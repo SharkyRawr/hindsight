@@ -1287,6 +1287,7 @@ class BanksApi:
 
         _response_types_map: Dict[str, Optional[str]] = {
             '200': "BankStatsResponse",
+            '404': None,
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(
@@ -1363,6 +1364,7 @@ class BanksApi:
 
         _response_types_map: Dict[str, Optional[str]] = {
             '200': "BankStatsResponse",
+            '404': None,
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(
@@ -1439,6 +1441,7 @@ class BanksApi:
 
         _response_types_map: Dict[str, Optional[str]] = {
             '200': "BankStatsResponse",
+            '404': None,
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(
@@ -1578,6 +1581,7 @@ class BanksApi:
 
         _response_types_map: Dict[str, Optional[str]] = {
             '200': "BankConfigResponse",
+            '404': None,
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(
@@ -1650,6 +1654,7 @@ class BanksApi:
 
         _response_types_map: Dict[str, Optional[str]] = {
             '200': "BankConfigResponse",
+            '404': None,
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(
@@ -1722,6 +1727,7 @@ class BanksApi:
 
         _response_types_map: Dict[str, Optional[str]] = {
             '200': "BankConfigResponse",
+            '404': None,
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(
@@ -2145,6 +2151,7 @@ class BanksApi:
 
         _response_types_map: Dict[str, Optional[str]] = {
             '200': "MemoriesTimeseriesResponse",
+            '404': None,
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(
@@ -2225,6 +2232,7 @@ class BanksApi:
 
         _response_types_map: Dict[str, Optional[str]] = {
             '200': "MemoriesTimeseriesResponse",
+            '404': None,
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(
@@ -2305,6 +2313,7 @@ class BanksApi:
 
         _response_types_map: Dict[str, Optional[str]] = {
             '200': "MemoriesTimeseriesResponse",
+            '404': None,
             '422': "HTTPValidationError",
         }
         response_data = await self.api_client.call_api(

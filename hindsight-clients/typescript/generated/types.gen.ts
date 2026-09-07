@@ -5905,6 +5905,10 @@ export type GetGraphData = {
 
 export type GetGraphErrors = {
   /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
    * Validation Error
    */
   422: HttpValidationError;
@@ -5981,6 +5985,10 @@ export type ListMemoriesData = {
 };
 
 export type ListMemoriesErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
   /**
    * Validation Error
    */
@@ -6300,6 +6308,10 @@ export type GetAgentStatsData = {
 
 export type GetAgentStatsErrors = {
   /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
    * Validation Error
    */
   422: HttpValidationError;
@@ -6383,6 +6395,10 @@ export type GetMemoriesTimeseriesData = {
 
 export type GetMemoriesTimeseriesErrors = {
   /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
    * Validation Error
    */
   422: HttpValidationError;
@@ -6434,6 +6450,10 @@ export type ListEntitiesData = {
 
 export type ListEntitiesErrors = {
   /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
    * Validation Error
    */
   422: HttpValidationError;
@@ -6482,6 +6502,10 @@ export type GetEntityGraphData = {
 };
 
 export type GetEntityGraphErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
   /**
    * Validation Error
    */
@@ -6627,6 +6651,10 @@ export type ListMentalModelsData = {
 };
 
 export type ListMentalModelsErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
   /**
    * Validation Error
    */
@@ -6989,6 +7017,10 @@ export type GetKnowledgeBaseTreeData = {
 
 export type GetKnowledgeBaseTreeErrors = {
   /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
    * Validation Error
    */
   422: HttpValidationError;
@@ -7102,6 +7134,10 @@ export type ExportKnowledgeBaseData = {
 
 export type ExportKnowledgeBaseErrors = {
   /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
    * Validation Error
    */
   422: HttpValidationError;
@@ -7151,6 +7187,10 @@ export type SearchKnowledgeBaseData = {
 };
 
 export type SearchKnowledgeBaseErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
   /**
    * Validation Error
    */
@@ -7334,6 +7374,10 @@ export type ListDirectivesData = {
 };
 
 export type ListDirectivesErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
   /**
    * Validation Error
    */
@@ -7551,6 +7595,10 @@ export type ListDocumentsData = {
 };
 
 export type ListDocumentsErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
   /**
    * Validation Error
    */
@@ -7828,6 +7876,10 @@ export type ListTagsData = {
 
 export type ListTagsErrors = {
   /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
    * Validation Error
    */
   422: HttpValidationError;
@@ -7930,6 +7982,10 @@ export type ListOperationsData = {
 };
 
 export type ListOperationsErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
   /**
    * Validation Error
    */
@@ -8399,6 +8455,10 @@ export type ExportBankTemplateData = {
 
 export type ExportBankTemplateErrors = {
   /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
    * Validation Error
    */
   422: HttpValidationError;
@@ -8705,6 +8765,10 @@ export type ListObservationScopesData = {
 
 export type ListObservationScopesErrors = {
   /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
    * Validation Error
    */
   422: HttpValidationError;
@@ -8859,6 +8923,10 @@ export type GetBankConfigData = {
 
 export type GetBankConfigErrors = {
   /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
    * Validation Error
    */
   422: HttpValidationError;
@@ -8984,6 +9052,10 @@ export type ListWebhooksData = {
 };
 
 export type ListWebhooksErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
   /**
    * Validation Error
    */
@@ -9345,6 +9417,10 @@ export type ListAuditLogsData = {
 
 export type ListAuditLogsErrors = {
   /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
    * Validation Error
    */
   422: HttpValidationError;
@@ -9393,6 +9469,10 @@ export type AuditLogStatsData = {
 };
 
 export type AuditLogStatsErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
   /**
    * Validation Error
    */
@@ -9503,6 +9583,10 @@ export type ListLlmRequestsData = {
 
 export type ListLlmRequestsErrors = {
   /**
+   * The bank does not exist.
+   */
+  404: unknown;
+  /**
    * Validation Error
    */
   422: HttpValidationError;
@@ -9551,6 +9635,10 @@ export type LlmRequestStatsData = {
 };
 
 export type LlmRequestStatsErrors = {
+  /**
+   * The bank does not exist.
+   */
+  404: unknown;
   /**
    * Validation Error
    */

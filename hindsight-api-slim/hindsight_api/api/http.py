@@ -252,6 +252,12 @@ def _internal_error(exc: Exception, where: str) -> HTTPException:
 # 499 is the de facto reverse-proxy status for "client closed request".
 _CLIENT_CLOSED_REQUEST_STATUS_CODE = 499
 
+# Declared on every bank-scoped read so a generated client can tell "this bank
+# does not exist" apart from "this bank is empty" (#4175). Without it the spec
+# advertises only 200/422 and a consumer has no documented missing-bank case.
+_BANK_NOT_FOUND_RESPONSES: dict[int | str, dict[str, Any]] = {404: {"description": "The bank does not exist."}}
+
+
 _T = TypeVar("_T")
 
 
@@ -4901,6 +4907,7 @@ def _register_routes(app: FastAPI):
         description="Retrieve graph data for visualization, optionally filtered by type (world/experience/observation).",
         operation_id="get_graph",
         tags=["Memory"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_graph(
         bank_id: str,
@@ -4941,6 +4948,7 @@ def _register_routes(app: FastAPI):
         description="List memory units with pagination and optional full-text search. Supports filtering by type, source document, and linked entity ID. Results are sorted by most recent first (mentioned_at DESC, then created_at DESC).",
         operation_id="list_memories",
         tags=["Memory"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_list(
         bank_id: str,
@@ -5607,6 +5615,7 @@ def _register_routes(app: FastAPI):
         description="Get statistics about nodes and links for a specific agent",
         operation_id="get_agent_stats",
         tags=["Banks"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_stats(
         bank_id: str,
@@ -5699,6 +5708,7 @@ def _register_routes(app: FastAPI):
         description="Memories ingested over a period, bucketed by time and broken down by fact type.",
         operation_id="get_memories_timeseries",
         tags=["Banks"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_memories_timeseries(
         bank_id: str,
@@ -5733,6 +5743,7 @@ def _register_routes(app: FastAPI):
         description="List all entities (people, organizations, etc.) known by the bank, ordered by mention count. Supports pagination.",
         operation_id="list_entities",
         tags=["Entities"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_list_entities(
         bank_id: str,
@@ -5765,6 +5776,7 @@ def _register_routes(app: FastAPI):
         description="Return a graph of entities (nodes) and their co-occurrences (edges) for visualization.",
         operation_id="get_entity_graph",
         tags=["Entities"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_entity_graph(
         bank_id: str,
@@ -5855,6 +5867,7 @@ def _register_routes(app: FastAPI):
         description="List user-curated living documents that stay current.",
         operation_id="list_mental_models",
         tags=["Mental Models"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_list_mental_models(
         bank_id: str,
@@ -6219,6 +6232,7 @@ def _register_routes(app: FastAPI):
         description="Return the knowledge base as a nested tree of folders and pages.",
         operation_id="get_knowledge_base_tree",
         tags=["Knowledge Base"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_knowledge_base_tree(
         bank_id: str,
@@ -6329,6 +6343,7 @@ def _register_routes(app: FastAPI):
         description="Return a portable markdown bundle: a nested index.md, one <id>.md per page, and history logs.",
         operation_id="export_knowledge_base",
         tags=["Knowledge Base"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_export_knowledge_base(
         bank_id: str,
@@ -6374,6 +6389,7 @@ def _register_routes(app: FastAPI):
         ),
         operation_id="search_knowledge_base",
         tags=["Knowledge Base"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_search_knowledge_base(
         bank_id: str,
@@ -6532,6 +6548,7 @@ def _register_routes(app: FastAPI):
         description="List directive definitions. Unlike reflect, an omitted tag filter returns all directives.",
         operation_id="list_directives",
         tags=["Directives"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_list_directives(
         bank_id: str,
@@ -6712,6 +6729,7 @@ def _register_routes(app: FastAPI):
         description="List documents with pagination and optional search, most recently written first (`updated_at` descending). Documents are the source content from which memory units are extracted.",
         operation_id="list_documents",
         tags=["Documents"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_list_documents(
         bank_id: str,
@@ -6890,6 +6908,7 @@ def _register_routes(app: FastAPI):
         "Use `source=mental_models` to list tags used on mental models instead of memories.",
         operation_id="list_tags",
         tags=["Memory"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_list_tags(
         bank_id: str,
@@ -7077,6 +7096,7 @@ def _register_routes(app: FastAPI):
         description="Get a list of async operations for a specific agent, with optional filtering by status and operation type. Results are sorted by most recent first.",
         operation_id="list_operations",
         tags=["Operations"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_list_operations(
         bank_id: str,
@@ -7158,8 +7178,14 @@ def _register_routes(app: FastAPI):
     @app.delete(
         "/v1/default/banks/{bank_id}/operations/{operation_id}",
         response_model=CancelOperationResponse,
-        summary="Cancel a pending async operation",
-        description="Cancel a pending async operation by removing it from the queue",
+        summary="Cancel a pending or in-flight async operation",
+        description=(
+            "Cancel a queued or running async operation. A 'pending' operation is never started. "
+            "A 'processing' one is cancelled cooperatively: the row is marked 'cancelled' immediately "
+            "and the worker running it stops at its next checkpoint, so work already in flight may "
+            "finish the batch it is on. This also clears operations stranded in 'processing' by a "
+            "crashed worker. Returns 409 for operations that already reached a terminal state."
+        ),
         operation_id="cancel_operation",
         tags=["Operations"],
     )
@@ -7167,7 +7193,7 @@ def _register_routes(app: FastAPI):
     async def api_cancel_operation(
         bank_id: str, operation_id: str, request_context: RequestContext = Depends(get_request_context)
     ):
-        """Cancel a pending async operation."""
+        """Cancel a pending or in-flight async operation."""
         try:
             # Validate UUID format
             try:
@@ -7521,6 +7547,7 @@ def _register_routes(app: FastAPI):
         "The exported manifest can be imported into another bank to replicate the setup.",
         operation_id="export_bank_template",
         tags=["Bank Templates"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_export_bank_template(
         bank_id: str,
@@ -7898,6 +7925,7 @@ def _register_routes(app: FastAPI):
         ),
         operation_id="list_observation_scopes",
         tags=["Memory"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_list_observation_scopes(
         bank_id: str,
@@ -7982,6 +8010,7 @@ def _register_routes(app: FastAPI):
         "Always available: HINDSIGHT_API_ENABLE_BANK_CONFIG_API gates only the write operations on this resource.",
         operation_id="get_bank_config",
         tags=["Banks"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_get_bank_config(bank_id: str, request_context: RequestContext = Depends(get_request_context)):
         """Get configuration for a bank with all hierarchical overrides applied.
@@ -8196,6 +8225,7 @@ def _register_routes(app: FastAPI):
         "Paged: `total` reports every webhook on the bank.",
         operation_id="list_webhooks",
         tags=["Webhooks"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_list_webhooks(
         bank_id: str,
@@ -8875,6 +8905,7 @@ def _register_routes(app: FastAPI):
         operation_id="list_audit_logs",
         tags=["Audit"],
         response_model=AuditLogListResponse,
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_list_audit_logs(
         bank_id: str,
@@ -8915,6 +8946,7 @@ def _register_routes(app: FastAPI):
         operation_id="audit_log_stats",
         tags=["Audit"],
         response_model=AuditLogStatsResponse,
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_audit_log_stats(
         bank_id: str,
@@ -8948,6 +8980,7 @@ def _register_routes(app: FastAPI):
         operation_id="list_llm_requests",
         tags=["LLM Traces"],
         response_model=LLMRequestListResponse,
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_list_llm_requests(
         bank_id: str,
@@ -9004,6 +9037,7 @@ def _register_routes(app: FastAPI):
         operation_id="llm_request_stats",
         tags=["LLM Traces"],
         response_model=LLMRequestStatsResponse,
+        responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_llm_request_stats(
         bank_id: str,

@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator
 
 from ..llm_interface import ProviderContentPolicyError, ProviderRateLimitResetError
-from ..llm_wrapper import LLMConfig, OutputTooLongError, parse_llm_json, sanitize_llm_output, sanitize_llm_value
+from ..llm_wrapper import LLMConfig, OutputTooLongError, parse_llm_json, sanitize_llm_output, sanitize_value
 from ..operation_metadata import RetainExtractionErrors
 from ..response_models import TokenUsage
 from ..structured_output import provider_json_schema, strict_json_schema
@@ -2359,7 +2359,8 @@ async def extract_facts_from_text(
         llm_config: LLM configuration to use
         config: Resolved HindsightConfig for this bank
         context: Context about the conversation/document
-        metadata: Optional document metadata key-value pairs
+        metadata: Optional document metadata key-value pairs. Also selects the
+            chain member when the retain LLM uses the "metadata" strategy.
         agent_name: Optional narrator to prime the prompt with ("Narrator: {name}").
             Retain never sets it — see the caller in retain/orchestrator.py — and the
             dry-run endpoint's field that does is deprecated in favour of ``context``.
@@ -2374,6 +2375,15 @@ async def extract_facts_from_text(
         - chunks: List of tuples (chunk_text, fact_count) for each chunk
         - usage: Aggregated token usage across all LLM calls
     """
+    # Metadata routing binds the member here rather than at the operation level:
+    # one call to this function is one retain item, so its metadata is
+    # unambiguous, and every chunk it fans out below shares that one item's
+    # classification. A chain in any other mode (or an item matching no route)
+    # returns the wrapper unchanged.
+    route_for = getattr(llm_config, "route_for", None)
+    if route_for is not None:
+        llm_config = route_for(metadata)
+
     chunks = chunk_text(
         text,
         max_chars=config.retain_chunk_size,
@@ -2742,7 +2752,7 @@ async def extract_facts_from_contents_batch_api(
     # Batch results are downloaded straight from the provider's output file, so they
     # never pass through ``LLMProvider.call`` and miss the scrub it applies. Sanitize
     # them here so the batch path gets the same guarantee as the sync one (#3729).
-    batch_results = sanitize_llm_value(await batch_impl.retrieve_batch_results(batch_id))
+    batch_results = sanitize_value(await batch_impl.retrieve_batch_results(batch_id))
 
     # Map results by custom_id
     results_by_id = {result["custom_id"]: result for result in batch_results}

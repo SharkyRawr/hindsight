@@ -176,6 +176,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/GraphDataResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -308,6 +310,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/ListMemoryUnitsResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -715,6 +719,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/BankStatsResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -821,6 +827,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/MemoriesTimeseriesResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -883,6 +891,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/EntityListResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -944,6 +954,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/EntityGraphResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -1138,6 +1150,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/MentalModelListResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -1564,6 +1578,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/KnowledgeTreeResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -1689,6 +1705,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/KnowledgePageBundleResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -1752,6 +1770,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/KnowledgePageSearchResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -1997,6 +2017,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/DirectiveListResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -2268,6 +2290,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/ListDocumentsResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -2628,6 +2652,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/ListTagsResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -2760,6 +2786,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/OperationsListResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -2771,7 +2799,12 @@ paths:
       - Operations
   /v1/default/banks/{bank_id}/operations/{operation_id}:
     delete:
-      description: Cancel a pending async operation by removing it from the queue
+      description: "Cancel a queued or running async operation. A 'pending' operation\
+        \ is never started. A 'processing' one is cancelled cooperatively: the row\
+        \ is marked 'cancelled' immediately and the worker running it stops at its\
+        \ next checkpoint, so work already in flight may finish the batch it is on.\
+        \ This also clears operations stranded in 'processing' by a crashed worker.\
+        \ Returns 409 for operations that already reached a terminal state."
       operationId: cancel_operation
       parameters:
       - explode: false
@@ -2811,7 +2844,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
           description: Validation Error
-      summary: Cancel a pending async operation
+      summary: Cancel a pending or in-flight async operation
       tags:
       - Operations
     get:
@@ -3311,6 +3344,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/BankTemplateManifest'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -3704,6 +3739,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/ObservationScopesResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -3870,6 +3907,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/BankConfigResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -4021,6 +4060,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/WebhookListResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -4511,6 +4552,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/AuditLogListResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -4568,6 +4611,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/AuditLogStatsResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -4726,6 +4771,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/LLMRequestListResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:
@@ -4783,6 +4830,8 @@ paths:
               schema:
                 $ref: '#/components/schemas/LLMRequestStatsResponse'
           description: Successful Response
+        "404":
+          description: The bank does not exist.
         "422":
           content:
             application/json:

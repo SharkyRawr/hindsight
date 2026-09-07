@@ -47,6 +47,7 @@ from ..config import (
     DEFAULT_REFLECT_SOURCE_FACTS_MAX_TOKENS,
     DEFAULT_STORE_DOCUMENT_TEXT,
     ENV_MODEL_INIT_TIMEOUT,
+    LLM_STRATEGY_METADATA,
     HindsightConfig,
     LLMMemberConfig,
     LLMStrategyConfig,
@@ -529,7 +530,14 @@ from enum import Enum
 from ..pg0 import EmbeddedPostgres, parse_pg0_url
 from .entity_resolver import EntityResolver
 from .fact_budget import select_facts_within_budget
-from .llm_wrapper import ConfiguredLLMProvider, LLMConfig, requires_api_key, sanitize_llm_output, sanitize_text
+from .llm_wrapper import (
+    ConfiguredLLMProvider,
+    LLMConfig,
+    requires_api_key,
+    sanitize_llm_output,
+    sanitize_text,
+    sanitize_value,
+)
 from .mental_model_refresh import (
     MentalModelDeltaOperations,
     MentalModelDryRunRefreshResult,
@@ -679,9 +687,28 @@ def _build_llm(
 
     ``defaults`` are the operation's resolved request defaults, applied to every
     fallback member so the whole chain shares the operation's effective settings.
+
+    Raises ``ValueError`` when a non-retain operation *explicitly* selects the
+    metadata strategy, which it has no item metadata to route on.
     """
     members: list[LLMMemberConfig] = getattr(config, f"{prefix}llm_members")
     strategy: LLMStrategyConfig | None = getattr(config, f"{prefix}llm_strategy")
+
+    # Metadata routing reads a *retained item's* metadata, so only retain has
+    # anything to route on. Setting it explicitly on another operation would
+    # otherwise be accepted and then quietly ignored (that chain pins to the
+    # primary), which looks exactly like the routes not working. Inheriting it
+    # from the global strategy stays legal and does pin those operations to the
+    # primary — that is the documented behaviour, not a mistake.
+    if prefix and prefix != "retain_" and strategy is not None and strategy.mode == LLM_STRATEGY_METADATA:
+        operation = prefix.rstrip("_")
+        raise ValueError(
+            f"The '{LLM_STRATEGY_METADATA}' LLM strategy is only supported for retain, but "
+            f"HINDSIGHT_API_{operation.upper()}_LLM_STRATEGY sets it for {operation}. Routing reads the "
+            f"metadata of the item being retained, which {operation} does not have. Remove the override to "
+            f"let {operation} use the global strategy, or give it 'failover'/'round-robin'."
+        )
+
     if prefix:
         if not members:
             members = config.llm_members
@@ -704,9 +731,23 @@ async def validate_retain_batch_support(
     capability is evaluated across ALL members, not just the primary: batch
     capacity may live on a secondary (issue #3645), and gating on the primary
     alone rejected configurations that would in fact have worked.
+
+    Metadata routing is rejected outright: the batch path submits every item of a
+    retain as ONE job to ONE member, so it cannot honour a per-item route. Rather
+    than silently sending routed items to whichever member serves the batch, make
+    the operator pick one of the two features.
     """
     if not config.retain_batch_enabled:
         return
+
+    if isinstance(retain_llm_config, MultiLLMProvider) and retain_llm_config.strategy.mode == LLM_STRATEGY_METADATA:
+        raise RuntimeError(
+            "Configuration error: HINDSIGHT_API_RETAIN_BATCH_ENABLED=true is not compatible with the "
+            "'metadata' LLM strategy. Batch retain submits every item of an operation as a single job "
+            "to a single member, so it cannot route items individually. Set "
+            "HINDSIGHT_API_RETAIN_BATCH_ENABLED=false or choose another LLM strategy."
+        )
+
     if await retain_llm_config.supports_batch_api():
         return
 
@@ -3003,8 +3044,11 @@ class MemoryEngine(MemoryEngineInterface):
             retain_content["event_date"] = None
         elif file_timestamp:
             retain_content["event_date"] = file_timestamp
-        retain_contents = [retain_content]
-        document_tags = task_dict.get("document_tags")
+        # Same jsonb constraint as `submit_async_retain`: this row's task_payload
+        # carries the item verbatim, and the caller-supplied metadata/tags on a
+        # file upload never passed through that scrub.
+        retain_contents = [sanitize_value(retain_content)]
+        document_tags = sanitize_value(task_dict.get("document_tags"))
 
         retain_task_payload: dict[str, Any] = {"contents": retain_contents}
         if document_tags:
@@ -3916,6 +3960,12 @@ class MemoryEngine(MemoryEngineInterface):
 
         Long-running operations should call this at natural checkpoints (e.g. after each
         committed batch) to detect cancellation or bank deletion early and abort cleanly.
+
+        This is how `DELETE /operations/{id}` stops work that is already 'processing'
+        (issue #4131): the API only flips the status, and the running task stops at its
+        next checkpoint. Adding a checkpoint to a long-running op type is therefore all
+        it takes to make that op type cancellable — no per-batch bookkeeping, and the
+        check is one indexed primary-key read at a boundary that already touches the DB.
         """
         try:
             backend = await self._get_backend()
@@ -3977,6 +4027,10 @@ class MemoryEngine(MemoryEngineInterface):
 
         Also checks if this is a child operation and updates the parent if all siblings are done.
         Uses a single transaction to avoid race conditions when multiple children fail simultaneously.
+
+        Never overwrites 'cancelled' (issue #4131): cancellation is cooperative, so a task
+        can raise after an operator cancelled it, and 'failed' would hide their decision
+        (and make the row retryable as if it had failed on its own).
         """
         try:
             backend = await self._get_backend()
@@ -3991,14 +4045,17 @@ class MemoryEngine(MemoryEngineInterface):
                         f"""
                         UPDATE {fq_table("async_operations")}
                         SET status = 'failed', error_message = $2, updated_at = NOW()
-                        WHERE operation_id = $1
+                        WHERE operation_id = $1 AND status <> 'cancelled'
                         RETURNING operation_id
                         """,
                         uuid.UUID(operation_id),
                         truncated_error,
                     )
                     if row is None:
-                        logger.info(f"Operation {operation_id} no longer exists (bank deleted), skipping mark-failed")
+                        logger.info(
+                            f"Operation {operation_id} was cancelled or no longer exists "
+                            "(bank deleted), skipping mark-failed"
+                        )
                         return
                     logger.info(f"Marked async operation as failed: {operation_id}")
 
@@ -4349,12 +4406,15 @@ class MemoryEngine(MemoryEngineInterface):
             bank_id = row["bank_id"]
 
             # Lock the parent operation to prevent concurrent updates from other children
-            # Use FOR UPDATE to ensure only one child can update the parent at a time
+            # Use FOR UPDATE to ensure only one child can update the parent at a time.
+            # A cancelled parent is excluded: the operator cancelled the whole batch,
+            # and a child finishing afterwards must not roll it back to a completed or
+            # failed state (issue #4131).
             parent_row = await conn.fetchrow(
                 f"""
                 SELECT operation_id
                 FROM {fq_table("async_operations")}
-                WHERE operation_id = $1 AND bank_id = $2
+                WHERE operation_id = $1 AND bank_id = $2 AND status <> 'cancelled'
                 FOR UPDATE
                 """,
                 uuid.UUID(parent_operation_id),
@@ -4362,7 +4422,7 @@ class MemoryEngine(MemoryEngineInterface):
             )
 
             if not parent_row:
-                # Parent doesn't exist (shouldn't happen)
+                # Parent doesn't exist, or was cancelled
                 return
 
             # Get all sibling operations (including this one).
@@ -4388,16 +4448,21 @@ class MemoryEngine(MemoryEngineInterface):
             if not siblings:
                 return
 
-            # Check if all siblings are done (completed or failed)
+            # Check if all siblings are done. 'cancelled' counts as done (issue #4131):
+            # an operator can now cancel an individual child, and leaving it out of this
+            # set strands the parent in 'processing' forever — exactly the wedge this
+            # endpoint exists to clear.
             all_completed = all(sib["status"] == "completed" for sib in siblings)
             any_failed = any(sib["status"] == "failed" for sib in siblings)
-            all_done = all(sib["status"] in ("completed", "failed") for sib in siblings)
+            any_cancelled = any(sib["status"] == "cancelled" for sib in siblings)
+            all_done = all(sib["status"] in ("completed", "failed", "cancelled") for sib in siblings)
 
             if not all_done:
                 # Some siblings still pending/processing
                 return
 
-            # All siblings are done - update parent status
+            # All siblings are done - update parent status. A real failure outranks a
+            # cancellation: it carries a cause the operator still needs to see.
             if any_failed:
                 new_status = "failed"
                 # Set parent error message to indicate child failure. Inherit
@@ -4415,6 +4480,18 @@ class MemoryEngine(MemoryEngineInterface):
                     uuid.UUID(parent_operation_id),
                     new_status,
                     _summarise_child_error_messages(siblings),
+                )
+            elif any_cancelled:
+                # No error_message and no completed_at: the batch was stopped, not finished.
+                new_status = "cancelled"
+                await conn.execute(
+                    f"""
+                    UPDATE {fq_table("async_operations")}
+                    SET status = $2, updated_at = NOW()
+                    WHERE operation_id = $1
+                    """,
+                    uuid.UUID(parent_operation_id),
+                    new_status,
                 )
             elif all_completed:
                 new_status = "completed"
@@ -5261,24 +5338,30 @@ class MemoryEngine(MemoryEngineInterface):
         # those mutations leak back to the caller's dicts.
         contents = cast(list[RetainContentDict], [dict(c) for c in contents])
 
-        # Sanitize content/context at ingress so lone UTF-16 surrogates (e.g. a
-        # half-emoji a client serialized as a `\udXXX` escape) cannot crash the
-        # embedder, cross-encoder, or logging with an HTTP 500 (see issue #1875).
+        # Sanitize the whole item at ingress. A lone UTF-16 surrogate (e.g. a
+        # half-emoji a client serialized as a `\udXXX` escape) crashes the
+        # embedder, cross-encoder or logging with an HTTP 500 (#1875), and U+0000
+        # is storable in neither `text` nor `jsonb`, so a NUL aborts the INSERT
+        # outright. Neither character is confined to `content`: `sanitize_value`
+        # walks the item — context, document_id, tags, entities and nested
+        # metadata, keys included — so no field can be forgotten one at a time.
+        contents = cast(list[RetainContentDict], sanitize_value(contents))
         for item in contents:
+            # Downstream expects a string here even when the item sanitized empty.
             if "content" in item:
-                item["content"] = sanitize_text(item["content"]) or ""
-            if item.get("context"):
-                item["context"] = sanitize_text(item["context"]) or ""
+                item["content"] = item["content"] or ""
             # Client-supplied entity names reach the same places the fact text does:
             # they are appended to the embedded string and joined into `text_signals`
             # for BM25, so an unpaired surrogate here crashes identically (#3729).
-            # Shape is ``[{"text": ..., "type": ...}]``; an entry whose text sanitizes
+            # Shape is ``[{"text": ..., "type": ...}]``; an entry whose text sanitized
             # away entirely is dropped rather than carried as a nameless entity.
             if item.get("entities"):
                 item["entities"] = [
-                    {key: sanitize_text(value) or "" for key, value in entity.items()}
+                    # `RetainContent.entities` is `list[dict[str, str]]`; an omitted
+                    # `type` arrives as None and must not survive as one.
+                    {key: value or "" for key, value in entity.items()}
                     for entity in item["entities"]
-                    if (sanitize_text(entity.get("text")) or "").strip()
+                    if (entity.get("text") or "").strip()
                 ]
 
         # Apply batch-level document_id to contents that don't have their own (backwards compatibility)
@@ -5370,11 +5453,11 @@ class MemoryEngine(MemoryEngineInterface):
             total_processed_content_tokens = 0
             cancelled = False
             for group_idx, group in enumerate(groups):
-                # Checkpoint: abort if the operation was deleted (bank deleted)
-                # between documents, mirroring the sub-batch loop's checkpoint.
+                # Checkpoint: abort if the operation was cancelled or deleted (bank
+                # deleted) between documents, mirroring the sub-batch loop's checkpoint.
                 if operation_id and not await self._check_op_alive(operation_id):
                     logger.info(
-                        f"[BATCH_RETAIN] bank={bank_id} operation {operation_id} cancelled (bank deleted), "
+                        f"[BATCH_RETAIN] bank={bank_id} operation {operation_id} cancelled, "
                         f"stopping after {group_idx}/{len(groups)} documents"
                     )
                     cancelled = True
@@ -5846,11 +5929,12 @@ class MemoryEngine(MemoryEngineInterface):
                     i = sub.index
                     sub_batch = sub.contents
                     sub_origins = sub.origins
-                    # Checkpoint: abort if the operation was deleted (bank was deleted) between sub-batches.
+                    # Checkpoint: abort if the operation was cancelled, or deleted because
+                    # the bank was deleted, between sub-batches.
                     if operation_id and not await self._check_op_alive(operation_id):
                         logger.info(
-                            f"[BATCH_RETAIN] bank={bank_id} operation {operation_id} cancelled "
-                            f"(bank deleted), stopping after {i - 1} sub-batches"
+                            f"[BATCH_RETAIN] bank={bank_id} operation {operation_id} cancelled, "
+                            f"stopping after {i - 1} sub-batches"
                         )
                         cancelled = True
                         # Cancel what is already in flight. Without this the gather below would run
@@ -10368,6 +10452,7 @@ class MemoryEngine(MemoryEngineInterface):
                 bank_id=bank_id, operation=BankReadOperation.LIST_OBSERVATION_SCOPES, request_context=request_context
             )
             await self._validate_operation(self._operation_validator.validate_bank_read(ctx))
+        await self._require_bank_exists(bank_id)
         backend = await self._get_backend()
         from .memories import get_memories
 
@@ -11143,6 +11228,7 @@ class MemoryEngine(MemoryEngineInterface):
                 bank_id=bank_id, operation=BankReadOperation.GET_GRAPH_DATA, request_context=request_context
             )
             await self._validate_operation(self._operation_validator.validate_bank_read(ctx))
+        await self._require_bank_exists(bank_id)
         from .memories import get_memories
 
         store = get_memories()
@@ -11579,6 +11665,7 @@ class MemoryEngine(MemoryEngineInterface):
                 bank_id=bank_id, operation=BankReadOperation.LIST_MEMORY_UNITS, request_context=request_context
             )
             await self._validate_operation(self._operation_validator.validate_bank_read(ctx))
+        await self._require_bank_exists(bank_id)
         from .memories import get_memories
 
         backend = await self._get_backend()
@@ -11687,6 +11774,7 @@ class MemoryEngine(MemoryEngineInterface):
                 bank_id=bank_id, operation=BankReadOperation.LIST_DOCUMENTS, request_context=request_context
             )
             await self._validate_operation(self._operation_validator.validate_bank_read(ctx))
+        await self._require_bank_exists(bank_id)
 
         # A store that owns its document metadata keeps no rows in the SQL `documents` table, so the
         # query below would return an empty page for it. List from the store's own registry instead.
@@ -12803,6 +12891,26 @@ class MemoryEngine(MemoryEngineInterface):
             "mission": resolved.mission,
         }
 
+    async def _require_bank_exists(self, bank_id: str) -> None:
+        """Raise a 404 when a bank-scoped read targets a bank that was never created.
+
+        Read endpoints must not answer for a bank nobody created. A 200 with
+        empty counters is indistinguishable from a healthy, empty bank, so a
+        typo'd, renamed or deleted ``bank_id`` silently passes any monitor built
+        on ``/stats`` or ``/memories/list`` (#4175). Callers invoke this after
+        their own authentication and read authorization, so the check neither
+        widens what a request is allowed to see nor creates the bank.
+
+        The profile row is cached per process (see ``bank_info_cache``), so on an
+        existing bank this costs no query; a missing bank is never cached, so it
+        stays one cheap read.
+        """
+        backend = await self._get_backend()
+        if await bank_utils.get_bank_profile_if_exists(backend, bank_id) is None:
+            from hindsight_api.extensions import OperationValidationError
+
+            raise OperationValidationError(f"Bank '{bank_id}' not found", status_code=404)
+
     async def _ensure_bank_exists(
         self,
         bank_id: str,
@@ -12933,6 +13041,7 @@ class MemoryEngine(MemoryEngineInterface):
                 request_context=request_context,
             )
             await self._validate_operation(self._operation_validator.validate_bank_read(context))
+        await self._require_bank_exists(bank_id)
         return await self._get_bank_config_authenticated(bank_id, request_context)
 
     async def update_bank_config(
@@ -14167,6 +14276,7 @@ class MemoryEngine(MemoryEngineInterface):
                 bank_id=bank_id, operation=BankReadOperation.LIST_ENTITIES, request_context=request_context
             )
             await self._validate_operation(self._operation_validator.validate_bank_read(ctx))
+        await self._require_bank_exists(bank_id)
         from .memories import get_memories
 
         backend = await self._get_backend()
@@ -14204,6 +14314,7 @@ class MemoryEngine(MemoryEngineInterface):
                 bank_id=bank_id, operation=BankReadOperation.GET_ENTITY_GRAPH, request_context=request_context
             )
             await self._validate_operation(self._operation_validator.validate_bank_read(ctx))
+        await self._require_bank_exists(bank_id)
 
         # A store that owns its entities keeps no rows in the SQL entity_cooccurrences/entities
         # tables, so the query below would return an empty graph. Read the store's own aggregate.
@@ -14369,6 +14480,7 @@ class MemoryEngine(MemoryEngineInterface):
                 bank_id=bank_id, operation=BankReadOperation.LIST_TAGS, request_context=request_context
             )
             await self._validate_operation(self._operation_validator.validate_bank_read(ctx))
+        await self._require_bank_exists(bank_id)
         # Tags live with the memories, so the store owns the histogram and applies
         # the wildcard filter, ordering (count desc, tag asc) and paging — on the
         # SQL stores that is one paged query, never the whole histogram over the wire.
@@ -14405,6 +14517,7 @@ class MemoryEngine(MemoryEngineInterface):
                 request_context=request_context,
             )
             await self._validate_operation(self._operation_validator.validate_bank_read(ctx))
+        await self._require_bank_exists(bank_id)
         return await self._list_tags_from_table(
             table="mental_models",
             bank_id=bank_id,
@@ -14541,6 +14654,7 @@ class MemoryEngine(MemoryEngineInterface):
                 bank_id=bank_id, operation=BankReadOperation.GET_BANK_STATS, request_context=request_context
             )
             await self._validate_operation(self._operation_validator.validate_bank_read(ctx))
+        await self._require_bank_exists(bank_id)
 
         return await self._cached_bank_stats(bank_id, force_refresh=force_refresh)
 
@@ -14795,6 +14909,7 @@ class MemoryEngine(MemoryEngineInterface):
                 bank_id=bank_id, operation=BankReadOperation.GET_MEMORIES_TIMESERIES, request_context=request_context
             )
             await self._validate_operation(self._operation_validator.validate_bank_read(ctx))
+        await self._require_bank_exists(bank_id)
 
         cfg = _MEMORIES_TIMESERIES_PERIODS.get(period) or _MEMORIES_TIMESERIES_PERIODS["7d"]
         if period not in _MEMORIES_TIMESERIES_PERIODS:
@@ -14999,6 +15114,7 @@ class MemoryEngine(MemoryEngineInterface):
                 bank_id=bank_id, operation=BankReadOperation.LIST_MENTAL_MODELS, request_context=request_context
             )
             await self._validate_operation(self._operation_validator.validate_bank_read(ctx))
+        await self._require_bank_exists(bank_id)
         backend = await self._get_backend()
 
         async with acquire_with_retry(backend) as conn:
@@ -17757,6 +17873,7 @@ class MemoryEngine(MemoryEngineInterface):
                 request_context=request_context,
             )
             await self._validate_operation(self._operation_validator.validate_bank_read(ctx))
+        await self._require_bank_exists(bank_id)
         backend = await self._get_backend()
         async with acquire_with_retry(backend) as conn:
             rows = await conn.fetch(
@@ -17876,6 +17993,7 @@ class MemoryEngine(MemoryEngineInterface):
                 request_context=request_context,
             )
             await self._validate_operation(self._operation_validator.validate_bank_read(ctx))
+        await self._require_bank_exists(bank_id)
         query = (query or "").strip()
         if not query:
             return []
@@ -18327,6 +18445,7 @@ class MemoryEngine(MemoryEngineInterface):
                 request_context=request_context,
             )
             await self._validate_operation(self._operation_validator.validate_bank_read(ctx))
+        await self._require_bank_exists(bank_id)
 
         with _authorize_nested_operations():
             nodes = await self.list_knowledge_nodes(bank_id=bank_id, request_context=request_context)
@@ -18691,6 +18810,7 @@ class MemoryEngine(MemoryEngineInterface):
                 bank_id=bank_id, operation=BankReadOperation.LIST_DIRECTIVES, request_context=request_context
             )
             await self._validate_operation(self._operation_validator.validate_bank_read(ctx))
+        await self._require_bank_exists(bank_id)
         backend = await self._get_backend()
 
         async with acquire_with_retry(backend) as conn:
@@ -19044,6 +19164,7 @@ class MemoryEngine(MemoryEngineInterface):
                 bank_id=bank_id, operation=BankReadOperation.LIST_OPERATIONS, request_context=request_context
             )
             await self._validate_operation(self._operation_validator.validate_bank_read(ctx))
+        await self._require_bank_exists(bank_id)
         backend = await self._get_backend()
 
         async with acquire_with_retry(backend) as conn:
@@ -19284,7 +19405,19 @@ class MemoryEngine(MemoryEngineInterface):
         *,
         request_context: "RequestContext",
     ) -> dict[str, Any]:
-        """Cancel a pending async operation."""
+        """Cancel a pending or in-flight async operation.
+
+        Cancellation is cooperative and never immediate: the row is flipped to
+        'cancelled' and the worker running it notices at its next checkpoint
+        (`_check_op_alive`), stopping after the batch/document it is on. An
+        operation whose worker died (SIGKILL, OOM) has no one to notice — the
+        flip is the whole fix there, and it is what unwedges a row stranded in
+        'processing' without hand-editing the database (issue #4131).
+
+        Every non-cancel status write in the worker is guarded against
+        overwriting 'cancelled', so a task that runs to completion past the
+        flip, or fails, cannot resurrect the row.
+        """
         await self._authenticate_tenant(request_context)
         if self._operation_validator:
             from hindsight_api.extensions import BankWriteContext, BankWriteOperation
@@ -19308,19 +19441,40 @@ class MemoryEngine(MemoryEngineInterface):
             if not result:
                 raise ValueError(f"Operation {operation_id} not found for bank {bank_id}")
 
-            if result["status"] != "pending":
+            if result["status"] not in ("pending", "processing"):
                 from hindsight_api.extensions import OperationValidationError
 
                 raise OperationValidationError(
-                    f"Operation {operation_id} cannot be cancelled: status is '{result['status']}', only 'pending' operations can be cancelled",
+                    f"Operation {operation_id} cannot be cancelled: status is '{result['status']}', "
+                    "only 'pending' and 'processing' operations can be cancelled",
                     409,
                 )
 
-            # Mark the operation as cancelled
-            await conn.execute(
-                f"UPDATE {fq_table('async_operations')} SET status = 'cancelled', updated_at = now() WHERE operation_id = $1",
+            # Mark the operation as cancelled. Re-checks the status in the UPDATE
+            # so a task that reaches its terminal write between the SELECT above
+            # and here wins the race rather than being reported as cancelled.
+            updated = await conn.fetchrow(
+                f"UPDATE {fq_table('async_operations')} SET status = 'cancelled', updated_at = now() "
+                f"WHERE operation_id = $1 AND status IN ('pending', 'processing') RETURNING status",
                 op_uuid,
             )
+            if updated is None:
+                from hindsight_api.extensions import OperationValidationError
+
+                raise OperationValidationError(
+                    f"Operation {operation_id} cannot be cancelled: it reached a terminal state concurrently",
+                    409,
+                )
+
+            # If this was the last outstanding child of a batch_retain, terminalize the
+            # parent now — nothing else will, and a parent left in 'processing' is the
+            # very wedge this endpoint exists to clear. Best-effort: the cancellation
+            # itself is already committed and must stand even if the rollup fails.
+            try:
+                async with conn.transaction():
+                    await self._maybe_update_parent_operation(operation_id, conn)
+            except Exception as e:
+                logger.warning(f"Failed to roll cancellation of {operation_id} up to its parent: {e}")
 
             return {
                 "success": True,
@@ -19756,6 +19910,7 @@ class MemoryEngine(MemoryEngineInterface):
                 bank_id=bank_id, operation=BankReadOperation.LIST_WEBHOOKS, request_context=request_context
             )
             await self._validate_operation(self._operation_validator.validate_bank_read(ctx))
+        await self._require_bank_exists(bank_id)
 
         backend = await self._get_backend()
         async with acquire_with_retry(backend) as conn:
@@ -20250,6 +20405,22 @@ class MemoryEngine(MemoryEngineInterface):
             result = await self._validate_operation(self._operation_validator.validate_retain(ctx))
             if result and result.contents is not None:
                 contents = result.contents
+
+        # Sanitize at the same ingress point the synchronous path does, and for a
+        # second reason on top of it: the whole item is serialized into
+        # `async_operations.task_payload::jsonb` below, and PostgreSQL stores
+        # neither U+0000 nor a lone surrogate. One such character anywhere in the
+        # item — content, a tag, a nested metadata value, even a metadata *key* —
+        # aborts that INSERT with UntranslatableCharacterError, the request 500s,
+        # and the memory is never queued. The failure is deterministic for that
+        # payload, so a retrying client re-sends it forever (see PR #3908).
+        #
+        # Scrubbed here rather than in the HTTP model: `mcp_tools.retain` builds a
+        # content dict by hand and calls this method directly, so a validator on
+        # `MemoryItem` would leave the MCP tool 500ing on the same payload.
+        contents = cast(list[dict[str, Any]], sanitize_value(contents))
+        document_tags = sanitize_value(document_tags)
+        strategy = sanitize_value(strategy)
 
         # Idempotency fast path: a caller-supplied id that already resolves to a
         # prior submission is a retried request — return the original operation.
