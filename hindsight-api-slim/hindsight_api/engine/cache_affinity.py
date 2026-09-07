@@ -9,8 +9,9 @@ cache, and providers expose different mechanisms for that:
   on a cache-cold replica.
 - OpenAI accepts a ``prompt_cache_key`` request field that improves its own
   cache routing.
-- OpenAI-compatible gateways commonly accept an opt-in ``x-session-id`` header
-  for routing related requests to the same backend session.
+- Explicit ``header`` mode sends the operation id under an operator-configured
+  header name. Backend support must be verified by the operator; this mode is
+  never selected by ``auto``.
 
 Hindsight already does provider-specific cache work for its first-class
 providers (``anthropic_llm`` sets ``cache_control`` breakpoints; ``gemini_llm``
@@ -21,7 +22,7 @@ and ``nous`` subclasses — which sent no affinity hint at all.
 Default ``auto`` per member (``cache_affinity``). ``auto`` is an allowlist, not a
 best-effort probe: it emits a hint only for hosts documented to accept one and
 resolves to ``none`` for everything else, so an unknown OpenAI-compatible backend
-never receives an unfamiliar field. Every helper here is fail-open — when no id
+never receives an unfamiliar field. With valid configuration, helpers are fail-open — when no id
 can be derived the request goes out byte-identical to before. Set ``none`` to
 disable entirely.
 """
@@ -31,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from enum import StrEnum
 from typing import Any
 from urllib.parse import urlparse
@@ -39,7 +41,6 @@ logger = logging.getLogger(__name__)
 
 # xAI's documented cache-pinning header, and OpenAI's cache-routing field.
 XAI_CONV_ID_HEADER = "x-grok-conv-id"
-SESSION_ID_HEADER = "x-session-id"
 OPENAI_PROMPT_CACHE_KEY_PARAM = "prompt_cache_key"
 # OpenCode Go's conversation-grouping header (#4071).
 OPENCODE_SESSION_HEADER = "x-opencode-session"
@@ -61,7 +62,7 @@ class CacheAffinityMode(StrEnum):
 
     NONE = "none"
     XAI_CONV_ID = "xai_conv_id"
-    X_SESSION_ID = "x_session_id"
+    HEADER = "header"
     OPENAI_PROMPT_CACHE_KEY = "openai_prompt_cache_key"
     AUTO = "auto"
 
@@ -80,6 +81,14 @@ def parse_cache_affinity(value: str | None) -> CacheAffinityMode:
     except ValueError as e:
         valid = ", ".join(mode.value for mode in CacheAffinityMode)
         raise ValueError(f"Invalid cache_affinity {value!r}. Must be one of: {valid}.") from e
+
+
+def validate_cache_affinity_header(mode: CacheAffinityMode, header_name: str | None) -> str | None:
+    """Require a valid HTTP field name when explicitly opting into header mode."""
+    if mode is CacheAffinityMode.HEADER:
+        if not header_name or not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", header_name):
+            raise ValueError("cache_affinity='header' requires cache_affinity_header to be a valid HTTP header name")
+    return header_name
 
 
 def _host_matches(hostname: str, domain: str) -> bool:
@@ -182,6 +191,9 @@ def apply_opencode_session(request: dict[str, Any], provider: str) -> None:
     User-wins, matching :func:`apply_cache_affinity`: a value the caller already
     placed in ``extra_headers`` is kept. Never raises; when no id can be derived
     the request goes out unchanged.
+
+    Client-default overrides remain exclusive to the opt-in ``header`` mode
+    to preserve existing OpenCode behavior.
     """
     if provider.lower() != "opencode-go":
         return
@@ -218,6 +230,7 @@ def apply_cache_affinity(
     request: dict[str, Any],
     mode: CacheAffinityMode,
     *,
+    header_name: str | None = None,
     default_headers: dict[str, str] | None = None,
 ) -> None:
     """Add this request's cache-affinity hint to ``request`` in place.
@@ -226,22 +239,27 @@ def apply_cache_affinity(
     ``none`` — and an unresolved ``auto`` — add nothing.
 
     User-wins semantics throughout, matching the file's ``setdefault`` precedent
-    in ``_apply_provider_extra_body_defaults``: affinity headers already placed
-    in either the client's ``default_headers`` or the call's ``extra_headers``
-    are kept, and a ``prompt_cache_key`` in the operator's configured
-    ``extra_body`` suppresses ours entirely.
+    in ``_apply_provider_extra_body_defaults``: an ``x-grok-conv-id`` the caller
+    already placed in ``extra_headers`` is kept, and a ``prompt_cache_key`` in
+    the operator's configured ``extra_body`` (the escape hatch for a backend
+    that wants its own value) suppresses ours entirely.
 
-    Never raises: when no id can be derived the request is left byte-identical
+    ``header`` mode also preserves operator headers case-insensitively across
+    ``default_headers`` and ``extra_headers``.
+
+    With valid header configuration, never raises: when no id can be derived the request is left byte-identical
     to a pre-affinity one.
     """
+    header_name = validate_cache_affinity_header(mode, header_name)
     affinity_id = cache_affinity_id(request.get("messages"))
     if affinity_id is None:
         return
 
     if mode is CacheAffinityMode.XAI_CONV_ID:
-        _setdefault_header(request, XAI_CONV_ID_HEADER, affinity_id, default_headers)
-    elif mode is CacheAffinityMode.X_SESSION_ID:
-        _setdefault_header(request, SESSION_ID_HEADER, affinity_id, default_headers)
+        extra_headers = request.setdefault("extra_headers", {})
+        extra_headers.setdefault(XAI_CONV_ID_HEADER, affinity_id)
+    elif mode is CacheAffinityMode.HEADER and header_name is not None:
+        _setdefault_header(request, header_name, affinity_id, default_headers)
     elif mode is CacheAffinityMode.OPENAI_PROMPT_CACHE_KEY:
         # prompt_cache_key is a first-class named parameter on
         # chat.completions.create() in the resolved openai SDK, so it goes at the
