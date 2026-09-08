@@ -96,6 +96,46 @@ async def test_request_holds_attempt_context(with_tools):
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_tools", [False, True])
+@pytest.mark.parametrize("mode", ["header", "none", "auto"])
+async def test_factory_forwards_affinity_to_responses_requests(with_tools: bool, mode: str) -> None:
+    from hindsight_api.engine.cache_affinity import cache_affinity_id
+    from hindsight_api.engine.llm_wrapper import LLMProvider
+
+    llm = LLMProvider(
+        provider="openai-responses",
+        api_key="sk-test",
+        base_url="https://gateway.example/v1",
+        model="test-model",
+        cache_affinity=mode,
+        cache_affinity_header="x-opencode-session",
+    )
+    impl = llm._provider_impl
+    create = _mock_create(impl, _fake_response(output_text="ok"))
+    try:
+        with patch("hindsight_api.engine.providers.openai_responses_llm.get_metrics_collector"):
+            if with_tools:
+                await impl.call_with_tools(messages=[{"role": "user", "content": "hello"}], tools=[])
+            else:
+                await impl.call(messages=[{"role": "user", "content": "hello"}])
+        sent = create.call_args.kwargs
+        assert "messages" not in sent
+        if mode == "header":
+            assert sent["extra_headers"]["x-opencode-session"] == cache_affinity_id(sent["input"])
+        else:
+            assert "extra_headers" not in sent
+    finally:
+        await impl.cleanup()
+
+
+def test_responses_header_affinity_requires_header_name() -> None:
+    with pytest.raises(ValueError, match="requires cache_affinity_header"):
+        OpenAIResponsesLLM(
+            provider="openai-responses", api_key="sk-test", base_url="", model="test-model", cache_affinity="header"
+        )
+
+
 def test_default_model_is_a_reasoning_model():
     from hindsight_api.config import PROVIDER_DEFAULT_MODELS
 

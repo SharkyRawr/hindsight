@@ -773,6 +773,8 @@ def create_llm_provider(
             openai_service_tier=openai_service_tier,
             extra_body=extra_body,
             default_headers=default_headers,
+            cache_affinity=cache_affinity,
+            cache_affinity_header=cache_affinity_header,
             timeout=timeout,
         )
 

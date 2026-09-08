@@ -44,6 +44,12 @@ from openai import APIConnectionError, APIStatusError, AsyncOpenAI
 
 from hindsight_api.config import DEFAULT_LLM_TIMEOUT, ENV_LLM_TIMEOUT
 from hindsight_api.engine.bank_attribution import apply_bank_attribution
+from hindsight_api.engine.cache_affinity import (
+    apply_cache_affinity,
+    parse_cache_affinity,
+    resolve_cache_affinity,
+    validate_cache_affinity_header,
+)
 from hindsight_api.engine.llm_interface import (
     LLM_TOOL_CHOICE_AUTO,
     LLMInterface,
@@ -184,6 +190,8 @@ class OpenAIResponsesLLM(LLMInterface):
         timeout: float | None = None,
         extra_body: dict[str, Any] | None = None,
         default_headers: dict[str, str] | None = None,
+        cache_affinity: str | None = None,
+        cache_affinity_header: str | None = None,
         **kwargs: Any,
     ):
         """Initialize the Responses provider.
@@ -200,6 +208,8 @@ class OpenAIResponsesLLM(LLMInterface):
             extra_body: Extra body params merged into every request.
             default_headers: Custom headers passed to the OpenAI SDK client (for
                 operators routing through proxies / request-tracing middleware).
+            cache_affinity: Explicit backend affinity mode for the lunabuild deployment patch.
+            cache_affinity_header: Header name required by explicit ``header`` mode.
             **kwargs: Additional provider-specific parameters (e.g. ``openai_service_tier``).
         """
         super().__init__(provider, api_key, base_url, model, reasoning_effort, **kwargs)
@@ -212,6 +222,10 @@ class OpenAIResponsesLLM(LLMInterface):
         self.openai_service_tier = kwargs.get("openai_service_tier")
         self._config_extra_body = extra_body or {}
         self.default_headers = default_headers
+        self._cache_affinity = resolve_cache_affinity(
+            parse_cache_affinity(cache_affinity), self.provider, self.base_url
+        )
+        self._cache_affinity_header = validate_cache_affinity_header(self._cache_affinity, cache_affinity_header)
         self.timeout = timeout or float(os.getenv(ENV_LLM_TIMEOUT, str(DEFAULT_LLM_TIMEOUT)))
 
         # Manual retries (max_retries=0). Extract query params from base_url so an
@@ -363,6 +377,17 @@ class OpenAIResponsesLLM(LLMInterface):
         usage is stashed before ``parse`` runs so an error trace can still attach
         real token counts (see #2387).
         """
+        # lunabuild deployment patch: reuse chat affinity for both Responses paths.
+        # The helper fingerprints `messages` without a trace; adapt Responses input
+        # locally, then remove the alias so it never reaches the Responses API.
+        params = {**params, "messages": params["input"]}
+        apply_cache_affinity(
+            params,
+            self._cache_affinity,
+            header_name=self._cache_affinity_header,
+            default_headers=self.default_headers,
+        )
+        params.pop("messages")
         last_exception: Exception | None = None
         for attempt in range(max_retries + 1):
             try:
