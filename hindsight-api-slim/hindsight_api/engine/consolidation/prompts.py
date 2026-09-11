@@ -207,6 +207,17 @@ def build_consolidation_system_prompt(
     return template.format()
 
 
+def build_mission_section(observations_mission: str | None) -> str:
+    """The MISSION section, heading included, as the user message writes it.
+
+    Shared with the prompt preview, which reports this section as the block the
+    ``observations_mission`` setting produces. Rebuilding the heading there left two
+    blocks both called "Mission" — the setting's, and the built-in gap that this
+    ``## MISSION`` heading names too.
+    """
+    return f"## MISSION\n\n{escape_for_prompt(observations_mission or _DEFAULT_MISSION)}"
+
+
 def build_consolidation_input(
     facts_text: str,
     observations_text: str,
@@ -219,8 +230,7 @@ def build_consolidation_input(
     bank-agnostic and one CachedContent serves every bank. The capacity note also
     lives here since it varies as observation slots fill.
     """
-    mission = escape_for_prompt(observations_mission or _DEFAULT_MISSION)
-    mission_section = f"## MISSION\n\n{mission}\n\n"
+    mission_section = f"{build_mission_section(observations_mission)}\n\n"
     capacity_section = ""
     if observation_capacity_note:
         capacity_section = f"## CAPACITY CONSTRAINT\n\n{escape_for_prompt(observation_capacity_note)}\n\n"

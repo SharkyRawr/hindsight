@@ -918,7 +918,15 @@ class MemoriesExtension(Extension, ABC):
 
         A store that indexes everything regardless ignores them, which is what the default does —
         and what Postgres does, where the columns behind both arms are maintained by the insert
-        itself and there is nothing separable to skip."""
+        itself and there is nothing separable to skip.
+
+        Returns a **mapping** describing the commit: ``seq`` (the store's write coordinate for this
+        retain), ``unit_ids`` (the ids actually written, echoed back) and ``new_entities`` (how many
+        entities the resolve minted). Read it with ``resp["seq"]`` / ``resp.get(...)``, never as
+        attributes — this is a plain mapping, not a response object, and callers that reached for
+        ``resp.seq`` raised ``AttributeError`` from inside a log line and failed the whole write.
+        Stated here because the return value was previously undeclared, which is what let the two
+        sides disagree without either being obviously wrong."""
         raise NotImplementedError("this store does not support a store-owned retain")
 
     async def assert_writable(self, bank_id: str) -> None:
@@ -1544,6 +1552,29 @@ class MemoriesExtension(Extension, ABC):
             for scope in scopes
         }
 
+    async def latest_memory_write_at(self, *, conn, fq_table, bank_id: str) -> datetime | None:
+        """The newest ``updated_at`` across the bank's memories, or None if it has none.
+
+        The bank-wide counterpart of :meth:`any_memory_updated_since`, and the
+        shortcut in front of it: a mental model whose watermark is at or past this
+        cannot be stale whatever its scope, so every staleness surface asks this
+        once and only then asks the scoped question for the models it cannot rule
+        out. That is worth a method of its own because the scoped check is the
+        expensive one — it is bounded by the writes since a model's watermark, and
+        a model whose own scope has been quiet pays for all of them.
+
+        None means the bank has no memories, never "unknown": a store that cannot
+        answer cheaply should leave the default in place rather than return None,
+        which callers read as an empty bank and act on.
+
+        The default is the value ``consolidation_freshness`` already computes, so a
+        store works without implementing this; override it when the aggregate costs
+        more than the single value does (Postgres reads it off the
+        ``(bank_id, updated_at)`` index instead of scanning to count).
+        """
+        fresh = await self.consolidation_freshness(conn=conn, fq_table=fq_table, bank_id=bank_id)
+        return fresh.get("last_memory_write_at")
+
     async def live_memory_ids(self, *, conn, fq_table, bank_id: str, unit_ids: list[Any]) -> set[str]:
         """Which of ``unit_ids`` still exist among the bank's live memories.
 
@@ -1967,10 +1998,12 @@ class MemoriesExtension(Extension, ABC):
         return RelinkPassResult()
 
     async def enqueue_entity_prune_candidates(self, *, conn, fq_table, bank_id: str, affected_unit_ids: list) -> int:
-        """Queue the entities ``affected_unit_ids`` reference as prune candidates.
+        """Queue the entities ``affected_unit_ids`` reference as prune candidates,
+        and give back the ``mention_count`` their postings contributed.
 
         Zero for a store that never wrote `unit_entities`: it has no entity
-        postings to lose, so nothing can become an orphan.
+        postings to lose, so nothing can become an orphan and no mention count
+        can drift.
         """
         return 0
 

@@ -24,7 +24,7 @@ The API service handles all memory operations (retain, recall, reflect).
 | `HINDSIGHT_API_MIGRATION_DATABASE_URL` | Direct PostgreSQL URL for running migrations, bypassing connection poolers (e.g. PgBouncer). When set, advisory locks and Alembic migrations use this URL instead of `DATABASE_URL`. | Falls back to `DATABASE_URL` |
 | `HINDSIGHT_API_DATABASE_SCHEMA` | PostgreSQL schema name for tables | `public` |
 | `HINDSIGHT_API_RUN_MIGRATIONS_ON_STARTUP` | Run database migrations on API startup | `true` |
-| `HINDSIGHT_API_MIGRATION_ISOLATION` | Run migrations in a subprocess instead of in the calling process: `auto` (only on a free-threaded interpreter, where Alembic's psycopg2 would otherwise re-enable the GIL for the life of the process), `true`, or `false` | `auto` |
+| `HINDSIGHT_API_MIGRATION_ISOLATION` | Run migrations in a subprocess instead of in the calling process: `true` (keeps Alembic's import graph and its psycopg2 sync engine out of a long-lived server process) or `false` | `false` |
 | `HINDSIGHT_API_MIGRATION_CONCURRENCY` | Number of tenant schemas to migrate concurrently (PostgreSQL only). Each schema runs in its own process; within a schema migrations are always sequential. Each worker has a fixed startup cost (~1–2s to boot a fresh interpreter), so this only pays off with **many** schemas (roughly tens or more) or slow/high-latency migrations — for a handful of schemas it is slower than sequential. Each worker uses ~3 database connections, so keep `concurrency × 3` within your database's spare `max_connections` (and any PgBouncer pool limit). `1` = fully sequential. Measured at 20k schemas: the per-restart no-op resweep dropped from ~60min to ~11min (≈5×) at `concurrency=12`. | `1` |
 | `HINDSIGHT_API_EXTERNALLY_OWNED_ROUTINES` | Comma-separated list of maintenance discovery routines this deployment installs itself (see [Owning a maintenance routine](#owning-a-maintenance-routine)). Migrations skip anything named here. | Empty (every routine installed) |
 | `HINDSIGHT_API_DATABASE_BACKEND` | Database engine backend: `postgresql` or `oracle` (Oracle 23ai) | `postgresql` |
@@ -94,7 +94,7 @@ A few things to know:
 | `HINDSIGHT_API_DB_ACQUIRE_TIMEOUT` | Connection acquisition timeout in seconds. Bounds how long a caller waits for a free pool connection before failing (retried by the caller); `0` waits indefinitely. | `30` |
 | `HINDSIGHT_API_DB_STATEMENT_TIMEOUT` | Postgres `statement_timeout` applied to every pool connection, in seconds. Server-side safety net for runaway queries. Does **not** apply to Alembic migrations (which run on a separate psycopg2 engine). Set to `0` to disable. | `600` |
 | `HINDSIGHT_API_DB_MAX_PARALLEL_WORKERS_PER_GATHER` | Optional Postgres `max_parallel_workers_per_gather` applied to every pool connection of this process. Unset leaves the server default. Set to `0` on background-worker processes so bulk maintenance queries (consolidation, graph upkeep) run serially instead of fanning out across CPU cores shared with latency-sensitive traffic. | unset |
-| `HINDSIGHT_API_DB_SESSION_SETUP_ON_ACQUIRE` | Whether the per-connection session settings above (`statement_timeout`, `max_parallel_workers_per_gather`, the trigram threshold, the vector-search tuning, and — on the `vchord` text-search backend — the search path) are re-applied every time a connection is taken from the pool, not only when it is first opened. Keep this on unless the same settings are already pinned on the database role or the database itself (`ALTER ROLE … SET`), because releasing a connection resets it to the server defaults — with the re-apply off and nothing pinned server-side, reused connections quietly run without them, and on `vchord` recall fails outright rather than merely degrading. When they *are* pinned server-side the re-apply changes nothing and only costs a round trip per acquire, which is worth reclaiming on busy deployments behind a transaction-mode connection pooler. `application_name` is always re-applied and is unaffected by this setting. | `true` |
+| `HINDSIGHT_API_DB_SESSION_SETUP_ON_ACQUIRE` | Whether the per-connection session settings above (`statement_timeout`, `max_parallel_workers_per_gather`, the trigram threshold, the vector-search tuning, and — on the `vchord` text-search backend — the search path) are re-applied every time a connection is taken from the pool, not only when it is first opened. Keep this on unless the same settings are already pinned on the database role or the database itself (`ALTER ROLE … SET`), because behind a transaction-mode connection pooler an acquire can be linked to a server connection that never received them (on a direct connection they now survive, so the re-apply is redundant there) — with the re-apply off and nothing pinned server-side, reused connections quietly run without them, and on `vchord` recall fails outright rather than merely degrading. When they *are* pinned server-side the re-apply changes nothing and only costs a round trip per acquire, which is worth reclaiming on busy deployments behind a transaction-mode connection pooler. `application_name` is always re-applied and is unaffected by this setting. | `true` |
 | `HINDSIGHT_API_ENTITY_TRGM_SIMILARITY_THRESHOLD` | Postgres `pg_trgm.similarity_threshold` applied to every pool connection, governing how close a name must be for entity resolution's `%` trigram match to treat it as a candidate. Must be between `0` (exclusive) and `1`. Lower catches more substring-ish matches at higher CPU cost on large entity sets; higher is stricter and cheaper. | `0.15` |
 | `HINDSIGHT_API_ENTITY_INTRABATCH_MERGE_SIMILARITY` | Trigram similarity (pg_trgm-equivalent, computed in-memory) at/above which two brand-new names created by the **same** retain are merged into a single entity (in-batch dedup of surface-form variants — e.g. the same name with different emoji/case/suffix). Must be between `0` (exclusive) and `1`. This is a *merge* cutoff, deliberately stricter than the recall-only threshold above; raise it toward `1.0` to merge only near-identical forms. | `0.5` |
 | `HINDSIGHT_API_ENTITY_MERGE_MIN_SIMILARITY` | Minimum trigram similarity a name must have with an **existing** entity before that entity can be reused for it, whatever the other resolution signals say. Sits between the recall threshold above (`0.15`, which only decides what is *considered*) and the same-batch fold-in cutoff below (`0.5`). Must be between `0` (exclusive) and `1`. Lower it for corpora of very short names, where trigram similarity is unavoidably low (`Jon`/`John` is `0.29`); raise it to merge only clear surface variants. | `0.3` |
@@ -524,6 +524,27 @@ export HINDSIGHT_API_LLM_PROVIDER=none
 :::tip OpenAI Codex, Claude Code & Vertex AI Setup
 For detailed setup instructions for **OpenAI Codex** (ChatGPT Plus/Pro), **Claude Code** (Claude Pro/Max), and **Vertex AI** (Google Cloud), see the [Models documentation](./models#openai-codex-setup-chatgpt-pluspro).
 :::
+
+### SuperGrok OAuth (`xai-oauth`)
+
+`HINDSIGHT_API_LLM_PROVIDER=xai-oauth` authenticates with a SuperGrok subscription via
+device-code OAuth instead of an API key. Log in once with
+`python -m hindsight_api.engine.providers.xai_oauth_auth login`; the grant is stored on disk
+and refreshed automatically. Every variable below is optional — the defaults match the
+vendor's own client, so a normal deployment sets none of them.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HINDSIGHT_API_XAI_OAUTH_TOKEN_PATH` | Where the OAuth grant is stored. Both the login and the refresh follow it, so this relocates the store rather than overriding only the read. | `~/.hindsight/xai_oauth.json` |
+| `HINDSIGHT_API_XAI_OAUTH_BASE_URL` | Deployment-wide endpoint override. Takes precedence over `HINDSIGHT_API_LLM_BASE_URL`, which deployments often set for an unrelated proxy. | `https://api.x.ai/v1` |
+| `HINDSIGHT_API_XAI_OAUTH_CLIENT_ID` | OAuth client id used at login and refresh. | xAI's published Grok CLI client |
+| `HINDSIGHT_API_XAI_OAUTH_SCOPE` | Scope string requested at login. | vendor default |
+| `HINDSIGHT_API_XAI_OAUTH_REFRESH_SKEW_SECONDS` | How long before expiry a token counts as due for refresh. Widen it if this deployment calls the provider rarely (a cron or gateway shape). | `60` |
+| `HINDSIGHT_API_XAI_OAUTH_REFRESH_TIMEOUT_SECONDS` | Per-request timeout for discovery, device-code and refresh calls. | `20` |
+| `HINDSIGHT_API_XAI_OAUTH_DEBUG_HEADERS` | Log an allowlist of response headers (`via`, `x-request-id`, `cf-ray`, `server`, `date`) on a non-2xx reply. Diagnostic only; never logs credentials, cookies or bodies. | `false` |
+
+This is the subscription lane, not xAI API-key support — for `api.x.ai` with an API key use
+`HINDSIGHT_API_LLM_PROVIDER=openai` with `HINDSIGHT_API_LLM_BASE_URL=https://api.x.ai/v1`.
 
 ### LLM Router (LiteLLM Router)
 
@@ -1379,12 +1400,15 @@ For advanced authentication (JWT, OAuth, multi-tenant schemas), implement a cust
 | `HINDSIGHT_API_PORT` | Server port | `8888` |
 | `HINDSIGHT_API_BASE_PATH` | Base path for API when behind reverse proxy (e.g., `/hindsight`) | `""` (root) |
 | `HINDSIGHT_API_WORKERS` | Number of uvicorn worker processes | `1` |
-| `HINDSIGHT_API_EVENT_LOOPS` | Number of event loops served from a single process, each on its own thread. Only a throughput win on the free-threaded `-py3.14t` image, where the loops execute Python in parallel rather than taking turns; on a standard build it warns and buys nothing. The DB pool size is divided across the loops, not multiplied. | `1` |
 | `HINDSIGHT_API_ACCESS_LOG` | Enable uvicorn access log (`true`, `1`, `yes`, `on` to enable) | `false` |
+| `HINDSIGHT_API_DAEMON_LOG` | Where `--daemon` redirects the server's stdout and stderr. Set this per profile when several daemons run on one machine, so their output does not interleave into a single file. | `~/.hindsight/daemon.log` |
+| `HINDSIGHT_API_FREE_THREADING` | What to do when running on a free-threaded (`python3.14t`) interpreter: `strict` refuses to start if the GIL is still enabled, `warn` logs and continues, `off` disables the check. Unset lets the interpreter decide — `strict` on a free-threaded build, `off` on a normal one. | interpreter-dependent |
 | `HINDSIGHT_API_LOG_LEVEL` | Log level: `debug`, `info`, `warning`, `error` | `info` |
 | `HINDSIGHT_API_LOG_FORMAT` | Log format: `text` or `json` (structured logging for cloud platforms) | `text` |
 | `HINDSIGHT_API_LOG_JSON_FIELDS` | Comma-separated allowlist of JSON log fields to emit (e.g. `severity,message,tenant`). Available: `severity`, `message`, `timestamp`, `logger`, `tenant`, `exception`. Empty = all fields. | `""` (all) |
 | `HINDSIGHT_API_MCP_ENABLED` | Enable MCP server at `/mcp/{bank_id}/` | `true` |
+| `HINDSIGHT_API_GZIP_MIN_SIZE` | Minimum response size (bytes) to gzip. Compressing a recall response costs ~5% of its CPU, so a CPU-bound (rather than bandwidth-bound) deployment can raise this past its typical response size. Negative disables compression entirely. | `1024` |
+| `HINDSIGHT_API_LOOP_LAG_REPORT_SECONDS` | Diagnostic: log event-loop lag percentiles (`[loop-lag]`) every N seconds (minimum 1), to tell a slow await from an oversubscribed loop. `0` disables the probe. | `0` |
 | `HINDSIGHT_API_TOKENIZER_ENCODING` | Vocabulary used for every token count and chunk boundary (recall budgets, chunk sizes, prompt fitting, embedding truncation). `o200k_base` matches current OpenAI models and counts non-Latin text far closer to what they actually charge; `cl100k_base` reproduces the counts Hindsight produced before this default changed. Server-level: token budgets are only comparable between banks if they are all counted the same way. Other bundled vocabulary: `o200k_harmony`. | `o200k_base` |
 | `HINDSIGHT_API_MODEL_INIT_TIMEOUT` | Wall-clock cap (seconds) on startup model/connection initialization. If embeddings, the cross-encoder, or LLM verification block (e.g. an offline model download or an unreachable provider), the server fails fast with a clear error instead of hanging forever. Increase if a legitimate first-time model download needs more time. | `300` |
 | `HINDSIGHT_API_STARTUP_WAIT_SECONDS` | **Docker image only.** How long the container waits for the API to answer `/health` before it stops and restarts. Raising `HINDSIGHT_API_MODEL_INIT_TIMEOUT` above the default raises this wait too, so a slow first-time model download is not cut short; set this to override the wait on its own. | `300`, or `HINDSIGHT_API_MODEL_INIT_TIMEOUT` + 30s when that is longer |
@@ -1414,7 +1438,6 @@ For advanced authentication (JWT, OAuth, multi-tenant schemas), implement a cust
 | `HINDSIGHT_API_RECENCY_DECAY_FUNCTION` | Shape of the recency boost applied during reranking — how a memory's age is turned into a small freshness adjustment to its final rank. `linear` (default) decays in a straight line from full freshness (today) to a floor reached at `HINDSIGHT_API_RECENCY_DECAY_LINEAR_WINDOW_DAYS`. `exponential` decays by half-life: a memory is treated as neutral (no boost or penalty) at `HINDSIGHT_API_RECENCY_DECAY_HALFLIFE_DAYS`, younger memories are boosted and older ones penalised, with a smooth fade rather than a hard cutoff. `none` disables recency entirely (age never affects ranking). | `linear` |
 | `HINDSIGHT_API_RECENCY_DECAY_LINEAR_WINDOW_DAYS` | For the `linear` decay function: the number of days over which a memory fades from full freshness to the minimum. Only used when `HINDSIGHT_API_RECENCY_DECAY_FUNCTION=linear`. | `365` |
 | `HINDSIGHT_API_RECENCY_DECAY_HALFLIFE_DAYS` | For the `exponential` decay function: the age (in days) at which a memory is considered neutral — younger memories get a recency boost, older ones a penalty. Smaller values favour very recent memories more aggressively. Only used when `HINDSIGHT_API_RECENCY_DECAY_FUNCTION=exponential`. | `90` |
-| `HINDSIGHT_API_MENTAL_MODEL_REFRESH_CONCURRENCY` | Max concurrent mental model refreshes | `8` |
 | `HINDSIGHT_API_ENABLE_MENTAL_MODEL_HISTORY` | Track history of content changes to each mental model (previous content + timestamp), stored one row per change in the `mental_model_history` table. Set to `false` to disable entirely — no history rows are written, reducing storage if audit trails are not needed. **This is how you turn the feature off** (not a zero cap). | `true` |
 | `HINDSIGHT_API_MENTAL_MODEL_MIN_REFRESH_INTERVAL_SECONDS` | Minimum seconds between two *automatic* refreshes of the same mental model — the after-consolidation trigger and the cron schedule. A trigger that fires sooner is not dropped: its refresh is queued and parked until the window closes, and every further trigger in the meantime folds into that one queued refresh, so a burst of small retains costs one refresh instead of one per retain. Raise it when a bank ingests continuously and its models do not need to be current to the minute — the parked refresh still sees everything that accumulated while it waited. Explicit refreshes (API, MCP, control plane) ignore the floor and run immediately, and additionally release a parked refresh they fold into. `0` = no floor, every trigger refreshes at once. Hierarchical — overridable per bank via the [config API](#hierarchical-configuration), and per model via `trigger.min_refresh_interval_seconds` (which wins, including an explicit `0` to exempt one hot model from a bank-wide floor). | `0` |
 | `HINDSIGHT_API_MENTAL_MODEL_HISTORY_MAX_ENTRIES` | Max history rows kept per mental model. On each refresh the previous version is inserted into the `mental_model_history` table and the oldest rows beyond this cap are deleted, so per-model history can't grow without bound. `0` or a negative value **removes the cap** (history then grows with every refresh — unbounded); to turn history off entirely set `HINDSIGHT_API_ENABLE_MENTAL_MODEL_HISTORY=false` instead. | `50` |
@@ -1980,6 +2003,7 @@ Files uploaded via the file retain API are stored in an object storage backend b
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `HINDSIGHT_API_FILE_STORAGE_TYPE` | Storage backend: `native`, `s3`, `gcs`, or `azure` | `native` |
+| `HINDSIGHT_API_FILE_STORAGE_EXTENSION` | `module.path:ClassName` naming your own `FileStorage` implementation, used instead of the built-in backends. Every other `HINDSIGHT_API_FILE_STORAGE_*` variable is passed to it as a lowercased config dict. | unset |
 
 #### Native (PostgreSQL)
 
@@ -2264,6 +2288,7 @@ Configuration for background task processing. By default, the API processes task
 | `HINDSIGHT_API_WORKER_POLL_INTERVAL_MS` | Database polling interval in milliseconds | `500` |
 | `HINDSIGHT_API_WORKER_MAX_RETRIES` | Max retries before marking task failed | `3` |
 | `HINDSIGHT_API_WORKER_TASK_RETRY_BACKOFF_SECONDS` | Seconds between retries on transient task failure | `60` |
+| `HINDSIGHT_API_BACKPRESSURE_DEFER_SECONDS` | How long a task the store shed for backpressure is held before it is retried. Long enough that the backlog has a real chance to drain — retrying into a still-full store just sheds again — and short enough that a cleared backlog is not left waiting. Deferrals do not count against `HINDSIGHT_API_WORKER_MAX_RETRIES`. | `120` |
 | `HINDSIGHT_API_WORKER_HTTP_PORT` | HTTP port for worker metrics/health (worker CLI only) | `8889` |
 | `HINDSIGHT_API_WORKER_MAX_SLOTS` | Maximum concurrent tasks per worker (total across all operation types) | `10` |
 | `HINDSIGHT_API_OPERATION_RETENTION_DAYS` | Static server-wide retention window for completed, failed, and cancelled operation rows, including their task payload and result metadata. `0` (the default) keeps them indefinitely; set a positive number of days to enable automatic pruning. | `0` |
@@ -2340,7 +2365,6 @@ For a server handling many concurrent requests, lower values (down to `1`) favor
 | `HINDSIGHT_API_WEBHOOK_URL` | Global webhook URL for event delivery | - (disabled) |
 | `HINDSIGHT_API_WEBHOOK_SECRET` | HMAC signing secret for webhook payloads | - (unsigned) |
 | `HINDSIGHT_API_WEBHOOK_EVENT_TYPES` | Comma-separated list of event types to deliver via webhook | `consolidation.completed` |
-| `HINDSIGHT_API_WEBHOOK_DELIVERY_POLL_INTERVAL_SECONDS` | How often the webhook delivery worker polls for pending deliveries (seconds) | `30` |
 | `HINDSIGHT_API_WEBHOOK_ALLOWED_HOSTS` | Comma-separated hosts or IP/CIDR ranges permitted as webhook destinations in addition to public addresses. Private, loopback, and link-local ranges (including the cloud metadata address) are blocked unless listed here. | - (public only) |
 | `HINDSIGHT_API_WEBHOOK_EXPOSE_RESPONSE_BODY` | Return the raw upstream response body in the delivery-history API. Off by default to avoid exposing internal response contents; the delivery status code is always returned. | `false` |
 
@@ -2438,6 +2462,8 @@ Hindsight provides OpenTelemetry-based observability for LLM calls, conforming t
 | `HINDSIGHT_API_OTEL_SERVICE_NAME` | Service name for traces. Applies to the API and to standalone workers, which default to `hindsight-worker` when it is unset. | `hindsight-api` |
 | `HINDSIGHT_API_OTEL_DEPLOYMENT_ENVIRONMENT` | Deployment environment name (e.g., development, staging, production) | `development` |
 | `HINDSIGHT_API_METRICS_INCLUDE_BANK_ID` | Include `bank_id` in OTel metric attributes. Enable only for deployments with few banks — high cardinality causes unbounded memory growth. | `false` |
+| `HINDSIGHT_API_RECALL_DIAGNOSTIC_PHASES` | Record the diagnostic recall phases (`diagnostic="true"` on `hindsight.recall.phase.duration`) — subsets of other phases, useful only while diagnosing. Disable to cut instrument overhead on a busy recall path. | `true` |
+| `HINDSIGHT_API_RECALL_PHASE_SAMPLE_EVERY` | Record 1 in N `hindsight.recall.phase.duration` observations. Each observation is sampled independently, so percentiles stay unbiased and only the histogram counts scale by 1/N. Raise it (e.g. `10`) to cut metrics CPU at high recall rates. | `1` |
 | `HINDSIGHT_API_METRICS_BACKLOG_ENABLED` | Expose async-operation queue depth and consolidation-backlog gauges (`hindsight_async_operations`, `hindsight_consolidation_backlog`, `hindsight_consolidation_failed`). Runs periodic per-schema `COUNT` queries on a background task. | `false` |
 | `OTEL_PYTHON_FASTAPI_EXCLUDED_URLS` | Comma-separated URL patterns excluded from request tracing | `health,metrics` |
 
@@ -2505,6 +2531,65 @@ The DB-pool acquire path also exposes `hindsight_db_pool_waiting` (callers curre
 queued for a connection) and the `hindsight_db_pool_acquire_wait` histogram. A slow
 or failing `/health` response additionally carries `db_acquire_ms`, `db_pool_waiting`,
 `db_pool_in_use`, and `db_pool_max` for triage.
+
+### CPU Profiling
+
+The loop watchdog above answers "is the loop blocked?". This answers the next question --
+*what is burning the CPU?* -- for a process you may not be able to attach a debugger to.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HINDSIGHT_API_PROFILE` | JSON object; unset disables profiling entirely. `{"every": 60, "top": 20}` | unset |
+
+`every` is the seconds between reports, `top` the rows in each. Set it and the API emits a
+CPU report to its normal log stream on that interval:
+
+```
+HINDSIGHT_API_PROFILE='{"every": 60, "top": 20}'
+```
+
+```
+[profile] thread hindsight-loop-            1.41 cores
+[profile] thread asyncio_                   0.37 cores
+[profile] 1598 functions active in the last 60s
+[profile] tottime=0.923 cumtime=1.833 ncalls=15842 <method 'encode' of 'builtins.CoreBPE' objects>
+[profile] tottime=0.691 cumtime=7.039 ncalls=1511590 <built-in method builtins.isinstance>
+```
+
+Each row is one log record tagged `[profile]`, so `grep '\[profile\]'` over the logs
+reconstructs the table.
+
+**It reports to the logs on purpose.** The case this exists for is a process dying without
+explanation. A file inside the container dies with the container unless a volume was mounted
+in advance, and an HTTP endpoint needs a live process and a route to it -- which is exactly
+what a crashing process does not offer. Container runtimes keep the previous container's
+stdout (`kubectl logs --previous`), so the last report before a crash is still readable
+afterwards. Each report is flushed as it is written, because a fatal signal takes buffered
+output with it.
+
+#### Reading the report
+
+Every report begins with per-thread CPU read from `/proc`, and that table is the arbiter:
+profiler overhead cannot distort it, so when the two disagree, `/proc` is right. It also
+shows whether work is spread across event loops or concentrated on one.
+
+Three things will mislead you otherwise:
+
+- **`tottime` is a function's own CPU; `cumtime` includes everything it called.** A
+  coroutine high in `cumtime` may simply be awaiting. Ranking by `cumtime` once put an ASGI
+  middleware at 77% of loop CPU when removing it changed throughput by 13%.
+- **cProfile roughly halves throughput and over-weights functions called very often.** Read
+  the ranking, not the milliseconds, and confirm anything load-bearing by changing one thing
+  and re-measuring.
+- **Numbers are per-window.** Each report is the delta since the previous one, not a running
+  total since boot.
+
+#### Limits
+
+Profiling is process-wide and single-instance: since Python 3.12 the profiler is a global
+monitoring tool, so nothing else in the process may profile at the same time (a second
+attempt logs `tool 2 is already in use` and leaves profiling off). `py-spy` remains the
+better tool when you can attach to the process; this exists for the cases where you cannot.
 
 ### Metrics
 

@@ -10,7 +10,10 @@ license = "MIT"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "asyncpg>=0.29.0",
+    # 0.30.0 added Connection.get_reset_query(), the only supported way to skip
+    # asyncpg's release-time reset (see engine/db/postgresql.py). On 0.29 the
+    # override would be silently ignored, making the flag a no-op.
+    "asyncpg>=0.30.0",
     "python-dotenv>=1.0.0",
     "openai>=1.66.0",  # Responses API (client.responses.create, reasoning=, text.format) for the openai-responses provider
     "pydantic>=2.0.0",
@@ -52,12 +55,12 @@ dependencies = [
     "opentelemetry-exporter-otlp-proto-http>=1.44.0",
     "opentelemetry-semantic-conventions>=0.65b0",
     "dateparser>=1.4.2",
-    # Transitive via dateparser, pinned here because the floor is load-bearing on a
-    # free-threaded build: 2025.11.3 turns concurrent entry into dateparser's locale
-    # caches into a SIGSEGV inside _regex (verified on the py3.14t image -- exit 139
-    # in seconds, 3/3; the same probe on 2026.9.3 survives). The engine also
-    # serialises those entries now (see engine/query_analyzer.py _DATEPARSER_LOCK),
-    # so this is the second of two independent guards, not the only one.
+    # Transitive via dateparser, pinned here because the floor is load-bearing:
+    # 2025.11.3 turns concurrent entry into dateparser's locale caches into a SIGSEGV
+    # inside _regex (verified -- exit 139 in seconds, 3/3; the same probe on 2026.9.3
+    # survives). The engine also serialises those entries now (see
+    # engine/query_analyzer.py _DATEPARSER_LOCK), so this is the second of two
+    # independent guards, not the only one.
     "regex>=2026.9.3",
     "google-genai>=1.72.0",
     "google-auth>=2.0.0",
@@ -104,6 +107,7 @@ dependencies = [
     "boto3>=1.42.74",
     "croniter>=2.0.0", # Cron parsing for scheduled mental model refresh
     "json-repair>=0.63.2", # Structural repair of malformed LLM JSON (last-resort parse fallback); >=0.60.1 also fixes the circular-$ref unbounded-CPU DoS
+    "orjson>=3.11.0", # Fast JSON encode/decode on the recall path (audit rows, TEI embedding responses); 3.11 ships 3.14 wheels
     "numpy>=1.26.0", # Core vector/array math for pgvector, embeddings, and link graph operations
 ]
 
@@ -120,7 +124,13 @@ local-ml = [
     # this cap: without it an in-place upgrade can pull tokenizers 0.23.1 and
     # break local embeddings/reranker startup. See issue #2055.
     "tokenizers>=0.22.0,<=0.23.0",
-    "torch>=2.6.0", # CVE fix for remote code execution
+    # >=2.6.0 for the remote-code-execution CVE fix. The 2.11.0 floor is for
+    # ARMv8.0 CPUs (e.g. Cortex-A57): torch 2.10.0's aarch64 wheel bundles a
+    # mimalloc whose ELF constructor runs an inline ARMv8.1 LSE atomic
+    # (`ldaddal` in `_mi_options_init`), so `import torch` dies with SIGILL at
+    # dlopen time on any CPU without LSE. 2.11.0+ keeps LSE behind the
+    # runtime-dispatched outline-atomics helpers again. See issue #4142.
+    "torch>=2.11.0",
     "einops>=0.8.2",
     "flashrank>=0.2.0",
     # Apple Silicon local inference — mlx publishes wheels only for
@@ -237,6 +247,7 @@ select = [
     "F",      # Pyflakes
     "I",      # isort
     "B021",   # flake8-bugbear: f-string used as docstring (leaves __doc__ None)
+    "TID251", # banned imports: sync HTTP clients and httpx (see banned-api below)
 ]
 ignore = [
     "E501",   # line too long (handled by formatter)
@@ -247,6 +258,22 @@ ignore = [
 
 [tool.ruff.lint.isort]
 known-third-party = ["alembic"]
+
+# Production HTTP is aiohttp, async only (see .claude/skills/code-review/SKILL.md).
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"httpx".msg = "Use aiohttp (async) via hindsight_api.engine.aiohttp_session. httpx is allowed only to configure or classify a third-party SDK built on it, with a `# noqa: TID251` saying so."
+"requests".msg = "Sync HTTP is forbidden in production code; use aiohttp via hindsight_api.engine.aiohttp_session."
+"urllib.request".msg = "Sync HTTP is forbidden in production code; use aiohttp via hindsight_api.engine.aiohttp_session."
+"urllib3".msg = "Sync HTTP is forbidden in production code; use aiohttp via hindsight_api.engine.aiohttp_session."
+"http.client".msg = "Sync HTTP is forbidden in production code; use aiohttp via hindsight_api.engine.aiohttp_session."
+
+[tool.ruff.lint.per-file-ignores]
+# The container readiness probe runs as its own short-lived process and is
+# stdlib-only by rule (tests/test_http_probe.py), so it is not on the event loop.
+"hindsight_api/http_probe.py" = ["TID251"]
+# Tests may use httpx (FastAPI TestClient / ASGITransport). `exclude` above already
+# skips them on a directory run; this covers ruff invoked on an explicit test path.
+"tests/**" = ["TID251"]
 
 [tool.ruff.format]
 quote-style = "double"

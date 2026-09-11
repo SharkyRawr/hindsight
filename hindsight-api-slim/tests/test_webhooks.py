@@ -11,16 +11,20 @@ import hashlib
 import hmac
 import json
 import uuid
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 import pytest_asyncio
+from aiohttp import web
 
 from hindsight_api import LLMConfig
 from hindsight_api.api import create_app
 from hindsight_api.engine.memory_engine import MemoryEngine
+from hindsight_api.engine.query_analyzer import QueryAnalyzer
 from hindsight_api.extensions import OperationValidationError
 from hindsight_api.webhooks.manager import MAX_ATTEMPTS, RETRY_DELAYS, WebhookManager
 from hindsight_api.webhooks.models import (
@@ -32,11 +36,53 @@ from hindsight_api.webhooks.models import (
     WebhookEvent,
     WebhookEventType,
 )
+from hindsight_api.webhooks.url_guard import GuardedWebhookClient, WebhookResponse, WebhookURLError, parse_allowlist
 from hindsight_api.worker.exceptions import RetryTaskAt
+from tests.aiohttp_stub import stub_server
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(params=["postgres", "buffered-store"])
+def retain_count_store(request: pytest.FixtureRequest) -> Iterator[None]:
+    """Exercise counts against both immediate SQL writes and a commit-buffered store."""
+    from hindsight_api.engine.memories import get_memories, set_memories
+    from tests.test_memories_extension import InMemoryMemories
+
+    original_store = get_memories()
+    if request.param == "buffered-store":
+        set_memories(InMemoryMemories({}))
+    try:
+        yield
+    finally:
+        set_memories(original_store)
+
+
+@pytest_asyncio.fixture
+async def retain_count_memory(pg0_db_url: str, query_analyzer: QueryAnalyzer) -> AsyncIterator[MemoryEngine]:
+    """Real retain/outbox persistence with deterministic, torch-free embeddings."""
+    from hindsight_api.engine.task_backend import SyncTaskBackend
+    from tests.test_llm_reasoning_effort_env import DummyCrossEncoder
+    from tests.test_retain_same_document_concurrency import _StubEmbeddings
+
+    memory = MemoryEngine(
+        db_url=pg0_db_url,
+        memory_llm_provider="mock",
+        memory_llm_api_key="",
+        memory_llm_model="mock",
+        embeddings=_StubEmbeddings(),
+        cross_encoder=DummyCrossEncoder(),
+        query_analyzer=query_analyzer,
+        run_migrations=False,
+        task_backend=SyncTaskBackend(),
+    )
+    try:
+        await memory.initialize()
+        yield memory
+    finally:
+        await memory.close()
 
 
 def _make_event(bank_id: str = "bank-1") -> WebhookEvent:
@@ -454,27 +500,63 @@ class TestFireEventWithConn:
 class TestHandleWebhookDelivery:
     """Integration tests for MemoryEngine._handle_webhook_delivery()."""
 
+    @staticmethod
+    @asynccontextmanager
+    async def _receiver(
+        memory: MemoryEngine, handler=None
+    ) -> AsyncIterator[tuple[str, list[web.Request], list[bytes]]]:
+        """Serve a loopback receiver and point delivery at it.
+
+        The engine's client blocks loopback (SSRF guard), so it is swapped for a
+        guarded client whose allowlist permits 127.0.0.1 — the real aiohttp path,
+        just with the receiver allowlisted.
+        """
+        requests: list[web.Request] = []
+        bodies: list[bytes] = []
+
+        async def record(request: web.Request) -> web.StreamResponse:
+            requests.append(request)
+            bodies.append(await request.read())
+            if handler is not None:
+                return await handler(request)
+            return web.Response(text="ok")
+
+        client = GuardedWebhookClient(parse_allowlist(["127.0.0.1"]))
+        try:
+            async with stub_server(record) as base:
+                with patch.object(memory, "_webhook_client", client):
+                    yield f"{base}/hook", requests, bodies
+        finally:
+            await client.close()
+
     @pytest.mark.asyncio
     async def test_deliver_success(self, memory: MemoryEngine):
-        """A successful HTTP POST completes without raising."""
-        task_dict = _make_delivery_task(retry_count=0)
-
-        mock_response = MagicMock()
-        mock_response.raise_for_status = MagicMock()
-
-        with patch.object(memory._http_client, "post", new=AsyncMock(return_value=mock_response)):
+        """A successful HTTP POST completes without raising and sends the raw payload."""
+        async with self._receiver(memory) as (url, requests, bodies):
+            task_dict = _make_delivery_task(url=url, retry_count=0)
             # Should not raise
             await memory._handle_webhook_delivery(task_dict)
 
-    @staticmethod
-    async def _capture_headers(memory: MemoryEngine, task_dict: dict) -> dict[str, str]:
-        """Run one delivery against a stubbed transport and return the sent headers."""
-        mock_response = MagicMock()
-        mock_response.raise_for_status = MagicMock()
-        post = AsyncMock(return_value=mock_response)
-        with patch.object(memory._http_client, "post", new=post):
+        assert [r.method for r in requests] == ["POST"]
+        assert bodies == [task_dict["payload"].encode()]
+
+    @pytest.mark.asyncio
+    async def test_get_delivery_sends_params_and_no_body(self, memory: MemoryEngine):
+        """method=GET sends the configured query params and no body."""
+        async with self._receiver(memory) as (url, requests, bodies):
+            task_dict = _make_delivery_task(url=url, http_config={"method": "get", "params": {"k": "v"}})
             await memory._handle_webhook_delivery(task_dict)
-        return post.call_args.kwargs["headers"]
+
+        assert [r.method for r in requests] == ["GET"]
+        assert dict(requests[0].query) == {"k": "v"}
+        assert bodies == [b""]
+
+    @classmethod
+    async def _capture_headers(cls, memory: MemoryEngine, task_dict: dict) -> dict[str, str]:
+        """Run one delivery against a loopback receiver and return the headers it saw."""
+        async with cls._receiver(memory) as (url, requests, _bodies):
+            await memory._handle_webhook_delivery({**task_dict, "url": url})
+        return dict(requests[0].headers)
 
     @pytest.mark.asyncio
     async def test_unsigned_delivery_sends_no_signature_headers(self, memory: MemoryEngine):
@@ -548,7 +630,9 @@ class TestHandleWebhookDelivery:
         """A failed HTTP POST raises RetryTaskAt when retries remain."""
         task_dict = _make_delivery_task(retry_count=0)
 
-        with patch.object(memory._http_client, "post", new=AsyncMock(side_effect=Exception("connection refused"))):
+        with patch.object(
+            memory._webhook_client, "request", new=AsyncMock(side_effect=Exception("connection refused"))
+        ):
             with pytest.raises(RetryTaskAt):
                 await memory._handle_webhook_delivery(task_dict)
 
@@ -557,7 +641,7 @@ class TestHandleWebhookDelivery:
         """When retry_count reaches MAX_ATTEMPTS-1, a failure raises the original exception."""
         task_dict = _make_delivery_task(retry_count=MAX_ATTEMPTS - 1)
 
-        with patch.object(memory._http_client, "post", new=AsyncMock(side_effect=Exception("server error"))):
+        with patch.object(memory._webhook_client, "request", new=AsyncMock(side_effect=Exception("server error"))):
             with pytest.raises(Exception, match="server error"):
                 await memory._handle_webhook_delivery(task_dict)
 
@@ -568,7 +652,7 @@ class TestHandleWebhookDelivery:
 
         task_dict = _make_delivery_task(retry_count=1)
 
-        with patch.object(memory._http_client, "post", new=AsyncMock(side_effect=Exception("fail"))):
+        with patch.object(memory._webhook_client, "request", new=AsyncMock(side_effect=Exception("fail"))):
             before = datetime.now(timezone.utc)
             with pytest.raises(RetryTaskAt) as exc_info:
                 await memory._handle_webhook_delivery(task_dict)
@@ -578,6 +662,53 @@ class TestHandleWebhookDelivery:
         expected_delay = RETRY_DELAYS[1]  # retry_count=1
         assert retry_at >= before + timedelta(seconds=expected_delay - 2)
         assert retry_at <= after + timedelta(seconds=expected_delay + 2)
+
+    @pytest.mark.asyncio
+    async def test_non_2xx_records_status_and_body_and_retries(self, memory: MemoryEngine):
+        """A 5xx is retried, and its status + body land in the delivery metadata."""
+
+        async def unavailable(request: web.Request) -> web.StreamResponse:
+            return web.Response(status=503, text="receiver down")
+
+        record = AsyncMock()
+        async with self._receiver(memory, unavailable) as (url, _requests, _bodies):
+            task_dict = {**_make_delivery_task(url=url), "_operation_id": str(uuid.uuid4())}
+            with patch.object(memory, "_update_webhook_delivery_metadata", new=record):
+                with pytest.raises(RetryTaskAt):
+                    await memory._handle_webhook_delivery(task_dict)
+
+        record.assert_awaited_once_with(task_dict["_operation_id"], 503, "receiver down")
+
+    @pytest.mark.asyncio
+    async def test_redirect_is_a_failed_delivery_not_followed(self, memory: MemoryEngine):
+        """A 3xx toward an internal address is not followed; it is a retryable failure."""
+
+        async def redirect(request: web.Request) -> web.StreamResponse:
+            raise web.HTTPFound("http://169.254.169.254/latest/meta-data/")
+
+        async with self._receiver(memory, redirect) as (url, requests, _bodies):
+            with pytest.raises(RetryTaskAt):
+                await memory._handle_webhook_delivery(_make_delivery_task(url=url))
+        assert len(requests) == 1
+
+    @pytest.mark.asyncio
+    async def test_blocked_destination_fails_permanently(self, memory: MemoryEngine):
+        """The engine's own client refuses an internal destination, without retrying."""
+        seen: list[str] = []
+
+        async def handler(request: web.Request) -> web.StreamResponse:
+            seen.append(request.path)
+            return web.Response(text="INTERNAL_SECRET")
+
+        record = AsyncMock()
+        async with stub_server(handler) as base:
+            task_dict = {**_make_delivery_task(url=f"{base}/internal"), "_operation_id": str(uuid.uuid4())}
+            with patch.object(memory, "_update_webhook_delivery_metadata", new=record):
+                with pytest.raises(WebhookURLError):
+                    await memory._handle_webhook_delivery(task_dict)
+
+        assert seen == []
+        record.assert_awaited_once_with(task_dict["_operation_id"], None, None)
 
     @pytest.mark.asyncio
     async def test_execute_task_marks_operation_completed(self, memory: MemoryEngine):
@@ -603,10 +734,9 @@ class TestHandleWebhookDelivery:
             "operation_id": operation_id,
         }
 
-        mock_response = MagicMock()
-        mock_response.raise_for_status = MagicMock()
-
-        with patch.object(memory._http_client, "post", new=AsyncMock(return_value=mock_response)):
+        with patch.object(
+            memory._webhook_client, "request", new=AsyncMock(return_value=WebhookResponse(status_code=200, body="ok"))
+        ):
             await memory.execute_task(task_dict)
 
         async with memory._pool.acquire() as conn:
@@ -1685,12 +1815,16 @@ class TestRetainCompletedWebhook:
             await memory.delete_bank(bank_id, request_context=request_context)
 
     @pytest.mark.asyncio
-    async def test_retain_completed_payload_carries_memory_unit_count(self, memory: MemoryEngine, request_context):
+    @pytest.mark.parametrize("use_factory", [False, True])
+    async def test_retain_completed_payload_carries_memory_unit_count(
+        self, retain_count_memory: MemoryEngine, request_context, retain_count_store, use_factory: bool
+    ):
         """The event reports how many memory units the document owns afterwards.
 
         Without it a receiver cannot tell a document that produced memories from
         one that produced none — the event body is otherwise identical (#3040).
         """
+        memory = retain_count_memory
         bank_id = f"wh-count-{uuid.uuid4().hex[:8]}"
         webhook_id = uuid.uuid4()
         original_manager = memory._webhook_manager
@@ -1710,6 +1844,8 @@ class TestRetainCompletedWebhook:
                 )
 
             contents = [{"content": "Alice works at Google", "document_id": "doc-counted"}]
+            if use_factory:
+                contents.append({"content": "Bob works at Microsoft", "document_id": "doc-counted-other"})
             callback = memory._build_retain_outbox_callback(
                 bank_id=bank_id, contents=contents, operation_id="op-counted"
             )
@@ -1718,19 +1854,28 @@ class TestRetainCompletedWebhook:
                 bank_id=bank_id,
                 contents=contents,
                 request_context=request_context,
-                outbox_callback=callback,
+                outbox_callback=None if use_factory else callback,
+                outbox_callback_factory=(
+                    memory._build_retain_outbox_callback_factory(bank_id, "op-counted") if use_factory else None
+                ),
             )
 
-            stored_units = (
-                await memory.list_memory_units(
-                    bank_id, document_id="doc-counted", limit=1000, request_context=request_context
-                )
-            )["total"]
-            assert stored_units > 0, "fixture precondition: the mock LLM must extract facts here"
-
             payloads = await self._retain_delivery_payloads(memory._pool, bank_id)
-            assert len(payloads) == 1
-            assert payloads[0]["data"]["memory_unit_count"] == stored_units
+            assert len(payloads) == len(contents)
+            assert {payload["data"]["document_id"] for payload in payloads} == {
+                content["document_id"] for content in contents
+            }
+            for payload in payloads:
+                stored_units = (
+                    await memory.list_memory_units(
+                        bank_id,
+                        document_id=payload["data"]["document_id"],
+                        limit=1000,
+                        request_context=request_context,
+                    )
+                )["total"]
+                assert stored_units > 0, "fixture precondition: the mock LLM must extract facts here"
+                assert payload["data"]["memory_unit_count"] == stored_units
         finally:
             memory._webhook_manager = original_manager
             async with memory._pool.acquire() as conn:
@@ -1743,7 +1888,7 @@ class TestRetainCompletedWebhook:
 
     @pytest.mark.asyncio
     async def test_retain_completed_payload_reports_zero_for_zero_fact_document(
-        self, memory: MemoryEngine, request_context, monkeypatch
+        self, retain_count_memory: MemoryEngine, request_context, monkeypatch, retain_count_store
     ):
         """A document that extracted nothing must report ``memory_unit_count: 0``.
 
@@ -1756,6 +1901,7 @@ class TestRetainCompletedWebhook:
         from hindsight_api.engine.retain.types import ExtractionResult
 
         bank_id = f"wh-zerocount-{uuid.uuid4().hex[:8]}"
+        memory = retain_count_memory
         webhook_id = uuid.uuid4()
         original_manager = memory._webhook_manager
 
@@ -1805,7 +1951,7 @@ class TestRetainCompletedWebhook:
 
     @pytest.mark.asyncio
     async def test_retain_completed_payload_counts_document_not_units_created(
-        self, memory: MemoryEngine, request_context
+        self, retain_count_memory: MemoryEngine, request_context, retain_count_store
     ):
         """Re-retaining unchanged content must not look like a zero-fact document.
 
@@ -1813,6 +1959,7 @@ class TestRetainCompletedWebhook:
         units while the document keeps every memory it already had. Reporting
         units *created* would raise a false alarm on every idempotent re-submit.
         """
+        memory = retain_count_memory
         bank_id = f"wh-delta-count-{uuid.uuid4().hex[:8]}"
         webhook_id = uuid.uuid4()
         original_manager = memory._webhook_manager

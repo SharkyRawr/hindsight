@@ -58,6 +58,12 @@ export const HARNESS_LOGO_REGISTRY: Record<string, HarnessLogoEntry> = {
   },
   codex: { id: "codex", label: "Codex", src: "/img/harness/codex.svg", invertOnDark: true },
   dcode: { id: "dcode", label: "DeepAgents Dcode", src: "/img/harness/dcode.svg" },
+  "factory-droid": {
+    id: "factory-droid",
+    label: "Factory Droid",
+    src: "/img/harness/factory-droid.svg",
+    invertOnDark: true,
+  },
   "copilot-cli": {
     id: "copilot-cli",
     label: "GitHub Copilot CLI",
@@ -105,6 +111,7 @@ export const HARNESS_LOGO_REGISTRY: Record<string, HarnessLogoEntry> = {
     src: "/img/harness/prime-agent.svg",
     invertOnDark: true,
   },
+  zcode: { id: "zcode", label: "ZCode", src: "/img/harness/zcode.svg" },
 };
 
 const HARNESS_TAG_PREFIX = "harness:";

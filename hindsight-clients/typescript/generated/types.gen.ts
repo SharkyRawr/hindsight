@@ -1762,6 +1762,81 @@ export type DocumentImportSubmitResponse = {
 };
 
 /**
+ * DocumentListItem
+ *
+ * One row of the document listing — a document's metadata without its text.
+ *
+ * Extra keys are allowed and passed through: the rows used to be an open object, and
+ * typing them must not drop a field an older or newer server also returns.
+ */
+export type DocumentListItem = {
+  /**
+   * Id
+   *
+   * Document ID
+   */
+  id: string;
+  /**
+   * Bank Id
+   *
+   * Bank the document belongs to
+   */
+  bank_id?: string;
+  /**
+   * Content Hash
+   *
+   * Hash of the document text, for idempotent retain
+   */
+  content_hash?: string | null;
+  /**
+   * Created At
+   *
+   * When the document was first retained (ISO 8601)
+   */
+  created_at?: string;
+  /**
+   * Updated At
+   *
+   * When the document was last written (ISO 8601)
+   */
+  updated_at?: string;
+  /**
+   * Text Length
+   *
+   * Length of the stored document text in characters
+   */
+  text_length?: number;
+  /**
+   * Memory Unit Count
+   *
+   * Number of memory units extracted from this document
+   */
+  memory_unit_count?: number;
+  /**
+   * Retain Params
+   *
+   * Parameters used during retain
+   */
+  retain_params?: {
+    [key: string]: unknown;
+  } | null;
+  /**
+   * Document Metadata
+   *
+   * Document metadata
+   */
+  document_metadata?: {
+    [key: string]: unknown;
+  } | null;
+  /**
+   * Tags
+   *
+   * Tags associated with this document
+   */
+  tags?: Array<string>;
+};
+
+/**
  * DocumentResponse
  *
  * Response model for get document endpoint.
@@ -1876,6 +1951,12 @@ export type DryRunExtractRequest = {
    */
   agent_name?: string | null;
   /**
+   * Strategy
+   *
+   * Name of a retain strategy to extract under (a key of the bank's `retain_strategies`). Omit it and the bank's `retain_default_strategy` applies, exactly as it does for a retain that names none.
+   */
+  strategy?: string | null;
+  /**
    * Retain Mission
    */
   retain_mission?: string | null;
@@ -1914,7 +1995,8 @@ export type DryRunExtractRequest = {
 /**
  * DryRunExtractionResult
  *
- * Result of dry-run fact extraction: candidate facts plus aggregated LLM token usage.
+ * Result of dry-run fact extraction: candidate facts, the chunks they came from,
+ * and aggregated LLM token usage.
  */
 export type DryRunExtractionResult = {
   /**
@@ -1923,6 +2005,12 @@ export type DryRunExtractionResult = {
    * Candidate facts the retain step would extract.
    */
   facts?: Array<ExtractedFact>;
+  /**
+   * Chunks
+   *
+   * The chunks the input was cut into before extraction. Already computed on every path; returned because `retain_chunk_size` is otherwise a number with no visible effect.
+   */
+  chunks?: Array<ExtractionChunk>;
   /**
    * Aggregated token usage across the extraction LLM calls.
    */
@@ -1968,6 +2056,115 @@ export type EntityDetailResponse = {
 };
 
 /**
+ * EntityGraphEdge
+ *
+ * A co-occurrence edge, in the Cytoscape ``{"data": {...}}`` envelope the graph uses.
+ */
+export type EntityGraphEdge = {
+  data: EntityGraphEdgeData;
+};
+
+/**
+ * EntityGraphEdgeData
+ *
+ * The payload of one co-occurrence edge.
+ */
+export type EntityGraphEdgeData = {
+  /**
+   * Id
+   *
+   * Edge ID (``<source>-<target>``)
+   */
+  id: string;
+  /**
+   * Source
+   *
+   * Source entity ID
+   */
+  source: string;
+  /**
+   * Target
+   *
+   * Target entity ID
+   */
+  target: string;
+  /**
+   * Linktype
+   *
+   * Kind of relationship this edge represents
+   */
+  linkType?: string;
+  /**
+   * Weight
+   *
+   * Number of co-occurrences between the two entities
+   */
+  weight?: number;
+  /**
+   * Color
+   *
+   * Suggested edge colour for rendering
+   */
+  color?: string | null;
+  /**
+   * Linestyle
+   *
+   * Suggested edge line style for rendering
+   */
+  lineStyle?: string | null;
+  /**
+   * Lastcooccurred
+   *
+   * ISO 8601 timestamp of the most recent co-occurrence
+   */
+  lastCooccurred?: string | null;
+};
+
+/**
+ * EntityGraphNode
+ *
+ * An entity node, in the Cytoscape ``{"data": {...}}`` envelope the graph uses.
+ */
+export type EntityGraphNode = {
+  data: EntityGraphNodeData;
+};
+
+/**
+ * EntityGraphNodeData
+ *
+ * The payload of one entity node in the co-occurrence graph.
+ *
+ * Extra keys are allowed and passed through: the graph payload has always been an open
+ * object, and typing it must not drop a field an older or newer server also returns.
+ */
+export type EntityGraphNodeData = {
+  /**
+   * Id
+   *
+   * Entity ID
+   */
+  id: string;
+  /**
+   * Label
+   *
+   * Entity canonical name
+   */
+  label?: string;
+  /**
+   * Mentioncount
+   *
+   * How many times this entity was mentioned
+   */
+  mentionCount?: number;
+  /**
+   * Color
+   *
+   * Suggested node colour for rendering
+   */
+  color?: string | null;
+};
+
+/**
  * EntityGraphResponse
  *
  * Response model for entity co-occurrence graph endpoint.
@@ -1976,15 +2173,11 @@ export type EntityGraphResponse = {
   /**
    * Nodes
    */
-  nodes: Array<{
-    [key: string]: unknown;
-  }>;
+  nodes: Array<EntityGraphNode>;
   /**
    * Edges
    */
-  edges: Array<{
-    [key: string]: unknown;
-  }>;
+  edges: Array<EntityGraphEdge>;
   /**
    * Total Entities
    */
@@ -2167,6 +2360,32 @@ export type ExtractedFact = {
    * Raw (unresolved) entity names mentioned in the fact.
    */
   entities?: Array<string>;
+  /**
+   * Chunk Index
+   *
+   * Index into `chunks` of the chunk this fact came from; null if it could not be attributed.
+   */
+  chunk_index?: number | null;
+};
+
+/**
+ * ExtractionChunk
+ *
+ * One chunk the extractor was handed, and how much it yielded.
+ */
+export type ExtractionChunk = {
+  /**
+   * Text
+   *
+   * The chunk as the extractor saw it.
+   */
+  text: string;
+  /**
+   * Fact Count
+   *
+   * How many facts came out of this chunk.
+   */
+  fact_count: number;
 };
 
 /**
@@ -2299,21 +2518,15 @@ export type GraphDataResponse = {
   /**
    * Nodes
    */
-  nodes: Array<{
-    [key: string]: unknown;
-  }>;
+  nodes: Array<MemoryGraphNode>;
   /**
    * Edges
    */
-  edges: Array<{
-    [key: string]: unknown;
-  }>;
+  edges: Array<MemoryGraphEdge>;
   /**
    * Table Rows
    */
-  table_rows: Array<{
-    [key: string]: unknown;
-  }>;
+  table_rows: Array<MemoryGraphTableRow>;
   /**
    * Total Units
    */
@@ -2923,9 +3136,7 @@ export type ListDocumentsResponse = {
   /**
    * Items
    */
-  items: Array<{
-    [key: string]: unknown;
-  }>;
+  items: Array<DocumentListItem>;
   /**
    * Total
    */
@@ -2949,9 +3160,7 @@ export type ListMemoryUnitsResponse = {
   /**
    * Items
    */
-  items: Array<{
-    [key: string]: unknown;
-  }>;
+  items: Array<MemoryUnitListItem>;
   /**
    * Total
    */
@@ -3138,6 +3347,225 @@ export type MemoriesTimeseriesResponse = {
 };
 
 /**
+ * MemoryGraphEdge
+ *
+ * An edge between two memory units, in the Cytoscape ``{"data": {...}}`` envelope.
+ */
+export type MemoryGraphEdge = {
+  data: MemoryGraphEdgeData;
+};
+
+/**
+ * MemoryGraphEdgeData
+ *
+ * The payload of one edge between two memory units.
+ */
+export type MemoryGraphEdgeData = {
+  /**
+   * Id
+   *
+   * Edge ID (``<source>-<target>-<linkType>``)
+   */
+  id: string;
+  /**
+   * Source
+   *
+   * Source memory unit ID
+   */
+  source: string;
+  /**
+   * Target
+   *
+   * Target memory unit ID
+   */
+  target: string;
+  /**
+   * Linktype
+   *
+   * Link kind: 'entity', 'semantic', 'temporal', ...
+   */
+  linkType?: string;
+  /**
+   * Weight
+   *
+   * Link strength
+   */
+  weight?: number;
+  /**
+   * Entityname
+   *
+   * Shared entity for an 'entity' link, empty otherwise
+   */
+  entityName?: string;
+  /**
+   * Color
+   *
+   * Suggested edge colour for rendering
+   */
+  color?: string | null;
+  /**
+   * Linestyle
+   *
+   * Suggested edge line style for rendering
+   */
+  lineStyle?: string | null;
+};
+
+/**
+ * MemoryGraphNode
+ *
+ * A memory-unit node, in the Cytoscape ``{"data": {...}}`` envelope the graph uses.
+ */
+export type MemoryGraphNode = {
+  data: MemoryGraphNodeData;
+};
+
+/**
+ * MemoryGraphNodeData
+ *
+ * The payload of one memory-unit node in the memory graph.
+ *
+ * Extra keys are allowed and passed through, so typing this never drops a field the
+ * server also returns.
+ */
+export type MemoryGraphNodeData = {
+  /**
+   * Id
+   *
+   * Memory unit ID
+   */
+  id: string;
+  /**
+   * Label
+   *
+   * Short display label (the text, truncated)
+   */
+  label?: string;
+  /**
+   * Text
+   *
+   * Full memory unit text
+   */
+  text?: string;
+  /**
+   * Date
+   *
+   * Event date (ISO 8601), empty when unknown
+   */
+  date?: string;
+  /**
+   * Context
+   *
+   * Context the memory was captured in
+   */
+  context?: string;
+  /**
+   * Entities
+   *
+   * Comma-separated entity names, 'None' when there are none
+   */
+  entities?: string;
+  /**
+   * Color
+   *
+   * Suggested node colour for rendering
+   */
+  color?: string | null;
+};
+
+/**
+ * MemoryGraphTableRow
+ *
+ * One row of the flat table view that accompanies the memory graph.
+ */
+export type MemoryGraphTableRow = {
+  /**
+   * Id
+   *
+   * Memory unit ID
+   */
+  id: string;
+  /**
+   * Text
+   *
+   * Memory unit text
+   */
+  text?: string;
+  /**
+   * Context
+   *
+   * Context the memory was captured in ('N/A' when absent)
+   */
+  context?: string;
+  /**
+   * Occurred Start
+   *
+   * Start of the event interval (ISO 8601)
+   */
+  occurred_start?: string | null;
+  /**
+   * Occurred End
+   *
+   * End of the event interval (ISO 8601)
+   */
+  occurred_end?: string | null;
+  /**
+   * Mentioned At
+   *
+   * When the memory was mentioned (ISO 8601)
+   */
+  mentioned_at?: string | null;
+  /**
+   * Date
+   *
+   * Deprecated: formatted event date, kept for backwards compatibility
+   */
+  date?: string | null;
+  /**
+   * Entities
+   *
+   * Comma-separated entity names, 'None' when there are none
+   */
+  entities?: string;
+  /**
+   * Document Id
+   *
+   * Source document ID
+   */
+  document_id?: string | null;
+  /**
+   * Chunk Id
+   *
+   * Source chunk ID
+   */
+  chunk_id?: string | null;
+  /**
+   * Fact Type
+   *
+   * Fact type: world, experience or observation
+   */
+  fact_type?: string | null;
+  /**
+   * Tags
+   *
+   * Tags on this memory unit
+   */
+  tags?: Array<string>;
+  /**
+   * Created At
+   *
+   * When the memory unit was created (ISO 8601)
+   */
+  created_at?: string | null;
+  /**
+   * Proof Count
+   *
+   * How many times the fact was independently seen
+   */
+  proof_count?: number | null;
+};
+
+/**
  * MemoryItem
  *
  * Single memory item for retain.
@@ -3263,6 +3691,151 @@ export type MemoryTimeseriesBucket = {
    * Observations recorded in this bucket.
    */
   observation?: number;
+};
+
+/**
+ * MemoryUnitListItem
+ *
+ * One row of the memory-unit listing.
+ *
+ * Extra keys are allowed and passed through: the rows used to be an open object, and
+ * typing them must not drop a field an older or newer server also returns.
+ */
+export type MemoryUnitListItem = {
+  /**
+   * Id
+   *
+   * Memory unit ID
+   */
+  id: string;
+  /**
+   * Text
+   *
+   * The fact text
+   */
+  text?: string;
+  /**
+   * Context
+   *
+   * Context the memory was captured in
+   */
+  context?: string;
+  /**
+   * Date
+   *
+   * Event date (ISO 8601), empty when unknown
+   */
+  date?: string;
+  /**
+   * Fact Type
+   *
+   * Fact type: world, experience or observation
+   */
+  fact_type?: string | null;
+  /**
+   * Document Id
+   *
+   * Source document ID
+   */
+  document_id?: string | null;
+  /**
+   * Mentioned At
+   *
+   * When the memory was mentioned (ISO 8601)
+   */
+  mentioned_at?: string | null;
+  /**
+   * Occurred Start
+   *
+   * Start of the event interval (ISO 8601)
+   */
+  occurred_start?: string | null;
+  /**
+   * Occurred End
+   *
+   * End of the event interval (ISO 8601)
+   */
+  occurred_end?: string | null;
+  /**
+   * Entities
+   *
+   * Comma-separated canonical entity names
+   */
+  entities?: string;
+  /**
+   * Chunk Id
+   *
+   * Source chunk ID
+   */
+  chunk_id?: string | null;
+  /**
+   * Proof Count
+   *
+   * How many times the fact was independently seen
+   */
+  proof_count?: number;
+  /**
+   * Tags
+   *
+   * Tags on this memory unit
+   */
+  tags?: Array<string>;
+  /**
+   * Metadata
+   *
+   * Arbitrary metadata stored with the memory
+   */
+  metadata?: {
+    [key: string]: unknown;
+  };
+  /**
+   * Consolidated At
+   *
+   * When consolidation last succeeded (ISO 8601)
+   */
+  consolidated_at?: string | null;
+  /**
+   * Consolidation Failed At
+   *
+   * When consolidation last failed permanently (ISO 8601)
+   */
+  consolidation_failed_at?: string | null;
+  /**
+   * State
+   *
+   * Curation state: 'valid' or 'invalidated'
+   */
+  state?: string;
+  /**
+   * Invalidation Reason
+   *
+   * Why the fact was invalidated, if it was
+   */
+  invalidation_reason?: string | null;
+  /**
+   * Invalidated At
+   *
+   * When the fact was invalidated (ISO 8601)
+   */
+  invalidated_at?: string | null;
+  /**
+   * Edited At
+   *
+   * When the fact was last edited by hand (ISO 8601)
+   */
+  edited_at?: string | null;
+  /**
+   * Updated At
+   *
+   * Write watermark for this row (ISO 8601)
+   */
+  updated_at?: string | null;
+  /**
+   * Source Memory Ids
+   *
+   * An observation's source facts; empty for a source fact
+   */
+  source_memory_ids?: Array<string>;
 };
 
 /**
@@ -4347,6 +4920,182 @@ export type OperationsListResponse = {
 };
 
 /**
+ * PromptBlockModel
+ *
+ * One block of a message: its text, and the setting that decides it.
+ *
+ * The **active** blocks of a message concatenate back to the exact text sent, so a
+ * client can render them separately without showing the reader something the model
+ * never receives. An **inactive** block has no text: it marks a setting that is
+ * switched off, at the point where it would land if it were on.
+ *
+ * Everything identifying a block is a machine value, never display copy — what a
+ * block is called, and what turning a switched-off one on would do, is for the
+ * client to say in the language it is running in.
+ */
+export type PromptBlockModel = {
+  /**
+   * Text
+   *
+   * The block's text; empty when the block is inactive.
+   */
+  text: string;
+  /**
+   * Source
+   *
+   * `config` — produced by a setting (`field` names it); `builtin` — Hindsight's own wording.
+   */
+  source: "config" | "builtin";
+  /**
+   * Field
+   *
+   * Config field behind this block; empty when no single field owns it.
+   */
+  field?: string;
+  /**
+   * Section
+   *
+   * Slug for a part the preview names itself and no field owns: `bank_identity`, `disposition`, `directives`. Empty otherwise.
+   */
+  section?: string;
+  /**
+   * Heading
+   *
+   * The section heading the prompt text carries at this point, extracted from the prompt itself. Empty when it carries none.
+   */
+  heading?: string;
+  /**
+   * Active
+   *
+   * Whether this block is in the prompt as configured.
+   */
+  active?: boolean;
+  /**
+   * Value
+   *
+   * The field's effective value; null when unset.
+   */
+  value?: string | null;
+  /**
+   * Kind
+   *
+   * Shape of the value, so a client can offer the right control for editing it.
+   */
+  kind: "text" | "boolean" | "choice" | "complex";
+  /**
+   * Choices
+   *
+   * Allowed values, when `kind` is `choice`.
+   */
+  choices?: Array<string> | null;
+  /**
+   * Editable
+   *
+   * Whether this bank may override the field via the bank config API. Server-level fields shape the prompt but cannot be set per bank, and offering to edit one would only collect a 400.
+   */
+  editable?: boolean;
+};
+
+/**
+ * PromptMessageModel
+ *
+ * One message of the request, as the blocks it is built from.
+ */
+export type PromptMessageModel = {
+  /**
+   * Role
+   */
+  role: "system" | "user";
+  /**
+   * Blocks
+   */
+  blocks?: Array<PromptBlockModel>;
+};
+
+/**
+ * PromptPreviewRequest
+ *
+ * Request to render the prompts an operation would send, without calling an LLM.
+ *
+ * The operation is the whole request: everything that shapes the prompt comes from
+ * the bank — its resolved config, profile and directives — and the runtime data an
+ * operation would be given is a fixed placeholder. There is deliberately nothing to
+ * override. A preview answers "what does this bank send"; letting a caller pass its
+ * own mission or sample text only moved that question somewhere the bank cannot
+ * answer it. To try a candidate value, save it and look again — the response says
+ * which settings are editable.
+ */
+export type PromptPreviewRequest = {
+  /**
+   * Operation
+   *
+   * Which operation's prompts to render.
+   */
+  operation?: "retain" | "consolidation" | "reflect";
+  /**
+   * Strategy
+   *
+   * Name of a retain strategy to render under (a key of the bank's `retain_strategies`). Retain only. Omit it and the bank's `retain_default_strategy` applies, exactly as it does for a retain that names none.
+   */
+  strategy?: string | null;
+};
+
+/**
+ * PromptPreviewResponse
+ *
+ * The messages one call of the requested operation would send.
+ *
+ * `messages` is in send order, system first. Both are always present because a
+ * mission is not necessarily in the system prompt: retain and consolidation keep
+ * their system prompt bank-agnostic (so one provider-side cache serves every bank)
+ * and carry the mission in the user message instead.
+ *
+ * When `skipped_reason` is set the configuration means no prompt is sent at all —
+ * `chunks` extraction mode stores each chunk verbatim and never calls an LLM — and
+ * `messages` is empty.
+ */
+export type PromptPreviewResponse = {
+  /**
+   * Messages
+   *
+   * Request messages, in send order. Each is given as the blocks it is built from.
+   */
+  messages?: Array<PromptMessageModel>;
+  /**
+   * Strategy
+   *
+   * The retain strategy these prompts were rendered under, if any.
+   */
+  strategy?: string | null;
+  /**
+   * Strategies
+   *
+   * Names of the bank's retain strategies, so a client can offer them without a second call.
+   */
+  strategies?: Array<string>;
+  /**
+   * Run Settings
+   *
+   * Settings that shape the operation without appearing in its prompt, such as chunk sizes.
+   */
+  run_settings?: Array<RunSettingModel>;
+  /**
+   * Response Schema
+   *
+   * JSON schema the response is constrained to, when the operation constrains it.
+   */
+  response_schema?: {
+    [key: string]: unknown;
+  } | null;
+  /**
+   * Skipped Reason
+   *
+   * Why no prompt is sent, when the configuration means none is.
+   */
+  skipped_reason?: string | null;
+};
+
+/**
  * RecallRequest
  *
  * Request model for recall endpoint.
@@ -4524,6 +5273,12 @@ export type RecallResult = {
    */
   source_fact_ids?: Array<string> | null;
   scores?: RecallScores | null;
+  /**
+   * Attachments
+   *
+   * Attachments this fact was drawn from, as recorded per fact at extraction time — the same edge the memory read endpoints return, not everything its chunk happened to carry. A fact stated in prose reports none. Omitted when there are none.
+   */
+  attachments?: Array<ChunkAttachment> | null;
 };
 
 /**
@@ -4830,6 +5585,12 @@ export type ReflectResponse = {
     [key: string]: unknown;
   } | null;
   /**
+   * Structured Output Error
+   *
+   * Why structured output could not be produced. Present only when a response_schema was given and the extraction call failed (provider error, timeout, unparseable output). A missing structured_output *without* this field means the answer held nothing matching the schema — the reflect itself still succeeded either way.
+   */
+  structured_output_error?: string | null;
+  /**
    * Token usage metrics for LLM calls during reflection.
    */
   usage?: TokenUsage | null;
@@ -5065,6 +5826,40 @@ export type RetryOperationResponse = {
    * Operation Id
    */
   operation_id: string;
+};
+
+/**
+ * RunSettingModel
+ *
+ * A setting that shapes the operation without appearing in its prompt.
+ *
+ * Chunk sizes decide how the input is cut before extraction runs, so they change
+ * what comes back while contributing no prompt text — they cannot be blocks, which
+ * partition the message, and these are in none of it.
+ */
+export type RunSettingModel = {
+  /**
+   * Field
+   */
+  field: string;
+  /**
+   * Value
+   *
+   * Effective value; null when unset.
+   */
+  value?: string | null;
+  /**
+   * Kind
+   *
+   * Shape of the value, so a client can offer the right control.
+   */
+  kind: "text" | "boolean" | "choice" | "complex";
+  /**
+   * Editable
+   *
+   * Whether this bank may override the field via the bank config API.
+   */
+  editable?: boolean;
 };
 
 /**
@@ -5360,7 +6155,7 @@ export type UpdateDocumentRequest = {
   /**
    * Tags
    *
-   * New tags for the document and its memory units. Triggers observation invalidation and re-consolidation.
+   * The complete new set of tags for the document and its memory units — this REPLACES the existing tags rather than adding to them, so omitting a tag drops it and `[]` clears them all. Triggers observation invalidation and re-consolidation.
    */
   tags?: Array<string> | null;
 };
@@ -6044,6 +6839,42 @@ export type DryRunExtractMemoriesResponses = {
 export type DryRunExtractMemoriesResponse =
   DryRunExtractMemoriesResponses[keyof DryRunExtractMemoriesResponses];
 
+export type PreviewPromptData = {
+  body: PromptPreviewRequest;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/prompts/preview";
+};
+
+export type PreviewPromptErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type PreviewPromptError = PreviewPromptErrors[keyof PreviewPromptErrors];
+
+export type PreviewPromptResponses = {
+  /**
+   * Successful Response
+   */
+  200: PromptPreviewResponse;
+};
+
+export type PreviewPromptResponse = PreviewPromptResponses[keyof PreviewPromptResponses];
+
 export type GetMemoryData = {
   body?: never;
   headers?: {
@@ -6635,7 +7466,7 @@ export type ListMentalModelsData = {
     /**
      * Detail
      *
-     * Detail level: 'metadata' (names/tags only), 'content' (adds content/config), 'full' (includes reflect_response)
+     * Detail level: 'metadata' (names/tags/staleness — the default), 'content' (adds content/config), 'full' (includes reflect_response). Content is opt-in: it is returned only when explicitly requested.
      */
     detail?: "metadata" | "content" | "full";
     /**
@@ -8392,7 +9223,12 @@ export type CreateOrUpdateBankResponse =
   CreateOrUpdateBankResponses[keyof CreateOrUpdateBankResponses];
 
 export type ImportBankTemplateData = {
-  body?: never;
+  /**
+   * Manifest
+   *
+   * Bank template manifest
+   */
+  body: BankTemplateManifest;
   headers?: {
     /**
      * Authorization
@@ -8644,8 +9480,11 @@ export type GetBankAttachmentResponses = {
   /**
    * Attachment bytes
    */
-  200: unknown;
+  200: Blob | File;
 };
+
+export type GetBankAttachmentResponse =
+  GetBankAttachmentResponses[keyof GetBankAttachmentResponses];
 
 export type DownloadFileData = {
   body?: never;
@@ -8678,8 +9517,10 @@ export type DownloadFileResponses = {
   /**
    * Stored file
    */
-  200: unknown;
+  200: Blob | File;
 };
+
+export type DownloadFileResponse = DownloadFileResponses[keyof DownloadFileResponses];
 
 export type GetBankTemplateSchemaData = {
   body?: never;

@@ -209,6 +209,9 @@ import type {
   LlmRequestStatsResponses,
   MetricsEndpointMetricsGetData,
   MetricsEndpointMetricsGetResponses,
+  PreviewPromptData,
+  PreviewPromptErrors,
+  PreviewPromptResponses,
   RecallMemoriesData,
   RecallMemoriesErrors,
   RecallMemoriesResponses,
@@ -397,6 +400,23 @@ export const dryRunExtractMemories = <ThrowOnError extends boolean = false>(
     ThrowOnError
   >({
     url: "/v1/default/banks/{bank_id}/memories/dry-run-extract",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Preview an operation's prompts (no LLM call)
+ *
+ * Render the exact system and user messages retain, consolidation or reflect would send for this bank, without calling an LLM, reading memories, or changing anything. Everything that shapes the prompt comes from the bank; the runtime data an operation would be given is a fixed placeholder. Both messages are returned: retain and consolidation keep their system prompt bank-agnostic (one provider-side cache serves every bank) and carry the mission in the user message instead.
+ */
+export const previewPrompt = <ThrowOnError extends boolean = false>(
+  options: Options<PreviewPromptData, ThrowOnError>
+) =>
+  (options.client ?? client).post<PreviewPromptResponses, PreviewPromptErrors, ThrowOnError>({
+    url: "/v1/default/banks/{bank_id}/prompts/preview",
     ...options,
     headers: {
       "Content-Type": "application/json",
@@ -1032,7 +1052,9 @@ export const getDocument = <ThrowOnError extends boolean = false>(
  *
  * Update mutable fields on a document without re-processing its content.
  *
- * **Tags** (`tags`): Propagated to all associated memory units. Observations derived from those units are invalidated and queued for re-consolidation under the new tags. Co-source memories from other documents that shared those observations are also reset.
+ * **Tags** (`tags`): The array REPLACES the document's tags, it is not merged into them — send the complete set you want the document to end up with, and any tag you leave out is dropped. An empty array (`[]`) therefore clears every tag; only omitting the field entirely is rejected (422).
+ *
+ * The new tags are propagated to all associated memory units. Observations derived from those units are invalidated and queued for re-consolidation under the new tags. Co-source memories from other documents that shared those observations are also reset. Tags are compared as a set, so re-sending the tags a document already has (in any order) changes nothing and queues no re-consolidation.
  *
  * At least one field must be provided.
  */
@@ -1264,7 +1286,14 @@ export const importBankTemplate = <ThrowOnError extends boolean = false>(
     ImportBankTemplateResponses,
     ImportBankTemplateErrors,
     ThrowOnError
-  >({ url: "/v1/default/banks/{bank_id}/import", ...options });
+  >({
+    url: "/v1/default/banks/{bank_id}/import",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
 
 /**
  * Export bank template

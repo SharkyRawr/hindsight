@@ -14,31 +14,10 @@ Read and internalize these standards before writing code. The review steps below
 
 ### Supported interpreters
 
-Hindsight must work on **both** of these, and a change is not done until it does:
-
-- **CPython 3.11** — the baseline, what `docker/standalone/Dockerfile` ships by default
-  and what the `.python-version` pin and `uv.lock` resolve for.
-- **Free-threaded CPython 3.14** (`python3.14t`) — the `-py3.14t` image target, where
-  the process runs an event loop per thread and executes Python bytecode in parallel.
-
-Neither is a "future" target that can be deferred to a follow-up. Two consequences
-that catch people, both covered in detail under Concurrency below:
-
-- **Anything process-wide is genuinely concurrent** on 3.14t. The GIL is no longer
-  making check-then-act sequences accidentally atomic, and `asyncio` primitives shared
-  between loops break outright.
-- **Free-threading is lost silently.** Importing a C extension that has not declared
-  `Py_MOD_GIL_NOT_USED` re-enables the GIL for the whole process, with only a
-  `RuntimeWarning`. Nothing crashes; the 3.14t image simply performs like the 3.11 one.
-  So "it passed CI" is weaker evidence here than usual — that is why the free-threaded
-  job asserts the GIL is off *before* running a single test, and why the image build
-  asserts it too.
-
-Most of what breaks is not free-threading-specific: it is *multi-loop*, which
-reproduces on 3.11 as soon as two event loops exist in one process.
-`tests/test_multi_loop_conformance.py` is the cheap guard for that and runs in the
-ordinary suite, so a reviewer should expect new shared state to be covered there
-rather than only by the free-threaded job.
+**CPython 3.11** is the baseline — what `docker/standalone/Dockerfile` ships, and what
+the `.python-version` pin and `uv.lock` resolve for. The package supports 3.11 through
+3.14; `build-api-python-versions` in CI installs and smoke-tests each of them, so a
+dependency floor that excludes one of those interpreters is a break, not a follow-up.
 
 ### Python Style
 - Python 3.11+, type hints required — and see Supported interpreters above
@@ -107,13 +86,25 @@ results = await asyncio.gather(*tasks, return_exceptions=True)
 - Engine methods return typed models (Pydantic/dataclass), not raw dicts (see Type Safety).
 - **Every list endpoint paginates, following the existing ones.** A `GET` that returns a collection whose size grows with the data (banks, documents, memories, entities, operations, webhook deliveries, audit logs, …) must take `limit`/`offset` and bound its result — an unbounded list is an unbounded payload plus unbounded per-row work (per-item counts, config resolution, embedding hydration). Copy the shape `list_documents` uses, don't invent a new one: `limit: int = Query(default=100, ge=0)` and `offset: int = Query(default=0, ge=0)` on the handler, matching keyword args on the engine method, and a response carrying the page **plus `total`, `limit`, `offset`** so a client knows when to stop. Add a `q` search param when the collection is something a user picks from in a UI — client-side filtering only ever sees the loaded page. Bounded-by-construction endpoints are the exception, not the rule: a tree/export that is whole-structure by design, or a table capped at write time (e.g. `observation_history` / `mental_model_history`, trimmed to `*_max_entries` on insert). If it isn't bounded, paginate it.
 
+### HTTP Middleware
+- **Never add a `BaseHTTPMiddleware`** — that means no `@app.middleware("http")` (the decorator installs one) and no `add_middleware(SomethingSubclassingBaseHTTPMiddleware)`. Starlette runs each such middleware's downstream app in a **child task**, piping the request and response through a pair of anyio memory-object streams. That costs a task spawn plus several scheduling hops per request, and because the cost is *scheduling*, it grows exactly when the event loop is already contended: removing the API's two of them took `/health/live` from ~2.4k to ~7.9k rps and p99 from ~107ms to ~18ms at the same concurrency (#4235). It also breaks `Request.is_disconnected()` for everything underneath it — the `http.disconnect` event never reaches the route (#2122) — and swallows `BackgroundTask` / streaming semantics in subtle ways.
+- **Write a pure-ASGI middleware instead**: a class with `__init__(self, app)` and `async def __call__(self, scope, receive, send)` that passes straight through for `scope["type"] != "http"` and wraps `send` when it needs to observe the response (read the status off the `http.response.start` message, append headers to `message["headers"]` as raw byte pairs). One `await` in the same task, no hops. `hindsight_api/api/observability.py` and `api/disconnect.py` are the models to copy.
+- **Prefer moving the work down a layer when it needs routing context.** Anything that has to know which endpoint was hit — its parameters, its signature, its body model — belongs in an `APIRoute` subclass (`app.router.route_class = ...`), not in a middleware that re-derives the route by walking `app.routes` and calling `route.matches()`. The route is already resolved there, and per-route facts can be computed once at startup instead of per request. See `api/unknown_params.py`. Note that `include_router` does not apply the app's `route_class` to a router's own routes — FastAPI <= 0.140 keeps each source route's class, >= 0.141 materialises from the source router's `route_class` — so routes from an included/extension router need `use_unknown_params_routes(router)` before the include.
+- **Header values built from client input must be sanitised** before they reach `message["headers"]`: query-param and body-field names are percent-decoded attacker input, so a non-latin-1 name raises mid-`send` (a 500 from a typo) and a name containing CR/LF splits the response.
+
+### Outbound HTTP: aiohttp, async only
+- **Production code makes HTTP calls with aiohttp, never httpx.** httpx's async client costs noticeably more per request than aiohttp (httpcore pool, anyio layers), and that overhead lands on the hottest paths we have — embeddings, reranking and LLM calls on every retain and recall. Build clients with `hindsight_api/engine/aiohttp_session.py`: `LoopLocalSession` (one `ClientSession` per event loop, created lazily — never create a session in `__init__` or in an `initialize()` that may run under `asyncio.run` in another thread), `per_phase_timeout` (httpx-style per-phase timeouts; aiohttp's `total` would cut off a long streamed body), and `raise_for_status` (raises `UpstreamHTTPError`, which keeps the body and a `status_code` that `remote_retry` classifies on).
+- **Sync HTTP is forbidden in production code** — no `requests`, `urllib.request`, `urllib3`, `http.client`, `httpx.Client`, and no sync SDK client (`openai.OpenAI`, `cohere.Client`, `litellm.embedding`, …) where the SDK has an async one. A sync call either blocks the event loop or needs a thread per in-flight request; use the async form on the loop instead. Wrapping a sync call in `asyncio.to_thread` / `run_in_executor` is not a fix. The only accepted exception is an SDK that offers no async API at all (e.g. `google.auth` credential refresh) — run that in a thread and say why in a comment.
+- **Enforced by ruff** (`TID251`, `banned-api` in `hindsight-api-slim/pyproject.toml`). `import httpx` is allowed only to *configure or classify* a third-party SDK that is built on it (`llm_transport.build_sdk_timeout` for the OpenAI/Anthropic SDKs, `remote_retry` classifying their errors), with a `# noqa: TID251` plus a comment naming the SDK. Reject any other `noqa: TID251`. `http_probe.py` is the one per-file exemption (stdlib-only readiness probe, its own process).
+- **Tests are exempt.** FastAPI's `TestClient` / `httpx.ASGITransport` are fine. To stub an upstream for an aiohttp client, serve it from `tests/aiohttp_stub.py::stub_server` rather than mocking the session.
+
 ### Bank/Tenant Isolation in Queries
 - **Bank isolation is a hard security invariant: no query may read, count, update, or delete another bank's rows.** Tenant isolation is enforced at the schema level (the resolved `search_path` / `fq_table(...)` qualifier, gated by `_authenticate_tenant`); bank isolation is enforced *within* a schema by a `bank_id` predicate on every statement that touches a multi-bank table.
 - **Every SQL statement against a multi-bank table must be constrained by `bank_id`** — directly in the `WHERE`, or transitively (see below). Multi-bank tables carry a `bank_id` column: `memory_units`, `documents`, `entities`, `entity_links`, `mental_models`, `knowledge_pages`, `memory_links`, `observation_history`, and similar.
 - **The trap: filtering by a caller-supplied, non-globally-unique key without `bank_id`.** Keys like `document_id` and `mental_models.id` are unique only *per bank* (their PK is composite, e.g. `(id, bank_id)`), so the *same* id legally exists in every bank. A statement like `UPDATE memory_units SET tags = $1 WHERE document_id = $2` — no `bank_id` — silently reads/writes **every** bank's rows that share the id. This is the exact defect from #3429/#3430. Adding `AND bank_id = $n` fixes it.
 - **Three ways a statement is legitimately scoped** (accept these; flag anything that fits none):
   1. **Explicit** `WHERE ... AND bank_id = $n`.
-  2. **Globally-unique single-column PK.** Filtering by a global uuid PK (`memory_units.id`, `entities.id`, `knowledge_pages.id`) or a bank-encoded key (`chunks.chunk_id` is `{bank_id}_{document_id}_{idx}`) cannot collide across banks. Contrast the *composite*-PK ids (`documents.id`/`document_id`, `mental_models.id`) — those are dangerous and MUST carry `bank_id`.
+  2. **Globally-unique single-column PK.** Filtering by a global uuid PK (`memory_units.id`, `entities.id`, `knowledge_pages.id`) or a bank-encoded key (`chunks.chunk_id`, built by `engine/chunk_ids.py`) cannot collide across banks. Note that the chunk id is only injective because that helper escapes the separator inside each component — the plain `{bank_id}_{document_id}_{idx}` join it replaced let `('a', 'b_c')` and `('a_b', 'c')` address the same row (#4244), so ids written before it are NOT safe to treat as bank-scoped. Contrast the *composite*-PK ids (`documents.id`/`document_id`, `mental_models.id`) — those are dangerous and MUST carry `bank_id`.
   3. **Transitive.** Junction tables without a `bank_id` column (`unit_entities`, `entity_cooccurrences`, `observation_sources`) are safe only when reached through globally-unique unit/entity ids that were themselves selected from a bank-scoped query in the same call, and edges are intra-bank by construction. If the id set could contain another bank's ids, it is not scoped.
 - **Watch two smells:** (a) a caller-supplied id used in the `WHERE` with no adjacent `bank_id`, while a *neighbouring* statement in the same method does carry `bank_id` (asymmetry is the tell); (b) a `bank_id` predicate applied only under `if bank_id:` with a `bank_id: str | None = None` default — latent even if all current callers pass one.
 - **Cross-bank by design must rewrite `bank_id` to the destination.** The transfer/import path is the only one that legitimately crosses banks; verify every write pins the *destination* `bank_id` and never inherits a source row's `bank_id`.
@@ -123,11 +114,11 @@ results = await asyncio.gather(*tasks, return_exceptions=True)
 - The pre-existing usage in `hindsight_api/migrations.py` is grandfathered, not a precedent — it is tracked for removal. Don't copy it.
 - Design the concurrency out instead of locking around it: give each process its own object to write (e.g. per-schema DDL rather than a shared `public.` object), make the operation idempotent, or use a real row/table constraint (`INSERT ... ON CONFLICT`, `SELECT ... FOR UPDATE` in a fixed order). See #2690 for a migration that reached for `pg_advisory_xact_lock` and had to be reverted.
 
-### Concurrency: asyncio vs threading primitives, and free-threading
+### Concurrency: asyncio vs threading primitives
 
-Hindsight is expected to run on free-threaded CPython (`python3.14t`), where one
-process can host several event loops in parallel threads. Two rules follow, and both
-are silent when broken — the code passes tests and fails under load.
+A Hindsight process runs threads (executors, `asyncio.to_thread`) and, across tests
+and tooling, more than one event loop. The rules below are silent when broken — the
+code passes tests and fails under load.
 
 **Which lock.** The choice is not style, it is ownership:
 
@@ -154,20 +145,11 @@ that owns them.
 `asyncio.Future` must key its in-flight map by `(running loop, key)`. Sharing the
 cached *data* across loops is fine and desirable; sharing the future is not.
 
-**Module-level mutable state.** Under free-threading, a process-global dict/set/list
-is genuinely concurrent for the first time — the GIL no longer makes check-then-act
-sequences accidentally atomic. Guard them, and never iterate one while another thread
-may mutate it (`RuntimeError: dictionary changed size during iteration`). Prefer
+**Module-level mutable state.** A process-global dict/set/list reachable from more
+than one thread needs a guard, and must never be iterated while another thread may
+mutate it (`RuntimeError: dictionary changed size during iteration` at best; a C
+extension handed borrowed references into a resizing dict can segfault). Prefer
 warm-once-under-a-lock over locking the hot path.
-
-**C extension imports.** On a free-threaded build, importing an extension that has not
-declared `Py_MOD_GIL_NOT_USED` **re-enables the GIL for the whole process**, with only
-a `RuntimeWarning`. Everything then still works, just single-threaded. So a new
-module-scope `import` of a C/Rust package is a load-bearing decision: keep it lazy
-unless the package is known free-threading-safe. `tests/test_free_threading.py` guards
-the API import surface; run the suite under
-`PYTHONWARNINGS="error:The global interpreter lock:RuntimeWarning"` to make a
-regression fail at the offending import.
 
 ### Branch Hygiene
 - **Always start new feature branches from `origin/main`** — rebase to ensure a clean base.
@@ -259,6 +241,58 @@ Direct SQL on those tables is legitimate **only** when it forces or inspects int
 public API cannot express — e.g. an `UPDATE documents SET updated_at` that forges a race, or a
 raw `memory_links` row-count that the deduped `get_graph_data` edge list cannot reproduce. Those
 must carry a comment saying why the direct access is necessary; flag any that do not.
+
+### 6b. Check user-facing capabilities have a system test
+
+`hindsight-system-tests/` holds blackbox stories that drive a real `hindsight-api`
+process through the published Python client — no engine access, no SQL, no internal
+imports. They exist because the ~500-file api-slim suite is one test per *mechanism*,
+which catches mechanism bugs and misses **composition** bugs: consolidation wiping the
+facts under it, a delta refresh missing a backdated window, a transfer dropping
+mental-model evidence, a reprocess that is a silent no-op. Every one of those spanned
+steps no single-mechanism test crosses. Tracking issue: #4214.
+
+A change needs a system story when it **adds a capability a user can name**, or when it
+**makes two existing capabilities meet**. Concretely, flag as **should fix** a PR that:
+
+- adds or changes an API endpoint, a retain/recall/reflect parameter, or a bank-config
+  field that alters observable behaviour;
+- adds a new derived layer or lifecycle step (an observation kind, a refresh trigger, a
+  background operation);
+- makes an existing feature interact with another for the first time — a new
+  combination is exactly what the unit suite cannot see;
+- fixes a composition bug. The regression test belongs here, not only in api-slim,
+  because the bug lived in the seam between steps.
+
+It does **not** need one for: internal refactors with no observable change, performance
+work, a mechanism already covered by an existing story, or anything whose only surface
+is the control plane (this suite is API-only by design).
+
+When reviewing an added or changed story, check:
+
+- **It goes through the client.** `client.aretain(...)`, not `httpx` and not
+  `MemoryEngine`. Reaching around the published client hides SDK defects the suite
+  exists to surface — `import_bank_template` was uncallable from every SDK (#4232) and
+  only a client-driven test could show it. **Must fix** if a story bypasses the client
+  to make itself pass.
+- **Every LLM call is declared.** An unscripted call fails the test with the rule to
+  paste in; a story that answers one with a plausible default proves nothing. Never
+  add a catch-all rule to quiet a miss.
+- **Background work is awaited, not disabled.** Retain enqueues consolidation; a story
+  that switches it off to stay deterministic has removed the half where the composition
+  bugs live. Use `settled(bank_id)`.
+- **It asserts the whole deterministic payload**, not the presence of a keyword. With
+  the LLM, embedder and reranker all stubbed, recall is a pure function of its input —
+  ranking, scores and rendered text are all pinnable, and "the word appears somewhere"
+  passes just as happily when fusion inverts.
+- **A known defect fails, rather than being documented.** If the PR leaves a contract
+  unmet, the story asserts the behaviour we *want* and is red until it is fixed — not
+  `xfail`, which keeps the run green so nothing forces the question, and not a test
+  pinning today's wrong answer, which breaks the day someone fixes it and teaches the
+  next reader to delete tests. **Must fix** either shape.
+
+The suite's README documents the conventions; `tests/test_01_retain_and_recall.py` is
+the reference for how total the assertions should be.
 
 ### 7. Check API consistency
 
@@ -399,7 +433,30 @@ Grep the diff for `advisory` (`git diff main...HEAD | grep -in advisory`). Any n
 author at the alternatives (per-process objects, idempotent DDL, row-level
 constraints) rather than just asking them to drop the lock.
 
-### 11d. Check concurrency primitives and free-threading safety
+### 11e. Check for BaseHTTPMiddleware
+
+```bash
+git diff main...HEAD -- '*.py' | grep -nE "@app\.middleware\(|BaseHTTPMiddleware"
+```
+
+Any new `@app.middleware("http")` or `BaseHTTPMiddleware` subclass is a **must fix** —
+see "HTTP Middleware" above. Ask for a pure-ASGI middleware (or an `APIRoute` subclass
+if the logic needs routing context), and check that a `send` wrapper sanitises any
+header value derived from client input.
+
+### 11f. Check outbound HTTP is aiohttp and async
+
+```bash
+git diff main...HEAD -- '*.py' ':!**/tests/**' | grep -nE "^\+.*(import httpx|from httpx|import requests|urllib\.request|http\.client|noqa: TID251|\.Client\(|asyncio\.to_thread|run_in_executor)"
+```
+
+Any new httpx use or sync HTTP call in production code is a **must fix** — see
+"Outbound HTTP" above. `ruff` catches the imports; review catches what it can't: a sync
+SDK client where an async one exists, a sync call pushed into `to_thread` /
+`run_in_executor`, an `aiohttp.ClientSession` created outside `LoopLocalSession`, and any
+`# noqa: TID251` that is not configuring or classifying a third-party SDK.
+
+### 11d. Check concurrency primitives
 
 See "Concurrency" above. Grep the diff:
 
@@ -415,23 +472,14 @@ git diff main...HEAD -- '*.py' | grep -nE "asyncio\.(Lock|Semaphore|Event|Condit
 - An in-flight/coalescing map holding `asyncio.Future`s keyed without the running loop.
 
 **Also check the change does not quietly drop an interpreter:**
-- A new dependency, or a version bump, that has no free-threaded (`cp3XXt`) wheel and
-  is imported on the API path — it costs the `-py3.14t` image its free-threading.
-  Check with `pip index versions` / the project's wheel list, and if there is no
-  wheel, either keep the import lazy or add it to
-  `hindsight-api-slim/overrides-freethreaded.txt` with a runtime fallback.
+- A new dependency, or a version bump, with no wheel for one of 3.11-3.14 — the
+  `build-api-python-versions` CI matrix installs and smoke-tests every one of them.
 - Syntax or stdlib usage newer than 3.11 (`uv run ty check` catches most of it).
 - A test that assumes one event loop per process, when what it covers is shared state.
 
 **Should fix:**
 - New process-global mutable state (dict/set/list, `lru_cache` over mutable values)
   with no lock, or iterated somewhere it can be mutated concurrently.
-- A new module-scope `import` of a C/Rust extension on the API import path. Check it
-  ships free-threaded wheels and declares `Py_MOD_GIL_NOT_USED`; if not, make it lazy.
-  Verify with:
-  ```bash
-  python -c "import sys, <mod>; print(sys._is_gil_enabled())"   # on a 3.14t build
-  ```
 
 ### 12. Review against other coding standards
 
@@ -456,6 +504,8 @@ Present a clear summary organized by severity:
 - Raw dict usage for structured data (including internal code)
 - Multi-item tuple returns (including internal code)
 - Missing tests for new endpoints
+- A new user-facing capability, or a new combination of existing ones, with no story in `hindsight-system-tests/` (see step 6b)
+- A system story that bypasses the published client, silences an unscripted LLM call, or disables background work to stay deterministic
 - Direct DB access (raw SQL / `acquire_with_retry` / `fq_table`) in an `api/` handler instead of a `MemoryEngine` method
 - Tenant-scoped data accessed without authentication enforced in the engine (`_authenticate_tenant` / `get_bank_profile`)
 - A SQL statement against a multi-bank table filtered by a caller-supplied, non-globally-unique key without a `bank_id` predicate (cross-bank read/write leak — see step 7c)
@@ -466,10 +516,8 @@ Present a clear summary organized by severity:
   harness, dialect, provider or language variant that skips a lifecycle step the others perform
 - An `asyncio` lock/semaphore/event created at import time or owned by a process-wide
   singleton, or a `threading.Lock` held across an `await` (see step 11d)
-- A change that only works on one of the two supported interpreters — 3.11 and
-  free-threaded 3.14 (see Supported interpreters); in particular a new C-extension
-  dependency with no `cp3XXt` wheel imported on the API path, which silently costs the
-  `-py3.14t` image its free-threading
+- A change that works on only some of the supported interpreters, 3.11 through 3.14
+  (see Supported interpreters)
 
 **Should fix** — issues that hurt code quality:
 - Dead code / unused imports missed by linter

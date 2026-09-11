@@ -264,6 +264,45 @@ class TestMetricsCollector:
         attributes = collector.operation_duration.record.call_args[0][1]
         assert attributes["bank_id"] == "test_bank"
 
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_recall_diagnostic_phases_follow_config(self, enabled):
+        """Diagnostic phases are dropped when disabled; ordinary phases are always recorded, once."""
+        mock_config = MagicMock()
+        mock_config.metrics_include_bank_id = False
+        mock_config.recall_diagnostic_phases = enabled
+        mock_config.recall_phase_sample_every = 1
+        with (
+            patch("hindsight_api.metrics.get_meter", return_value=MagicMock()),
+            patch("hindsight_api.config.get_config", return_value=mock_config),
+        ):
+            collector = MetricsCollector()
+
+        collector.record_recall_phase("engine_call", 0.01, diagnostic=True)
+        collector.record_recall_phase("engine_auth", 0.01)
+
+        phases = [c.args[1]["phase"] for c in collector.recall_phase_duration.record.call_args_list]
+        assert phases == (["engine_call", "engine_auth"] if enabled else ["engine_auth"])
+
+    def test_recall_phase_sampling_records_one_in_n(self):
+        """With a sample rate of N, a phase is recorded only when the draw lands in the 1/N slice."""
+        mock_config = MagicMock()
+        mock_config.metrics_include_bank_id = False
+        mock_config.recall_diagnostic_phases = True
+        mock_config.recall_phase_sample_every = 10
+        with (
+            patch("hindsight_api.metrics.get_meter", return_value=MagicMock()),
+            patch("hindsight_api.config.get_config", return_value=mock_config),
+        ):
+            collector = MetricsCollector()
+
+        # random() * 10 < 1 keeps the observation: 0.05 and 0.099 are kept, 0.1 and 0.9 are dropped.
+        with patch("hindsight_api.metrics.random.random", side_effect=[0.05, 0.1, 0.9, 0.099]):
+            for phase in ("a", "b", "c", "d"):
+                collector.record_recall_phase(phase, 0.01)
+
+        phases = [c.args[1]["phase"] for c in collector.recall_phase_duration.record.call_args_list]
+        assert phases == ["a", "d"]
+
 
 class TestGetMetricsCollector:
     """Tests for the get_metrics_collector function."""

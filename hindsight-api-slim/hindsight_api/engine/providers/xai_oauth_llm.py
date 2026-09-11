@@ -21,7 +21,7 @@ The wire format is OpenAI-shaped, but the credential is a rotating OAuth token
 with proactive/reactive refresh against a shared on-disk store, and xAI's 403
 responses need their own classification (a spending-limit stop is not a
 credential failure). Neither fits the OpenAI SDK client the compatible provider
-is built on, so the transport is a hand-written ``httpx.AsyncClient`` in the
+is built on, so the transport is a hand-written aiohttp session in the
 ``codex_llm`` mould.
 
 Logging
@@ -41,21 +41,27 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import time
+from collections.abc import Mapping
 from contextlib import AbstractAsyncContextManager, nullcontext, suppress
 from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
-import httpx
+import aiohttp
 from pydantic import BaseModel, Field
 
-from hindsight_api.config import DEFAULT_LLM_TIMEOUT, ENV_LLM_TIMEOUT
+from hindsight_api.config import (
+    DEFAULT_XAI_OAUTH_BASE_URL,
+    ENV_XAI_OAUTH_BASE_URL,
+    ENV_XAI_OAUTH_DEBUG_HEADERS,
+    get_config,
+)
+from hindsight_api.engine.aiohttp_session import LoopLocalSession
 from hindsight_api.engine.cache_affinity import XAI_CONV_ID_HEADER, cache_affinity_id
 from hindsight_api.engine.llm_interface import LLM_TOOL_CHOICE_AUTO, LLMInterface, LLMToolChoice, LLMToolChoiceMode
 from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usage
-from hindsight_api.engine.llm_transport import build_sdk_timeout
+from hindsight_api.engine.llm_transport import build_aiohttp_timeout
 from hindsight_api.engine.providers.xai_oauth_auth import (
     DEFAULT_REFRESH_SKEW_SECONDS,
     LOGIN_COMMAND,
@@ -86,9 +92,9 @@ __all__ = [
 #: ``HINDSIGHT_API_LLM_BASE_URL`` that deployments often set for an unrelated
 #: proxy — the same "more specific beats more general" rule the rest of
 #: Hindsight's config hierarchy follows.
-ENV_BASE_URL = "HINDSIGHT_API_XAI_OAUTH_BASE_URL"
 
-DEFAULT_BASE_URL = "https://api.x.ai/v1"
+DEFAULT_BASE_URL = DEFAULT_XAI_OAUTH_BASE_URL
+ENV_BASE_URL = ENV_XAI_OAUTH_BASE_URL
 
 #: Body marker xAI returns when the account's spending limit stopped the call.
 SPENDING_LIMIT_CODE = "personal-team-blocked:spending-limit"
@@ -105,7 +111,8 @@ MAX_ERROR_DETAIL_CHARS = 200
 
 #: Debug-only response-header logging on a non-2xx reply (default off). See
 #: the module docstring's Logging section for the exact carve-out.
-ENV_DEBUG_HEADERS = "HINDSIGHT_API_XAI_OAUTH_DEBUG_HEADERS"
+ENV_DEBUG_HEADERS = ENV_XAI_OAUTH_DEBUG_HEADERS
+
 
 #: Response headers safe to log verbatim under ``ENV_DEBUG_HEADERS``: routing
 #: and diagnostic metadata that names no credential and carries no request
@@ -297,13 +304,13 @@ def _strip_code_fence(content: str) -> str:
     return content
 
 
-def _retry_after_seconds(response: httpx.Response) -> float | None:
+def _retry_after_seconds(headers: Mapping[str, str]) -> float | None:
     """Read ``Retry-After`` as delta-seconds, or None.
 
     Only the delta-seconds form is honored; the HTTP-date form falls back to
     the caller's backoff schedule (not enforced here).
     """
-    raw = response.headers.get("Retry-After")
+    raw = headers.get("Retry-After")
     if not raw:
         return None
     try:
@@ -336,10 +343,10 @@ def _actual_host(base_url: str) -> str:
 
 
 def _debug_headers_enabled() -> bool:
-    return os.getenv(ENV_DEBUG_HEADERS, "false").lower() == "true"
+    return get_config().xai_oauth_debug_headers
 
 
-def _log_non_2xx_response_headers(response: httpx.Response) -> None:
+def _log_non_2xx_response_headers(status_code: int, headers: Mapping[str, str]) -> None:
     """Log status + an allowlisted subset of response headers, non-2xx only.
 
     Gated behind ``ENV_DEBUG_HEADERS`` (default off): the module's logging
@@ -352,8 +359,8 @@ def _log_non_2xx_response_headers(response: httpx.Response) -> None:
     """
     if not _debug_headers_enabled():
         return
-    present = {name: response.headers[name] for name in _DEBUG_HEADER_ALLOWLIST if name in response.headers}
-    logger.info("xai-oauth non-2xx reply: status=%s headers=%s", response.status_code, present)
+    present = {name: headers[name] for name in _DEBUG_HEADER_ALLOWLIST if name in headers}
+    logger.info("xai-oauth non-2xx reply: status=%s headers=%s", status_code, present)
 
 
 class XaiOAuthLLM(LLMInterface):
@@ -378,17 +385,19 @@ class XaiOAuthLLM(LLMInterface):
         """
         super().__init__(provider, api_key, base_url, model, reasoning_effort, **kwargs)
 
-        self.base_url = (os.environ.get(ENV_BASE_URL, "").strip() or self.base_url or DEFAULT_BASE_URL).rstrip("/")
+        # None means the operator named no deployment-wide endpoint, so the caller's
+        # base_url still gets its turn ahead of the vendor default.
+        self.base_url = (get_config().xai_oauth_base_url or self.base_url or DEFAULT_BASE_URL).rstrip("/")
 
         # Honour the engine-resolved per-operation timeout; fall back to the
         # same global default the OpenAI-compatible providers use.
-        self.timeout = timeout if timeout is not None else float(os.getenv(ENV_LLM_TIMEOUT, str(DEFAULT_LLM_TIMEOUT)))
+        self.timeout = timeout if timeout is not None else get_config().llm_timeout
 
         self._auth = auth_manager or XaiOAuthManager()
-        self._auth_lock = asyncio.Lock()
         self._client_lock = asyncio.Lock()
-        # Per-phase so the connect leg is capped independently (issue #3881).
-        self._client = httpx.AsyncClient(timeout=build_sdk_timeout(self.timeout))
+        # One aiohttp session per event loop, created lazily. Per-phase so the
+        # connect leg is capped independently (issue #3881).
+        self._client = self._new_client()
         # In-flight request count per client object, and the future that fires
         # when a retired client's last request lands. Both keyed by the client
         # itself, because a recycle can leave more than one alive at a time.
@@ -414,19 +423,15 @@ class XaiOAuthLLM(LLMInterface):
 
     async def _access_token(self) -> str:
         """Return a token good for at least :meth:`_admission_ttl` seconds."""
-        return await asyncio.to_thread(self._auth.get_access_token, self._admission_ttl())
+        return await self._auth.get_access_token(self._admission_ttl())
 
     async def _refresh_after_rejection(self, rejected: str) -> str:
         """Refresh once after the API rejected ``rejected``.
 
-        The asyncio lock keeps concurrent coroutines to one refresh attempt;
-        the manager's own store lock and recheck cover threads and sibling
-        provider instances.
+        The manager's store lock and recheck keep concurrent coroutines, event
+        loops and sibling provider instances to one refresh attempt.
         """
-        async with self._auth_lock:
-            return await asyncio.to_thread(
-                lambda: self._auth.refresh(reason="reactive (HTTP 401 from api.x.ai)", rejected_token=rejected)
-            )
+        return await self._auth.refresh(reason="reactive (HTTP 401 from api.x.ai)", rejected_token=rejected)
 
     # ------------------------------------------------------------------
     # Transport
@@ -455,21 +460,24 @@ class XaiOAuthLLM(LLMInterface):
         client = self._client
         self._inflight[client] = self._inflight.get(client, 0) + 1
         try:
-            response = await client.post(f"{self.base_url}/chat/completions", json=body, headers=headers)
+            async with client.get().post(f"{self.base_url}/chat/completions", json=body, headers=headers) as response:
+                status_code = response.status
+                response_headers = response.headers
+                body_text = await response.text(errors="replace")
         finally:
             self._release_client(client)
 
-        if not (200 <= response.status_code < 300):
-            _log_non_2xx_response_headers(response)
+        if not (200 <= status_code < 300):
+            _log_non_2xx_response_headers(status_code, response_headers)
         return _UpstreamReply(
-            status_code=response.status_code,
-            body_text=response.text,
-            retry_after=_retry_after_seconds(response),
+            status_code=status_code,
+            body_text=body_text,
+            retry_after=_retry_after_seconds(response_headers),
         )
 
-    def _new_client(self) -> httpx.AsyncClient:
+    def _new_client(self) -> LoopLocalSession:
         """Build a replacement pooled client. A seam tests override directly."""
-        return httpx.AsyncClient(timeout=build_sdk_timeout(self.timeout))
+        return LoopLocalSession(timeout=build_aiohttp_timeout(self.timeout))
 
     async def _recycle_client(self) -> None:
         """Drop the shared client's pooled connections after a retryable >=500.
@@ -495,7 +503,7 @@ class XaiOAuthLLM(LLMInterface):
         The stale client is closed once its last in-flight request lands, not
         immediately. This provider instance is shared by every concurrent call
         on its lane, so closing on the spot would yank the connection out from
-        under siblings mid-response: measured, they surface ``httpx.ReadError``
+        under siblings mid-response: measured, they surface a read error
         and retry, which re-sends completions the upstream had already accepted
         and can fail outright a sibling that was on its final attempt. One
         backend's 5xx must not cost the other requests in flight.
@@ -509,7 +517,7 @@ class XaiOAuthLLM(LLMInterface):
                 self._drained[stale] = waiter
 
         if not busy:
-            await stale.aclose()
+            await stale.close()
             return
 
         task = asyncio.create_task(self._close_when_drained(stale, waiter))
@@ -540,7 +548,7 @@ class XaiOAuthLLM(LLMInterface):
             self._drained.pop(stale, None)
             self._inflight.pop(stale, None)
             with suppress(Exception):
-                await stale.aclose()
+                await stale.close()
 
     def _classify_forbidden(self, reply: _UpstreamReply) -> Exception:
         """Turn a 403 into one of three classifications, none of them credential failures.
@@ -808,7 +816,7 @@ class XaiOAuthLLM(LLMInterface):
             # retry while an identical failure one hop later got ten. The
             # states a retry cannot fix raise XaiOAuthLoginRequiredError, which
             # is deliberately absent here and stays fatal.
-            except (_UpstreamStatusError, httpx.RequestError, XaiOAuthRefreshError) as e:
+            except (_UpstreamStatusError, aiohttp.ClientError, XaiOAuthRefreshError) as e:
                 last_exception = e
                 retryable = e.retryable if isinstance(e, _UpstreamStatusError) else True
                 if retryable and attempt < max_retries:
@@ -910,7 +918,7 @@ class XaiOAuthLLM(LLMInterface):
                     thoughts_tokens=counts.thoughts_tokens,
                 )
 
-            except (_UpstreamStatusError, httpx.RequestError, XaiOAuthRefreshError) as e:
+            except (_UpstreamStatusError, aiohttp.ClientError, XaiOAuthRefreshError) as e:
                 last_exception = e
                 retryable = e.retryable if isinstance(e, _UpstreamStatusError) else True
                 if retryable and attempt < max_retries:
@@ -952,17 +960,17 @@ class XaiOAuthLLM(LLMInterface):
 
         # A cancelled drain task cannot be relied on to have closed its client. The
         # cancellation is delivered at that task's next await -- which is the
-        # `await stale.aclose()` in its `finally` -- so the close never runs, and
+        # `await stale.close()` in its `finally` -- so the close never runs, and
         # CancelledError is a BaseException, so the `suppress(Exception)` there does
         # not catch it either. The client then leaked its connections on shutdown.
-        # Closing here is where it is actually guaranteed to happen; aclose() is
+        # Closing here is where it is actually guaranteed to happen; close() is
         # idempotent, so a drain that did complete on its own costs nothing.
         for stale in retired:
             with suppress(Exception):
-                await stale.aclose()
+                await stale.close()
 
-        await self._client.aclose()
-        self._auth.close()
+        await self._client.close()
+        await self._auth.close()
 
     def supports_attempt_scoped_concurrency(self) -> bool:
         return True

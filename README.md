@@ -8,11 +8,13 @@
 [![Version](https://img.shields.io/pypi/v/hindsight-api?logo=python&logoColor=white&label=version&color=blue)](https://pypi.org/project/hindsight-api/)
 [![PyPI Downloads](https://img.shields.io/pypi/dm/hindsight-client?logo=pypi&logoColor=white&label=PyPI&color=blue)](https://pypi.org/project/hindsight-client/)
 [![NPM Downloads](https://img.shields.io/npm/dm/%40vectorize-io%2Fhindsight-client?logo=npm&logoColor=white&label=NPM&color=blue)](https://www.npmjs.com/package/@vectorize-io/hindsight-client)
-[![Slack Community](https://img.shields.io/badge/Slack-Join%20Community-4A154B?logo=slack)](https://join.slack.com/t/hindsight-space/shared_invite/zt-3nhbm4w29-LeSJ5Ixi6j8PdiYOCPlOgg)
+[![Slack Community](https://img.shields.io/badge/Slack-Join%20Community-4A154B?logo=slack)](https://vectorize.io/slack)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 <br/>
+<p align="center">
+ <a href="https://www.star-history.com/vectorize-io/hindsight"><img src="https://api.star-history.com/badge?repo=vectorize-io/hindsight&type=rank" alt="Star History Rank" /> <img src="https://api.star-history.com/badge?repo=vectorize-io/hindsight&type=trending" alt="GitHub Trending Repository of the Day" /></a>
+</p>
 
-<a href="https://trendshift.io/repositories/15603" target="_blank"><img src="https://trendshift.io/api/badge/repositories/15603" alt="vectorize-io%2Fhindsight | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 </div>
 
 ---
@@ -414,14 +416,14 @@ More patterns in the [Cookbook](https://hindsight.vectorize.io/cookbook) and [Be
 - [Python](https://hindsight.vectorize.io/sdks/python) · [Node.js](https://hindsight.vectorize.io/sdks/nodejs) · [Go](https://hindsight.vectorize.io/sdks/go) · [CLI](https://hindsight.vectorize.io/sdks/cli) · [REST API](https://hindsight.vectorize.io/api-reference)
 
 **Community:**
-- [Slack](https://join.slack.com/t/hindsight-space/shared_invite/zt-3nhbm4w29-LeSJ5Ixi6j8PdiYOCPlOgg)
+- [Slack](https://vectorize.io/slack)
 - [GitHub Issues](https://github.com/vectorize-io/hindsight/issues)
 
 ---
 
 ## Star History
 
-[![Star history](https://raw.githubusercontent.com/vectorize-io/hindsight/main/.github/star-history/chart.svg)](https://github.com/vectorize-io/hindsight/stargazers)
+[![Star History Chart](https://api.star-history.com/chart?repos=vectorize-io/hindsight&type=date&legend=top-left)](https://www.star-history.com/?repos=vectorize-io%2Fhindsight&type=date&legend=top-left)
 
 ---
 

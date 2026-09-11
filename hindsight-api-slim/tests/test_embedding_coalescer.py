@@ -44,19 +44,17 @@ class FakeBackend:
     async def initialize(self) -> None:
         return None
 
-    def encode(self, texts: list[str]) -> list[list[float]]:
+    async def encode(self, texts: list[str]) -> list[list[float]]:
         self.calls.append(list(texts))
         if self.delay:
-            import time
-
-            time.sleep(self.delay)
+            await asyncio.sleep(self.delay)
         return [[float(len(text)), float(hash(text) % 1000)] for text in texts]
 
-    def encode_documents(self, texts: list[str]) -> list[list[float]]:
-        return self.encode(texts)
+    async def encode_documents(self, texts: list[str]) -> list[list[float]]:
+        return await self.encode(texts)
 
-    def encode_query(self, texts: list[str]) -> list[list[float]]:
-        return self.encode(texts)
+    async def encode_query(self, texts: list[str]) -> list[list[float]]:
+        return await self.encode(texts)
 
 
 def _expected(text: str) -> list[float]:
@@ -111,10 +109,9 @@ async def test_batches_never_exceed_the_backend_batch_size() -> None:
     # Every text is dispatched exactly once — compared as a multiset, not in order.
     # The coalescer runs up to `max_concurrent_requests` backend calls at a time
     # (`self._slots`), so which batch reaches the backend first is a scheduling
-    # detail it has never promised. Under the GIL the interleaving happened to be
-    # stable; on a free-threaded interpreter the batches genuinely race, and this
-    # assertion was failing on order alone with every text present and every batch
-    # within budget. What must hold is that nothing is dropped or sent twice...
+    # detail it has never promised. Asserting on order made this flake with every
+    # text present and every batch within budget. What must hold is that nothing is
+    # dropped or sent twice...
     assert Counter(text for call in backend.calls for text in call) == Counter(texts)
     # ...and that each caller still gets its own vectors, in its own position.
     assert results == [[_expected(text)] for text in texts]
@@ -140,7 +137,7 @@ async def test_backend_failure_reaches_every_caller_in_the_batch() -> None:
     """One bad request must fail all of its riders, not silently drop them."""
 
     class ExplodingBackend(FakeBackend):
-        def encode(self, texts: list[str]) -> list[list[float]]:
+        async def encode(self, texts: list[str]) -> list[list[float]]:
             raise RuntimeError("embeddings backend down")
 
     embedder = CoalescingEmbedder(ExplodingBackend(batch_size=100))

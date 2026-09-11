@@ -20,7 +20,12 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from hindsight_api.config import DEFAULT_LLM_CONNECT_TIMEOUT, ENV_LLM_CONNECT_TIMEOUT, ENV_LLM_HTTP_LOG_LEVEL
+from hindsight_api.config import (
+    DEFAULT_LLM_CONNECT_TIMEOUT,
+    ENV_LLM_CONNECT_TIMEOUT,
+    ENV_LLM_HTTP_LOG_LEVEL,
+    clear_config_cache,
+)
 from hindsight_api.engine.llm_trace import (
     LLMQueueWait,
     record_queue_wait,
@@ -100,29 +105,18 @@ def test_openai_compatible_client_gets_a_capped_connect_phase(monkeypatch):
 def test_every_provider_that_owns_an_httpx_client_caps_its_connect_phase(monkeypatch):
     """Parity guard: providers that build their own client, not just the SDK-backed ones.
 
-    codex and xai-oauth construct ``httpx.AsyncClient`` directly instead of going through
-    an SDK, so they were the two that carried the bare-float defect after the first pass
-    at #3881. Enumerated here rather than tested one by one, so a provider added later
-    with its own client fails this instead of silently inheriting the whole budget.
+    Enumerated here rather than tested one by one, so a provider added later with its
+    own client fails this instead of silently inheriting the whole budget. The
+    providers that talk HTTP through aiohttp directly are covered by the next test.
     """
     monkeypatch.delenv(ENV_LLM_CONNECT_TIMEOUT, raising=False)
 
-    from hindsight_api.engine.providers.codex_llm import CodexLLM
     from hindsight_api.engine.providers.openai_compatible_llm import OpenAICompatibleLLM
     from hindsight_api.engine.providers.openai_responses_llm import OpenAIResponsesLLM
-
-    # Codex reads OAuth credentials from disk at construction; stub them the way the
-    # rest of the codex suite does so this runs on a machine that has never logged in.
-    with (
-        patch.object(CodexLLM, "_load_codex_auth", return_value=("token", "account")),
-        patch.object(CodexLLM, "_load_codex_refresh_token", return_value=None),
-    ):
-        codex = CodexLLM(provider="openai-codex", api_key="k", base_url="", model="m", timeout=150.0)
 
     providers = [
         OpenAICompatibleLLM(provider="openai", api_key="k", base_url="", model="m", timeout=150.0),
         OpenAIResponsesLLM(provider="openai-responses", api_key="k", base_url="", model="m", timeout=150.0),
-        codex,
     ]
 
     for provider in providers:
@@ -131,6 +125,37 @@ def test_every_provider_that_owns_an_httpx_client_caps_its_connect_phase(monkeyp
         assert isinstance(timeout, httpx.Timeout), f"{label} passed a bare float"
         assert timeout.connect == DEFAULT_LLM_CONNECT_TIMEOUT, f"{label} left connect uncapped"
         assert timeout.read == 150.0, f"{label} lost the request budget"
+
+
+async def test_every_provider_that_owns_an_aiohttp_session_caps_its_connect_phase(monkeypatch):
+    """The same parity guard for the providers that build their own aiohttp session.
+
+    codex and xai-oauth talk HTTP directly instead of going through an SDK, so they
+    were the two that carried the bare-float defect after the first pass at #3881.
+    """
+    monkeypatch.delenv(ENV_LLM_CONNECT_TIMEOUT, raising=False)
+
+    from hindsight_api.engine.providers.codex_llm import CodexLLM
+    from hindsight_api.engine.providers.xai_oauth_llm import XaiOAuthLLM
+
+    # Codex reads OAuth credentials from disk at construction; stub them the way the
+    # rest of the codex suite does so this runs on a machine that has never logged in.
+    with (
+        patch.object(CodexLLM, "_load_codex_auth", return_value=("token", "account")),
+        patch.object(CodexLLM, "_load_codex_refresh_token", return_value=None),
+    ):
+        codex = CodexLLM(provider="openai-codex", api_key="k", base_url="", model="m", timeout=150.0)
+    # xai-oauth reads its credential store lazily, on the first call.
+    xai = XaiOAuthLLM(provider="xai-oauth", api_key="", base_url="", model="m", timeout=150.0)
+
+    for label, sessions in (("CodexLLM", codex._session), ("XaiOAuthLLM", xai._client)):
+        try:
+            timeout = sessions.get().timeout
+            assert timeout.total is None, f"{label} bounded the whole streamed body"
+            assert timeout.connect == DEFAULT_LLM_CONNECT_TIMEOUT, f"{label} left connect uncapped"
+            assert timeout.sock_read == 150.0, f"{label} lost the request budget"
+        finally:
+            await sessions.close()
 
 
 # -- transport cause ----------------------------------------------------------
@@ -212,14 +237,21 @@ def test_describe_llm_error_omits_the_bracket_without_a_cause():
 
 
 def test_http_logging_level_is_configurable(monkeypatch):
-    """httpcore at DEBUG is the instrument that names the stalled phase."""
+    """httpcore at DEBUG is the instrument that names the stalled phase.
+
+    The explicit cache clears are because this test changes the environment twice:
+    the conftest reset only covers the state the test starts from, and the level is
+    read off the config, not the environment.
+    """
     monkeypatch.setenv(ENV_LLM_HTTP_LOG_LEVEL, "DEBUG")
+    clear_config_cache()
     try:
         configure_http_logging()
         assert logging.getLogger("httpx").level == logging.DEBUG
         assert logging.getLogger("httpcore").level == logging.DEBUG
     finally:
         monkeypatch.delenv(ENV_LLM_HTTP_LOG_LEVEL, raising=False)
+        clear_config_cache()
         configure_http_logging()
 
     assert logging.getLogger("httpx").level == logging.WARNING
@@ -228,11 +260,13 @@ def test_http_logging_level_is_configurable(monkeypatch):
 
 def test_unparseable_http_log_level_falls_back(monkeypatch):
     monkeypatch.setenv(ENV_LLM_HTTP_LOG_LEVEL, "chatty")
+    clear_config_cache()
     try:
         configure_http_logging()
         assert logging.getLogger("httpx").level == logging.WARNING
     finally:
         monkeypatch.delenv(ENV_LLM_HTTP_LOG_LEVEL, raising=False)
+        clear_config_cache()
         configure_http_logging()
 
 

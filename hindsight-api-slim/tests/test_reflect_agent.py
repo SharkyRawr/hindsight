@@ -147,6 +147,7 @@ class TestReflectStructuredOutput:
         )
 
         assert result.structured_output is None
+        assert result.error is not None
         call_kwargs = llm.call.await_args.kwargs
         assert call_kwargs["scope"] == "reflect_structured"
         assert call_kwargs["max_retries"] == 1
@@ -220,6 +221,52 @@ class TestReflectStructuredOutput:
         )
 
         assert llm.call.await_args.kwargs.get("max_completion_tokens") is None
+
+    @pytest.mark.asyncio
+    async def test_failed_extraction_reports_why(self):
+        """A failed extraction carries the reason, so a caller can tell it apart from
+        an answer that simply held nothing matching the schema (issue #4230)."""
+        llm = MagicMock()
+        llm.call = AsyncMock(side_effect=RuntimeError("provider is down"))
+
+        result = await _generate_structured_output(
+            answer="Alice prefers concise engineering updates.",
+            response_schema={
+                "type": "object",
+                "properties": {"summary": {"type": "string"}},
+                "required": ["summary"],
+            },
+            llm_config=llm,
+            reflect_id="test-reflect",
+        )
+
+        assert result.structured_output is None
+        assert result.error == "RuntimeError: provider is down"
+
+    @pytest.mark.asyncio
+    async def test_successful_extraction_reports_no_error(self):
+        """The success path leaves ``error`` unset, so its presence alone means failure."""
+        llm = MagicMock()
+        llm.call = AsyncMock(
+            return_value=LLMCallResult(
+                content={"summary": "Alice likes short updates."},
+                usage=TokenUsage(input_tokens=10, output_tokens=5, total_tokens=15),
+            )
+        )
+
+        result = await _generate_structured_output(
+            answer="Alice prefers concise engineering updates.",
+            response_schema={
+                "type": "object",
+                "properties": {"summary": {"type": "string"}},
+                "required": ["summary"],
+            },
+            llm_config=llm,
+            reflect_id="test-reflect",
+        )
+
+        assert result.structured_output == {"summary": "Alice likes short updates."}
+        assert result.error is None
 
 
 class TestReflectAgentMocked:
@@ -1286,6 +1333,146 @@ class TestReflectAgentMocked:
         assert len(contents) == 2
         assert "first" in contents[0], contents
         assert "second" in contents[1], contents
+
+    @pytest.mark.asyncio
+    async def test_duplicate_tool_call_ids_are_uniquified_on_the_wire(
+        self, mock_llm: MagicMock, mock_functions: dict[str, AsyncMock]
+    ) -> None:
+        """Repeated or empty ids get unique wire ids so a strict Anthropic API accepts the turn.
+
+        Anthropic rejects a turn where two tool_use blocks share an id
+        ("each tool_use must have a single result"), which used to make the whole
+        reflect loop fail on the first tool round-trip against a strict endpoint.
+        """
+        mock_functions["recall_fn"].side_effect = [
+            {"memories": [{"id": "mem-1", "content": "first"}]},
+            {"memories": [{"id": "mem-2", "content": "second"}]},
+            {"memories": [{"id": "mem-3", "content": "third"}]},
+        ]
+        mock_llm.call_with_tools.side_effect = [
+            LLMToolCallResult(
+                tool_calls=[
+                    LLMToolCall(id="dup", name="recall", arguments={"query": "q1"}),
+                    LLMToolCall(id="dup", name="recall", arguments={"query": "q2"}),
+                    LLMToolCall(id="", name="recall", arguments={"query": "q3"}),
+                ],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="d", name="done", arguments={"answer": "A", "memory_ids": ["mem-1"]})],
+                finish_reason="tool_calls",
+            ),
+        ]
+
+        await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            **mock_functions,
+        )
+
+        messages = mock_llm.call_with_tools.call_args_list[-1].kwargs["messages"]
+        assistant = [m for m in messages if m.get("role") == "assistant" and m.get("tool_calls")][-1]
+        tool_use_ids = [tc["id"] for tc in assistant["tool_calls"]]
+        assert len(tool_use_ids) == 3
+        assert all(tool_use_id for tool_use_id in tool_use_ids), tool_use_ids
+        assert len(set(tool_use_ids)) == 3, tool_use_ids
+        # Every tool_result maps to exactly one tool_use, in the model's order.
+        tool_messages = [m for m in messages if m.get("role") == "tool"]
+        assert [m["tool_call_id"] for m in tool_messages] == tool_use_ids
+        # ...and each slot still carries its OWN payload.
+        assert "first" in tool_messages[0]["content"], tool_messages
+        assert "second" in tool_messages[1]["content"], tool_messages
+        assert "third" in tool_messages[2]["content"], tool_messages
+
+    @pytest.mark.asyncio
+    async def test_wire_ids_stay_unique_across_iterations(
+        self, mock_llm: MagicMock, mock_functions: dict[str, AsyncMock]
+    ) -> None:
+        """A gateway that blanks ids blanks them EVERY turn; the replacements must still differ.
+
+        The whole reflect loop serializes into one request, so deduping per batch
+        would mint the same replacement id on turn 1 and turn 2 and hand the
+        strict API back the collision it was supposed to remove.
+        """
+        mock_functions["recall_fn"].side_effect = [
+            {"memories": [{"id": "mem-1", "content": "first"}]},
+            {"memories": [{"id": "mem-2", "content": "second"}]},
+        ]
+        mock_llm.call_with_tools.side_effect = [
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="", name="recall", arguments={"query": "q1"})],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="", name="recall", arguments={"query": "q2"})],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="d", name="done", arguments={"answer": "A", "memory_ids": ["mem-1"]})],
+                finish_reason="tool_calls",
+            ),
+        ]
+
+        await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            **mock_functions,
+        )
+
+        messages = mock_llm.call_with_tools.call_args_list[-1].kwargs["messages"]
+        tool_use_ids = [
+            tc["id"] for m in messages if m.get("role") == "assistant" and m.get("tool_calls") for tc in m["tool_calls"]
+        ]
+        assert len(tool_use_ids) == 2, tool_use_ids
+        assert len(set(tool_use_ids)) == 2, tool_use_ids
+        # Each tool_use is still answered by exactly one tool_result.
+        assert [m["tool_call_id"] for m in messages if m.get("role") == "tool"] == tool_use_ids
+
+    @pytest.mark.asyncio
+    async def test_premature_done_guardrail_emits_a_usable_wire_id(
+        self, mock_llm: MagicMock, mock_functions: dict[str, AsyncMock]
+    ) -> None:
+        """The "search first" guardrail loops, so its tool_use needs a deduped id too.
+
+        An empty id reaches Anthropic verbatim as ``tool_use.id: ""`` and is
+        rejected, taking the whole reflect run with it.
+        """
+        mock_functions["recall_fn"].side_effect = [{"memories": [{"id": "mem-1", "content": "first"}]}]
+        mock_llm.call_with_tools.side_effect = [
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="", name="done", arguments={"answer": "premature"})],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="", name="recall", arguments={"query": "q"})],
+                finish_reason="tool_calls",
+            ),
+            LLMToolCallResult(
+                tool_calls=[LLMToolCall(id="d", name="done", arguments={"answer": "A", "memory_ids": ["mem-1"]})],
+                finish_reason="tool_calls",
+            ),
+        ]
+
+        await run_reflect_agent(
+            llm_config=mock_llm,
+            bank_id="test-bank",
+            query="test query",
+            bank_profile={"name": "Test", "mission": "Testing"},
+            **mock_functions,
+        )
+
+        messages = mock_llm.call_with_tools.call_args_list[-1].kwargs["messages"]
+        tool_use_ids = [
+            tc["id"] for m in messages if m.get("role") == "assistant" and m.get("tool_calls") for tc in m["tool_calls"]
+        ]
+        assert len(tool_use_ids) == 2, tool_use_ids
+        assert all(tool_use_id for tool_use_id in tool_use_ids), tool_use_ids
+        assert len(set(tool_use_ids)) == 2, tool_use_ids
+        assert [m["tool_call_id"] for m in messages if m.get("role") == "tool"] == tool_use_ids
 
 
 class TestContextOverflowHelpers:

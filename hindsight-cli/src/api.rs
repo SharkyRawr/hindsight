@@ -897,12 +897,21 @@ impl ApiClient {
     pub fn list_mental_models(
         &self,
         bank_id: &str,
-        _verbose: bool,
+        verbose: bool,
     ) -> Result<types::MentalModelListResponse> {
+        // The endpoint defaults to `metadata`, which omits the content this
+        // command previews (and that scripts read out of `--output json`), so
+        // ask for it explicitly. `--verbose` additionally pulls the heavyweight
+        // reflect_response provenance chains.
+        let detail = if verbose {
+            types::Detail::Full
+        } else {
+            types::Detail::Content
+        };
         self.runtime.block_on(async {
             let response = self
                 .client
-                .list_mental_models(bank_id, None, None, None, None, None, None)
+                .list_mental_models(bank_id, Some(detail), None, None, None, None, None)
                 .humanized()
                 .await?;
             Ok(response.into_inner())
@@ -1434,9 +1443,11 @@ impl ApiClient {
         })
     }
 
-    /// Import a bank template manifest. The OpenAPI spec does not declare a
-    /// request body for this endpoint, so the progenitor-generated client does
-    /// not expose one — we POST the manifest JSON via raw HTTP instead.
+    /// Import a bank template manifest via the JSON endpoint.
+    ///
+    /// The CLI keeps using its direct HTTP path here so it can accept the
+    /// manifest as an untyped JSON value; the generated Rust client now also
+    /// exposes the typed request body from the OpenAPI schema.
     pub fn import_bank_template(
         &self,
         bank_id: &str,
