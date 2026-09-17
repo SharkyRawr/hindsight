@@ -19,7 +19,7 @@ from collections.abc import Awaitable
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import TYPE_CHECKING, Annotated, Any, Literal, TypeVar
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.gzip import GZipMiddleware
@@ -2771,6 +2771,19 @@ class DocumentExportSubmitResponse(BaseModel):
     status: str = "pending"
 
 
+class BankTransferSubmitResponse(BaseModel):
+    """Response for the unified bank-transfer endpoints (202).
+
+    The transfer runs in the background; poll
+    GET /v1/default/banks/{bank_id}/operations/{operation_id}. An export's
+    ``result_metadata`` carries ``download_url`` / ``storage_key`` /
+    ``byte_size`` / ``filename``; an import's carries the per-component counts.
+    """
+
+    operation_id: str
+    status: str = "pending"
+
+
 class DeleteResponse(BaseModel):
     """Response model for delete operations."""
 
@@ -3604,6 +3617,13 @@ class BankTemplateConfig(BaseModel):
     reflect_source_facts_max_tokens: int | None = Field(
         default=None, description="Max tokens of source facts per reflect call"
     )
+    knowledge_page_default_trigger: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Trigger fields merged over the built-in knowledge-page default when a page is created "
+            '(e.g. {"refresh_cron": "0 * * * *"}). A trigger sent with the create request still wins.'
+        ),
+    )
     mental_model_min_refresh_interval_seconds: int | None = Field(
         default=None,
         ge=0,
@@ -3865,7 +3885,6 @@ async def apply_bank_template_manifest(
         await memory.get_bank_profile(
             bank_id,
             request_context=request_context,
-            create_if_missing=False,
         )
         is not None
     )
@@ -5743,12 +5762,13 @@ def _register_routes(app: FastAPI):
 
         # Validate query length to prevent expensive operations on oversized queries
         max_query_tokens = get_config().recall_max_query_tokens
-        query_tokens = count_tokens(request.query)
-        if query_tokens > max_query_tokens:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Query too long: {query_tokens} tokens exceeds maximum of {max_query_tokens}. Please shorten your query.",
-            )
+        if max_query_tokens > 0:  # 0 (or negative) disables the cap
+            query_tokens = count_tokens(request.query)
+            if query_tokens > max_query_tokens:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Query too long: {query_tokens} tokens exceeds maximum of {max_query_tokens}. Please shorten your query.",
+                )
 
         try:
             # Default to all fact types if not specified
@@ -7444,19 +7464,11 @@ def _register_routes(app: FastAPI):
             document = await app.state.memory.get_document(document_id, bank_id, request_context=request_context)
             if not document:
                 raise HTTPException(status_code=404, detail="Document not found")
-            # A store-owned bank's document carries its attachment names from the record just
-            # read; taken off so the payload is the same shape on either backend, and handed on so
-            # the engine does not read that record a second time.
-            stored_names = document.pop("attachment_filenames", None)
-            by_document = await app.state.memory.attachments_for_documents(
-                bank_id,
-                [document_id],
-                request_context,
-                # Used only for a store-owned bank, which has no document edge to read; a null
-                # text (full text not kept) makes the engine fall back to the chunk texts.
-                carried_texts={document_id: document.get("original_text")},
-                carried_filenames=None if stored_names is None else {document_id: stored_names},
-            )
+            # A store-owned bank's record carries its own copy of the attachment names; taken
+            # off so the payload is the same shape on either backend. The names below come from
+            # the attachment rows themselves, which carry them on every backend now.
+            document.pop("attachment_filenames", None)
+            by_document = await app.state.memory.attachments_for_documents(bank_id, [document_id], request_context)
             if by_document.get(document_id):
                 document["attachments"] = [_attachment_payload(bank_id, record) for record in by_document[document_id]]
             return document
@@ -8152,9 +8164,7 @@ def _register_routes(app: FastAPI):
         """Export a bank's config and mental models as a template manifest."""
         try:
             # Read endpoint: do not auto-create on missing bank.
-            profile = await app.state.memory.get_bank_profile(
-                bank_id, request_context=request_context, create_if_missing=False
-            )
+            profile = await app.state.memory.get_bank_profile(bank_id, request_context=request_context)
             if profile is None:
                 raise HTTPException(status_code=404, detail=f"Bank '{bank_id}' not found")
 
@@ -8274,6 +8284,10 @@ def _register_routes(app: FastAPI):
         "Mental Models plus Knowledge Pages (all whole-bank export only).",
         operation_id="export_documents",
         tags=["Document Transfer"],
+        # Superseded by POST /v1/default/banks/{bank_id}/transfer/export, which
+        # carries the same document subsets plus the bank's own config and
+        # history. Kept working unchanged for existing callers.
+        deprecated=True,
     )
     async def api_export_documents(
         bank_id: str,
@@ -8295,9 +8309,7 @@ def _register_routes(app: FastAPI):
                     detail="Document export API is disabled. "
                     "Set HINDSIGHT_API_ENABLE_DOCUMENT_EXPORT_API=true to enable.",
                 )
-            profile = await app.state.memory.get_bank_profile(
-                bank_id, request_context=request_context, create_if_missing=False
-            )
+            profile = await app.state.memory.get_bank_profile(bank_id, request_context=request_context)
             if profile is None:
                 raise HTTPException(status_code=404, detail=f"Bank '{bank_id}' not found")
 
@@ -8332,6 +8344,10 @@ def _register_routes(app: FastAPI):
         "result_metadata. Use on_conflict to control existing document ids: skip (default), replace, or new-id.",
         operation_id="import_documents",
         tags=["Document Transfer"],
+        # Superseded by POST /v1/default/banks/{bank_id}/transfer/import with
+        # mode=merge, which is this endpoint's behaviour under the unified
+        # vocabulary. Kept working unchanged for existing callers.
+        deprecated=True,
     )
     @audited("import_documents", request_param=None)
     async def api_import_documents(
@@ -8367,6 +8383,301 @@ def _register_routes(app: FastAPI):
             raise
         except Exception as e:
             raise _internal_error(e, f"POST /v1/default/banks/{bank_id}/document-transfer")
+
+    # =====================================================================
+    # Bank Transfer (unified export / import)
+    # =====================================================================
+    #
+    # One archive format and one vocabulary for every transfer: what used to be
+    # the document-transfer pair plus the admin-only `hindsight-admin export-bank`
+    # / `import-bank`. Three booleans choose what travels:
+    #
+    #   include_data        documents, facts, observations, entities and links,
+    #                       attachments (bytes included), the curation archive,
+    #                       the operations log, the maintenance queues, and what
+    #                       the bank synthesized from all of it: mental models,
+    #                       their refresh history and the knowledge-page tree
+    #   include_bank_config the bank row (per-bank config), directives, webhooks
+    #   include_history     audit_log and llm_requests
+    #
+    # Mental models and knowledge pages are data, not configuration: their
+    # evidence cites memory units by id, so they are only coherent alongside the
+    # facts they were derived from.
+    #
+    # The older endpoints stay, and keep their exact request and response shapes.
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/transfer/export",
+        response_model=BankTransferSubmitResponse,
+        status_code=202,
+        summary="Export a bank (async)",
+        description="Submit an async export of a bank as a transfer ZIP archive. Three flags choose what the "
+        "archive carries: include_data (documents, facts, observations, attachments and their bytes, the "
+        "curation archive, the operations log and the maintenance queues), include_bank_config (bank config, "
+        "mental models and their history, knowledge pages), include_bank_config (the bank's config "
+        "overrides, directives and webhooks) and include_history "
+        "(audit_log, llm_requests). Embeddings and database ids are never carried — importing re-embeds with "
+        "the target bank's model and re-resolves entities, so an archive moves between instances configured "
+        "with different embedding models. Returns an operation_id; poll "
+        "GET /v1/default/banks/{bank_id}/operations/{operation_id}, then fetch the archive from the "
+        "download_url in its result_metadata. Pass document_id to export specific documents instead of the "
+        "whole bank (a document subset carries no bank-level sections).",
+        operation_id="export_bank_transfer",
+        tags=["Bank Transfer"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
+    )
+    async def api_bank_transfer_export(
+        bank_id: str,
+        include_data: bool = Query(default=True, description="Carry the memories and everything backing them"),
+        include_bank_config: bool = Query(
+            default=True, description="Carry the bank's config overrides, directives and webhooks"
+        ),
+        include_history: bool = Query(default=False, description="Carry audit_log and llm_requests"),
+        document_id: list[str] | None = Query(default=None, description="Document id(s); omit for the whole bank"),
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Submit an async bank export."""
+        try:
+            if not get_config().enable_document_export_api:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Bank export API is disabled. Set HINDSIGHT_API_ENABLE_DOCUMENT_EXPORT_API=true to enable.",
+                )
+            if not (include_data or include_bank_config or include_history):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Nothing to export: set at least one of include_data, include_bank_config, include_history",
+                )
+            profile = await app.state.memory.get_bank_profile(bank_id, request_context=request_context)
+            if profile is None:
+                raise HTTPException(status_code=404, detail=f"Bank '{bank_id}' not found")
+
+            from hindsight_api.engine.transfer import TransferScope
+
+            try:
+                if document_id:
+                    # A subset of documents is not a bank: the bank-level sections
+                    # describe the whole of it, and observations can span documents
+                    # outside the subset.
+                    if include_bank_config or include_history:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="include_bank_config and include_history are only supported for a whole-bank "
+                            "export (omit document_id)",
+                        )
+                    submission = await app.state.memory.submit_export_documents_async(
+                        bank_id,
+                        request_context,
+                        list(document_id),
+                    )
+                else:
+                    submission = await app.state.memory.submit_bank_export_async(
+                        bank_id,
+                        request_context,
+                        scope=TransferScope(
+                            data=include_data,
+                            bank_config=include_bank_config,
+                            history=include_history,
+                        ),
+                    )
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            return BankTransferSubmitResponse(operation_id=submission["operation_id"])
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"POST /v1/default/banks/{bank_id}/transfer/export")
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/transfer/import",
+        response_model=BankTransferSubmitResponse,
+        status_code=202,
+        summary="Import a bank (async)",
+        description="Submit a transfer archive (produced by the export endpoint) for import. Runs as a "
+        "background operation: facts are re-embedded with the target bank's embedding model and entities are "
+        "re-resolved — no LLM extraction, so the import costs no tokens and invents no new facts.\n\n"
+        "Two modes. `restore` (default) writes a whole bank into target_bank_id, which must NOT already exist "
+        "— it restores a bank rather than merging into one, and is how a bank is moved between instances or "
+        "copied under a new id. `merge` folds an archive's documents into this bank, with document_conflict "
+        "deciding what happens to ids that already exist (skip, replace, new-id).\n\n"
+        "The include flags narrow what is restored to a subset of what the archive holds; they cannot add "
+        "what the producer did not export. Returns an operation_id; poll "
+        "GET /v1/default/banks/{bank_id}/operations/{operation_id} for status and per-component counts. The "
+        "operation is recorded against {bank_id} even in restore mode, because the target bank does not exist "
+        "yet.",
+        operation_id="import_bank_transfer",
+        tags=["Bank Transfer"],
+    )
+    @audited("import_bank_transfer", request_param=None)
+    async def api_bank_transfer_import(
+        bank_id: str,
+        file: UploadFile = File(..., description="Transfer ZIP archive"),
+        mode: str = Query(default="restore", description="restore (into a fresh bank) | merge (into this bank)"),
+        target_bank_id: str | None = Query(
+            default=None, description="restore mode: the bank to create; defaults to the archive's source bank"
+        ),
+        document_conflict: str = Query(default="skip", description="merge mode: skip | replace | new-id"),
+        # Optional rather than defaulted, so "not passed" is distinguishable from
+        # "passed the default": merge mode takes documents only, and accepting a
+        # scope flag there would silently do nothing (rejected below instead).
+        include_data: bool | None = Query(
+            default=None, description="restore mode: carry the memories and everything backing them (default true)"
+        ),
+        include_bank_config: bool | None = Query(
+            default=None,
+            description="restore mode: restore the bank's config overrides, directives and webhooks (default true)",
+        ),
+        include_history: bool | None = Query(
+            default=None, description="restore mode: carry audit_log and llm_requests (default false)"
+        ),
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Submit a transfer archive for async import."""
+        try:
+            if not get_config().enable_document_import_api:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Bank import API is disabled. Set HINDSIGHT_API_ENABLE_DOCUMENT_IMPORT_API=true to enable.",
+                )
+            if mode not in ("restore", "merge"):
+                raise HTTPException(status_code=400, detail=f"Invalid mode '{mode}' (expected restore|merge)")
+            if document_conflict not in ("skip", "replace", "new-id"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid document_conflict '{document_conflict}' (expected skip|replace|new-id)",
+                )
+            archive_bytes = await file.read()
+
+            from hindsight_api.engine.transfer import TransferScope
+
+            try:
+                if mode == "merge":
+                    if target_bank_id:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="target_bank_id is only valid in restore mode; merge imports into {bank_id}",
+                        )
+                    # A merge takes the archive's documents and nothing else, so a
+                    # scope flag here would be accepted and then do nothing —
+                    # refuse it rather than quietly ignore a caller who asked for
+                    # the bank's config.
+                    if include_data is not None or include_bank_config is not None or include_history is not None:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="include_data / include_bank_config / include_history apply to mode=restore; "
+                            "a merge imports the archive's documents only",
+                        )
+                    submission = await app.state.memory.import_documents_async(
+                        bank_id, archive_bytes, request_context, document_conflict
+                    )
+                else:
+                    submission = await app.state.memory.submit_bank_import_async(
+                        bank_id,
+                        archive_bytes,
+                        request_context,
+                        target_bank_id=target_bank_id,
+                        scope=TransferScope(
+                            data=True if include_data is None else include_data,
+                            bank_config=True if include_bank_config is None else include_bank_config,
+                            history=False if include_history is None else include_history,
+                        ),
+                    )
+            except ValueError as e:
+                # Invalid archive, unsupported schema version, or a target bank
+                # that already exists — all caller errors.
+                raise HTTPException(status_code=400, detail=str(e))
+            return BankTransferSubmitResponse(operation_id=submission["operation_id"])
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"POST /v1/default/banks/{bank_id}/transfer/import")
+
+    @app.post(
+        "/v1/default/banks/{bank_id}/clone",
+        response_model=BankTransferSubmitResponse,
+        status_code=202,
+        summary="Clone a bank (async)",
+        description="Copy this bank into a new one, in a single call. The clone starts with the source's "
+        "memories as they are at clone time and evolves independently from then on: later retains, "
+        "consolidation and edits on either bank leave the other alone.\n\n"
+        "This is the export and import above run back to back on this instance, so nothing is re-extracted "
+        "and no LLM is called — facts are re-embedded and entities re-resolved, exactly as a restore does. "
+        "The same three flags choose what the clone inherits: include_data (documents, facts, observations, "
+        "attachments, the curation archive, the operations log, and the mental models and knowledge pages "
+        "synthesized from them), include_bank_config (the bank's config overrides, directives and "
+        "**webhooks**) and include_history (audit_log, llm_requests).\n\n"
+        "Note the webhooks: they travel with the bank's configuration, so a clone made with the default "
+        "flags will call the source's webhook endpoints. Pass include_bank_config=false, or delete them on "
+        "the clone, when they point at a per-bank consumer.\n\n"
+        "target_bank_id must not already exist. Returns an operation_id, recorded against the source bank "
+        "(the target does not exist yet); poll GET /v1/default/banks/{bank_id}/operations/{operation_id} for "
+        "status and the per-component counts.",
+        operation_id="clone_bank",
+        tags=["Bank Transfer"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
+    )
+    @audited("clone_bank", request_param=None)
+    async def api_clone_bank(
+        bank_id: str,
+        target_bank_id: str = Query(..., description="Bank to create; must not already exist"),
+        include_data: bool = Query(
+            default=True,
+            description="Copy the memories, what backs them, and the mental models and knowledge pages "
+            "synthesized from them",
+        ),
+        include_bank_config: bool = Query(
+            default=True, description="Copy the bank's config overrides, directives and webhooks"
+        ),
+        include_history: bool = Query(default=False, description="Copy audit_log and llm_requests"),
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Submit an async clone of a bank."""
+        try:
+            # A clone is an export and an import, so it is gated on both flags: with
+            # either half disabled the operator has turned off bulk bank copying.
+            config = get_config()
+            if not (config.enable_document_export_api and config.enable_document_import_api):
+                raise HTTPException(
+                    status_code=404,
+                    detail="Bank clone API is disabled. It requires both "
+                    "HINDSIGHT_API_ENABLE_DOCUMENT_EXPORT_API and HINDSIGHT_API_ENABLE_DOCUMENT_IMPORT_API.",
+                )
+            if not (include_data or include_bank_config or include_history):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Nothing to clone: set at least one of include_data, include_bank_config, include_history",
+                )
+            profile = await app.state.memory.get_bank_profile(bank_id, request_context=request_context)
+            if profile is None:
+                raise HTTPException(status_code=404, detail=f"Bank '{bank_id}' not found")
+
+            from hindsight_api.engine.transfer import TransferScope
+
+            try:
+                submission = await app.state.memory.submit_bank_clone_async(
+                    bank_id,
+                    target_bank_id,
+                    request_context,
+                    scope=TransferScope(
+                        data=include_data,
+                        bank_config=include_bank_config,
+                        history=include_history,
+                    ),
+                )
+            except ValueError as e:
+                # Target already exists, an invalid bank id, or cloning onto itself.
+                raise HTTPException(status_code=400, detail=str(e))
+            return BankTransferSubmitResponse(operation_id=submission["operation_id"])
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"POST /v1/default/banks/{bank_id}/clone")
 
     @app.get(
         "/v1/default/banks/{bank_id}/attachments/{attachment_id}",
@@ -8447,15 +8758,21 @@ def _register_routes(app: FastAPI):
                     "Set HINDSIGHT_API_ENABLE_DOCUMENT_EXPORT_API=true to enable.",
                 )
             # Only bank-scoped keys are downloadable. Parse the bank id out of the
-            # "banks/{bank_id}/..." key (request validation, so it belongs here); the
-            # engine method then authorizes the caller against that bank and retrieves
-            # the file, so a caller can't fetch another tenant's or bank's archive
-            # (IDOR guard). The unguessable uuid in the key is defence in depth, not
-            # the access control.
+            # "tenants/{schema}/banks/{bank_id}/..." key — or the "banks/{bank_id}/..."
+            # layout written before keys carried the tenant (request validation, so it
+            # belongs here); the engine method then authorizes the caller against that
+            # bank, in their own tenant, and retrieves the file, so a caller can't fetch
+            # another tenant's or bank's archive (IDOR guard). The unguessable uuid in
+            # the key is defence in depth, not the access control.
             parts = key.split("/")
-            if ".." in parts or len(parts) < 2 or parts[0] != "banks" or not parts[1]:
+            if ".." in parts:
                 raise HTTPException(status_code=404, detail="File not found")
-            bank_id = parts[1]
+            if len(parts) > 4 and parts[0] == "tenants" and parts[2] == "banks" and parts[3]:
+                bank_id = unquote(parts[3])
+            elif len(parts) > 2 and parts[0] == "banks" and parts[1]:
+                bank_id = parts[1]
+            else:
+                raise HTTPException(status_code=404, detail="File not found")
 
             data = await app.state.memory.retrieve_bank_file(bank_id, key, request_context)
             if data is None:
@@ -9115,15 +9432,31 @@ def _register_routes(app: FastAPI):
                 )
                 for index, item in enumerate(request.items)
             ]
-            retained_attachments = [
-                attachment for canonical in canonical_contents for attachment in canonical.attachments
+            # The document each item's attachments belong to, decided here rather
+            # than inside the retain: an attachment is stored under its document's
+            # key, so the document needs an id before its bytes are written. The
+            # retain then uses the id chosen here instead of minting its own — the
+            # same thing the file-retain route does. Only an item that carries
+            # attachments needs one; the rest keep the behaviour they had.
+            item_document_ids = [
+                item.document_id or (f"retain_{uuid.uuid4()}" if canonical.attachments else None)
+                for item, canonical in zip(request.items, canonical_contents, strict=True)
             ]
-            if retained_attachments:
-                await app.state.memory.store_retain_attachments(bank_id, retained_attachments, request_context)
+            attachments_by_document: dict[str, list] = {}
+            for item_document_id, canonical in zip(item_document_ids, canonical_contents, strict=True):
+                if item_document_id and canonical.attachments:
+                    attachments_by_document.setdefault(item_document_id, []).extend(canonical.attachments)
+            # Short ids per document, for whatever this request actually wrote — what a
+            # refusal below has to take back out, as opposed to what the document already had.
+            ingress_attachments = await app.state.memory.store_retain_attachments(
+                bank_id, attachments_by_document, request_context
+            )
 
             # Group items by strategy
             strategy_groups: dict[str | None, list[dict]] = {}
-            for item, canonical in zip(request.items, canonical_contents, strict=True):
+            for item, canonical, item_document_id in zip(
+                request.items, canonical_contents, item_document_ids, strict=True
+            ):
                 effective = item.strategy
                 if effective not in strategy_groups:
                     strategy_groups[effective] = []
@@ -9154,8 +9487,8 @@ def _register_routes(app: FastAPI):
                     content_dict["context"] = item.context
                 if item.metadata:
                     content_dict["metadata"] = item.metadata
-                if item.document_id:
-                    content_dict["document_id"] = item.document_id
+                if item_document_id:
+                    content_dict["document_id"] = item_document_id
                 if item.entities:
                     content_dict["entities"] = [{"text": e.text, "type": e.type or "CONCEPT"} for e in item.entities]
                     content_dict["resolve_entities"] = item.resolve_entities
@@ -9190,6 +9523,7 @@ def _register_routes(app: FastAPI):
                         strategy=group_strategy,
                         request_context=request_context,
                         operation_id=request.operation_id,
+                        ingress_attachments=ingress_attachments,
                     )
                     all_operation_ids.append(result["operation_id"])
                     total_items_count += result["items_count"]
@@ -9228,6 +9562,7 @@ def _register_routes(app: FastAPI):
                             strategy=group_strategy,
                             request_context=request_context,
                             return_usage=True,
+                            ingress_attachments=ingress_attachments,
                             outbox_callback_factory=app.state.memory._build_retain_outbox_callback_factory(
                                 bank_id=bank_id,
                                 operation_id=None,
@@ -9492,11 +9827,20 @@ def _register_routes(app: FastAPI):
     ):
         """Clear memories for a memory bank, optionally filtered by type."""
         try:
-            await app.state.memory.delete_bank(
+            result = await app.state.memory.delete_bank(
                 bank_id, fact_type=type, delete_bank_profile=False, request_context=request_context
             )
 
-            return DeleteResponse(success=True)
+            # Counted inside the delete's transaction — a client's before/after list diff races
+            # concurrent retains (#4307). Memory units only: unlike api_delete_bank, the bank's
+            # entities and documents survive a clear.
+            deleted = result.get("memory_units_deleted", 0)
+            scope = f" of type '{type}'" if type else ""
+            return DeleteResponse(
+                success=True,
+                message=f"Cleared {deleted} memory unit(s){scope} from bank '{bank_id}'",
+                deleted_count=deleted,
+            )
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
         except (AuthenticationError, HTTPException):

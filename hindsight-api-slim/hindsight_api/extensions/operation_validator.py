@@ -159,6 +159,8 @@ class RetainContext:
     bank_id: str
     contents: list[dict]  # List of {content, context, event_date, document_id, tags, strategy}
     request_context: "RequestContext"
+    #: The document every item belongs to; None when items name different
+    #: documents (or none) — read ``contents[i]["document_id"]`` then.
     document_id: str | None = None
     fact_type_override: str | None = None
     #: Inline attachments this retain carries, in first-appearance order. Empty
@@ -586,6 +588,12 @@ class OperationValidatorExtension(Extension, ABC):
     Supported operations:
         - retain, recall, reflect (core memory operations)
         - consolidate (mental models consolidation)
+
+    ``self.context`` is the process-wide ExtensionContext, set by the engine at
+    construction: use it for process-global handles, e.g. ``get_memory_engine()`` for the
+    data-plane pool. It carries NO per-request state -- take the tenant and bank from the
+    hook's own argument (``ctx.bank_id``, ``ctx.request_context``), never from the context
+    or other shared engine state.
     """
 
     # =========================================================================

@@ -225,7 +225,7 @@ async def test_file_retain_batch_generates_unique_storage_keys(memory_no_llm_ver
 
     bank_id = "test_file_unique_key_bank"
     context = RequestContext(internal=True)
-    await memory_no_llm_verify.get_bank_profile(bank_id, request_context=context)
+    await memory_no_llm_verify.ensure_bank_profile(bank_id, request_context=context)
 
     class MockFile:
         def __init__(self, content, filename, content_type):
@@ -278,7 +278,9 @@ async def test_file_retain_batch_generates_unique_storage_keys(memory_no_llm_ver
     # The core regression: keys are unique, so no file clobbers another's bytes.
     assert len(set(storage_keys)) == 3, f"storage keys collided: {storage_keys}"
     for key in storage_keys:
-        assert key.startswith(f"banks/{bank_id}/files/")
+        from hindsight_api.engine.storage import bank_storage_prefix
+
+        assert key.startswith(f"{bank_storage_prefix(bank_id)}files/")
     # No file was left stranded: every conversion retrieved its own bytes.
     for row in rows:
         assert row["status"] == "completed", f"operation not completed: {row['status']}"
@@ -713,7 +715,7 @@ async def test_file_conversion_creates_separate_retain_operation(memory_no_llm_v
     bank_id = "test_file_two_phase_bank"
 
     context = RequestContext(internal=True)
-    await memory_no_llm_verify.get_bank_profile(bank_id, request_context=context)
+    await memory_no_llm_verify.ensure_bank_profile(bank_id, request_context=context)
 
     class MockFile:
         def __init__(self, content, filename, content_type):
@@ -815,7 +817,7 @@ async def test_list_operations_surfaces_file_document_id_and_filename(memory_no_
 
     bank_id = "test_file_op_fields_bank"
     context = RequestContext(internal=True)
-    await memory_no_llm_verify.get_bank_profile(bank_id, request_context=context)
+    await memory_no_llm_verify.ensure_bank_profile(bank_id, request_context=context)
 
     class MockFile:
         def __init__(self, content, filename, content_type):
@@ -865,7 +867,7 @@ async def test_async_file_retain_serializes_datetime_timestamp(memory_no_llm_ver
     timestamp = datetime(2024, 1, 15, 10, 30, tzinfo=timezone.utc)
 
     context = RequestContext(internal=True)
-    await memory_no_llm_verify.get_bank_profile(bank_id, request_context=context)
+    await memory_no_llm_verify.ensure_bank_profile(bank_id, request_context=context)
 
     class MockFile:
         def __init__(self, content, filename, content_type):
@@ -980,7 +982,7 @@ async def test_file_retain_maps_timestamp_to_event_date(memory_no_llm_verify, sa
 
         async def run_case(label: str, timestamp_value) -> dict:
             bank_id = f"test_file_event_date_{label}_{datetime.now(timezone.utc).timestamp()}"
-            await memory.get_bank_profile(bank_id, request_context=context)
+            await memory.ensure_bank_profile(bank_id, request_context=context)
 
             captured.clear()
             await memory.submit_async_file_retain(
@@ -1075,7 +1077,7 @@ async def test_file_retain_forwards_all_content_fields(memory_no_llm_verify, sam
     try:
         request_context = RequestContext(internal=True)
         bank_id = f"test_file_all_fields_{datetime.now(timezone.utc).timestamp()}"
-        await memory.get_bank_profile(bank_id, request_context=request_context)
+        await memory.ensure_bank_profile(bank_id, request_context=request_context)
 
         await memory.submit_async_file_retain(
             bank_id=bank_id,
@@ -1144,7 +1146,7 @@ async def test_file_conversion_failure_sets_status_to_failed(memory_no_llm_verif
 
     # Create bank
     context = RequestContext(internal=True)
-    await memory_no_llm_verify.get_bank_profile(bank_id, request_context=context)
+    await memory_no_llm_verify.ensure_bank_profile(bank_id, request_context=context)
 
     # Create mock file
     class MockFile:
@@ -1244,7 +1246,7 @@ async def test_on_file_convert_complete_hook_called(memory_no_llm_verify, sample
     memory_no_llm_verify._operation_validator = validator
 
     context = RequestContext(internal=True, api_key_id="test-key-id", tenant_id="test-tenant")
-    await memory_no_llm_verify.get_bank_profile(bank_id, request_context=context)
+    await memory_no_llm_verify.ensure_bank_profile(bank_id, request_context=context)
 
     class MockFile:
         def __init__(self, content, filename, content_type):
@@ -1303,7 +1305,7 @@ async def test_on_file_convert_complete_hook_called_for_each_file(memory_no_llm_
     memory_no_llm_verify._operation_validator = validator
 
     context = RequestContext(internal=True)
-    await memory_no_llm_verify.get_bank_profile(bank_id, request_context=context)
+    await memory_no_llm_verify.ensure_bank_profile(bank_id, request_context=context)
 
     class MockFile:
         def __init__(self, content, filename, content_type):
@@ -1377,7 +1379,7 @@ async def test_on_file_convert_complete_hook_not_called_on_conversion_failure(me
     memory_no_llm_verify._parser_registry.register(FailingParser())
 
     context = RequestContext(internal=True)
-    await memory_no_llm_verify.get_bank_profile(bank_id, request_context=context)
+    await memory_no_llm_verify.ensure_bank_profile(bank_id, request_context=context)
 
     class MockFile:
         def __init__(self, content, filename, content_type):

@@ -103,6 +103,7 @@ async function gitSyncNote(args: {
       execFileSync("git", ["-C", cwd, "rev-list", "--count", "HEAD"], {
         encoding: "utf8",
         windowsHide: true,
+        stdio: ["ignore", "pipe", "pipe"], // do not corrupt the host banner on a late git failure
       }).trim()
     );
     if (n > 0) target = Math.min(DEEPEN_DIFF_TARGET, n);
@@ -305,7 +306,9 @@ export async function buildSessionStartContext(args: {
     }
     /* fail-open preamble; preserve first-prompt reflect eligibility on a transient outage */
   }
-  const additionalContext = buildKnowledgePreamble(pages, { reflectOnNewGoals: !cfg.autoReflect });
+  const additionalContext = buildKnowledgePreamble(pages, {
+    reflectOnNewGoals: cfg.autoInject !== "reflect",
+  });
   const deferInitialReflect = cold === true || (pageListKnown && pages.length === 0);
 
   // The banner shows on EVERY session — Hindsight's presence is part of the product, not a

@@ -411,8 +411,9 @@ const opencode: HarnessInstaller = {
 };
 
 /**
- * opencode v2 — the `opencode2` binary (npm `@opencode-ai/cli@beta`), which installs ALONGSIDE v1
- * rather than replacing it.
+ * opencode v2: the `opencode2` alias published by npm `@opencode/cli`. The stable package also
+ * publishes `opencode`, so a normal global install conflicts with v1's bin; the distinct alias lets
+ * installations that expose both commands target the v2 harness explicitly.
  *
  * Detection is the binary only, deliberately NOT `~/.config/opencode`: that directory is v1's too,
  * so keying on it would make `install` (which wires every detected agent) claim opencode2 on every
@@ -1633,7 +1634,11 @@ const dsh: HarnessInstaller = {
     writeFileSync(path, others ? `${others}\n\n${block}` : block);
     // dsh's skill provider scans the shared agentskills root, the same one Codex reads.
     installSkill(c, "dsh");
-    c.log?.(`dsh: plugin registered in ${path} (applies to every dsh profile)`);
+    // A running `dsh web` hot-loads the new patch entry, so its open sessions gain the hindsight_*
+    // tools mid-conversation — a tool-set change that invalidates the provider prompt cache (#4317).
+    c.log?.(
+      `dsh: plugin registered in ${path} (applies to every dsh profile; start new sessions — ones already open would gain the tools mid-conversation)`
+    );
   },
   uninstall(c) {
     const path = join(dshHome(c), "cordis.patch.yml");

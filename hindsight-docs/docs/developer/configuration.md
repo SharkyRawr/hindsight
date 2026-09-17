@@ -639,7 +639,7 @@ Two further limits:
 - **`update_mode: "append"` routes on the metadata supplied with the append call**, not the stored document's. An append re-extracts the stored body together with the new text, so resupply the same metadata to keep it on the same member.
 - **Batch retain is not supported** with this mode. `HINDSIGHT_API_RETAIN_BATCH_ENABLED=true` submits every item of an operation as a single job to a single member, which cannot honour per-item routes, so the combination is rejected at startup.
 
-**Per-operation chains.** Each operation can define its own members + strategy with the `RETAIN` / `REFLECT` / `CONSOLIDATION` prefix (e.g. `HINDSIGHT_API_RETAIN_LLM_1_PROVIDER`, `HINDSIGHT_API_RETAIN_LLM_STRATEGY`). A per-operation slot with no indexed members (or no strategy) inherits the global chain.
+**Per-operation chains.** Each operation can define its own members + strategy with the `RETAIN` / `REFLECT` / `CONSOLIDATION` / `MENTAL_MODEL_REFRESH` prefix (e.g. `HINDSIGHT_API_RETAIN_LLM_1_PROVIDER`, `HINDSIGHT_API_RETAIN_LLM_STRATEGY`). A per-operation slot with no indexed members (or no strategy) inherits the global chain — except `MENTAL_MODEL_REFRESH`, which inherits the reflect chain.
 
 The indexed members are credential fields — never returned by the bank-config API and server-level only (not per-bank configurable). **Batch retain** runs on the first batch-capable member in declared order, which need not be the primary — so a chain whose primary has no batch API can still use `HINDSIGHT_API_RETAIN_BATCH_ENABLED=true` as long as one member supports it. That member serves the whole batch (submit, polling and retrieval all target the account that holds it), so batch does not fail over the way the interactive retain/reflect/consolidation calls do. An in-flight batch is bound to the account that submitted it, so if the worker restarts mid-batch it resumes on that same account even when the chain has since been reordered or extended. Removing that member — or rotating its API key — while a batch is still running makes the operation fail with an explicit error instead of polling a different account.
 
@@ -737,10 +737,33 @@ Different memory operations have different requirements. **Retain** (fact extrac
 | `HINDSIGHT_API_CONSOLIDATION_LLM_EXTRA_BODY` | Extra request-body params (JSON dict) for consolidation operations | Falls back to `HINDSIGHT_API_LLM_EXTRA_BODY` |
 | `HINDSIGHT_API_CONSOLIDATION_LLM_CACHE_AFFINITY` | Prompt-cache affinity mode for consolidation operations | Falls back to `HINDSIGHT_API_LLM_CACHE_AFFINITY` |
 | `HINDSIGHT_API_CONSOLIDATION_LLM_CACHE_AFFINITY_HEADER` | Header name for consolidation header-mode affinity; resolved independently of the mode | Falls back to `HINDSIGHT_API_LLM_CACHE_AFFINITY_HEADER` |
+| `HINDSIGHT_API_MENTAL_MODEL_REFRESH_LLM_PROVIDER` | LLM provider for the automatic mental-model refresh | Falls back to `HINDSIGHT_API_REFLECT_LLM_PROVIDER` |
+| `HINDSIGHT_API_MENTAL_MODEL_REFRESH_LLM_API_KEY` | API key for the refresh LLM | Falls back to `HINDSIGHT_API_REFLECT_LLM_API_KEY` |
+| `HINDSIGHT_API_MENTAL_MODEL_REFRESH_LLM_MODEL` | Model for the automatic refresh | Falls back to `HINDSIGHT_API_REFLECT_LLM_MODEL` |
+| `HINDSIGHT_API_MENTAL_MODEL_REFRESH_LLM_BASE_URL` | Base URL for the refresh LLM | Falls back to `HINDSIGHT_API_REFLECT_LLM_BASE_URL` |
+| `HINDSIGHT_API_MENTAL_MODEL_REFRESH_LLM_MAX_CONCURRENT` | Extra cap on concurrent refresh LLM requests, composed with the global cap. Unset → only the global cap applies. | Unset |
+| `HINDSIGHT_API_MENTAL_MODEL_REFRESH_LLM_MAX_RETRIES` | Max retries for the refresh | Falls back to `HINDSIGHT_API_REFLECT_LLM_MAX_RETRIES` |
+| `HINDSIGHT_API_MENTAL_MODEL_REFRESH_LLM_INITIAL_BACKOFF` | Initial backoff for refresh retries (seconds) | Falls back to `HINDSIGHT_API_REFLECT_LLM_INITIAL_BACKOFF` |
+| `HINDSIGHT_API_MENTAL_MODEL_REFRESH_LLM_MAX_BACKOFF` | Max backoff cap for refresh retries (seconds) | Falls back to `HINDSIGHT_API_REFLECT_LLM_MAX_BACKOFF` |
+| `HINDSIGHT_API_MENTAL_MODEL_REFRESH_LLM_TIMEOUT` | Timeout for refresh requests (seconds). Nobody is waiting on a background refresh, so this is usually set much higher than the reflect timeout. | Falls back to `HINDSIGHT_API_REFLECT_LLM_TIMEOUT` |
+| `HINDSIGHT_API_MENTAL_MODEL_REFRESH_LLM_REASONING_EFFORT` | Reasoning effort for the automatic refresh | Falls back to `HINDSIGHT_API_REFLECT_LLM_REASONING_EFFORT` |
+| `HINDSIGHT_API_MENTAL_MODEL_REFRESH_LLM_EXTRA_BODY` | Extra request-body params (JSON dict) for the refresh | Falls back to `HINDSIGHT_API_REFLECT_LLM_EXTRA_BODY` |
+| `HINDSIGHT_API_MENTAL_MODEL_REFRESH_LLM_CACHE_AFFINITY` | Prompt-cache affinity mode for the refresh | Falls back to `HINDSIGHT_API_REFLECT_LLM_CACHE_AFFINITY` |
+
+**Automatic mental-model refresh.** The background refresh that runs after consolidation
+drives the same agent as interactive reflect, so by default it uses the reflect LLM and
+nothing above needs setting. The `MENTAL_MODEL_REFRESH_LLM_*` group exists because the two
+want opposite tradeoffs on a single-GPU self-hosted box: interactive reflect favours a
+reasoning model (a human is waiting on the quality), while the background refresh favours
+a fast no-think model that cannot blow the wall timeout, cannot exceed the completion-token
+budget on a reasoning chain, and does not halve interactive decode speed by running
+alongside it. Every field falls back to its `REFLECT_LLM_*` counterpart, which in turn falls
+back to the global `LLM_*` — set none of them and behaviour is exactly as before.
 
 :::tip When to Use Per-Operation Config
 - **Retain**: Use models with strong structured output (e.g., GPT-4o, Claude) for accurate fact extraction
 - **Reflect**: Use faster/cheaper models (e.g., GPT-4o-mini, Groq) for reasoning and response generation
+- **Mental model refresh**: On shared/local hardware, point it at a no-think or cheaper hosted model so the background job cannot destabilise interactive reflect
 - **Recall**: Does not use LLM (pure retrieval), so no configuration needed
 :::
 
@@ -781,14 +804,18 @@ export HINDSIGHT_API_RETAIN_LLM_MAX_BACKOFF=120.0    # Cap at 2min instead of 1m
 ```
 
 :::note Per-operation concurrency composes with the global cap
-`HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT`, `HINDSIGHT_API_REFLECT_LLM_MAX_CONCURRENT`, and
-`HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT` add an extra cap that applies *on top of*
+`HINDSIGHT_API_RETAIN_LLM_MAX_CONCURRENT`, `HINDSIGHT_API_REFLECT_LLM_MAX_CONCURRENT`,
+`HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT`, and
+`HINDSIGHT_API_MENTAL_MODEL_REFRESH_LLM_MAX_CONCURRENT` add an extra cap that applies *on top of*
 `HINDSIGHT_API_LLM_MAX_CONCURRENT`. A retain call counts against both the retain cap and the
 global cap; a reflect call without a per-op cap is bounded only by the global cap.
 
 To reserve headroom for live chat/reflect on a rate-limited provider, cap retain and
 consolidation below the global value — e.g. global=4, retain=1, consolidation=1 leaves
-two slots that retain/consolidation cannot consume.
+two slots that retain/consolidation cannot consume. The mental-model refresh cap covers
+the background refresh, its dry run and its delta operations, and is separate from the
+reflect cap — capping it is how you stop the background job from starving interactive
+reflect on shared hardware.
 
 Unlike the per-operation timeout and retry/backoff knobs, the `*_LLM_MAX_CONCURRENT`
 caps are process-global semaphores read from the environment once at startup. They are
@@ -800,7 +827,7 @@ server-level only (not overridable per tenant/bank) and a change requires a rest
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `HINDSIGHT_API_EMBEDDINGS_PROVIDER` | Provider: `local`, `onnx`, `tei`, `openai`, `openai-codex`, `openrouter`, `requesty`, `cohere`, `google`, `zeroentropy`, `litellm`, or `litellm-sdk` | `local` |
-| `HINDSIGHT_API_EMBEDDINGS_MAX_INPUT_TOKENS` | Applies to **every** provider: truncate each text to this many tokens (counted with `HINDSIGHT_API_TOKENIZER_ENCODING`, approximate) before embedding, so oversized content is truncated instead of failing the embed call permanently. The budget covers the whole payload, including any client-side prefix an asymmetric model needs. The default matches the input limit of essentially every remote embedding model (OpenAI `text-embedding-3-*`, Bedrock Titan V2, Cohere v3, a stock llama.cpp context) — set it to your model's real limit if it differs, or to `0` to send text uncapped. (Deprecated alias: `HINDSIGHT_API_EMBEDDINGS_LITELLM_SDK_MAX_INPUT_TOKENS`.) | `8192` |
+| `HINDSIGHT_API_EMBEDDINGS_MAX_INPUT_TOKENS` | Applies to **every** provider: truncate each text to this many tokens (counted with `HINDSIGHT_API_TOKENIZER_ENCODING`, approximate) before embedding, so oversized content is truncated instead of failing the embed call permanently. The budget covers the whole payload, including any client-side prefix an asymmetric model needs. The default matches the input limit of essentially every remote embedding model (OpenAI `text-embedding-3-*`, Bedrock Titan V2, Cohere v3, a stock llama.cpp context) — set it to your model's real limit if it differs, or to `0` to send text uncapped. **The cap is counted in Hindsight's tokens, not your provider's.** If your model uses a different tokenizer (for example `BAAI/bge-m3`, `nomic-embed-text`, or most open-source models behind TEI or an OpenAI-compatible endpoint), the same text can count up to ~2× more tokens on the provider's side, especially code, logs, or minified text. Text cut to exactly 8192 then still exceeds the model's limit, and the embed call fails with a 400. For these models, convert the limit: divide the model's real limit by how many of its tokens one Hindsight token becomes on your content, e.g. `4096` for an 8192-token model when embedding code. (Deprecated alias: `HINDSIGHT_API_EMBEDDINGS_LITELLM_SDK_MAX_INPUT_TOKENS`.) | `8192` |
 | `HINDSIGHT_API_EMBEDDINGS_QUERY_PREFIX` | Text prepended to every search before it is embedded. Set it when your endpoint serves an asymmetric model that expects a search instruction — e.g. `task: search result \| query: ` for `google/embeddinggemma-300m`, or `query: ` for E5. Applies to the providers that only accept plain text (`tei`, `openai`, `openai-codex`, `openrouter`, `requesty`, `litellm`, `litellm-sdk`); see the note below for the ones that don't need it. Trailing spaces are kept as written. | - (no prefix) |
 | `HINDSIGHT_API_EMBEDDINGS_PASSAGE_PREFIX` | Text prepended to every stored memory/document before it is embedded — e.g. `title: none \| text: ` for `google/embeddinggemma-300m`, or `passage: ` for E5. Same providers as above. Trailing spaces are kept as written. | - (no prefix) |
 | `HINDSIGHT_API_EMBEDDINGS_LOCAL_MODEL` | Model for local provider. Models that ship their own search-text and stored-text instructions (e.g. the Qwen3-Embedding family) have them applied automatically — see the note below. | `BAAI/bge-small-en-v1.5` |
@@ -1460,6 +1487,7 @@ For advanced authentication (JWT, OAuth, multi-tenant schemas), implement a cust
 | `HINDSIGHT_API_RECENCY_DECAY_HALFLIFE_DAYS` | For the `exponential` decay function: the age (in days) at which a memory is considered neutral — younger memories get a recency boost, older ones a penalty. Smaller values favour very recent memories more aggressively. Only used when `HINDSIGHT_API_RECENCY_DECAY_FUNCTION=exponential`. | `90` |
 | `HINDSIGHT_API_ENABLE_MENTAL_MODEL_HISTORY` | Track history of content changes to each mental model (previous content + timestamp), stored one row per change in the `mental_model_history` table. Set to `false` to disable entirely — no history rows are written, reducing storage if audit trails are not needed. **This is how you turn the feature off** (not a zero cap). | `true` |
 | `HINDSIGHT_API_MENTAL_MODEL_MIN_REFRESH_INTERVAL_SECONDS` | Minimum seconds between two *automatic* refreshes of the same mental model — the after-consolidation trigger and the cron schedule. A trigger that fires sooner is not dropped: its refresh is queued and parked until the window closes, and every further trigger in the meantime folds into that one queued refresh, so a burst of small retains costs one refresh instead of one per retain. Raise it when a bank ingests continuously and its models do not need to be current to the minute — the parked refresh still sees everything that accumulated while it waited. Explicit refreshes (API, MCP, control plane) ignore the floor and run immediately, and additionally release a parked refresh they fold into. `0` = no floor, every trigger refreshes at once. Hierarchical — overridable per bank via the [config API](#hierarchical-configuration), and per model via `trigger.min_refresh_interval_seconds` (which wins, including an explicit `0` to exempt one hot model from a bank-wide floor). | `0` |
+| `HINDSIGHT_API_KNOWLEDGE_PAGE_DEFAULT_TRIGGER` | Default refresh settings for newly created knowledge pages, as a JSON object merged over the built-in default (`{"mode": "delta", "fact_types": ["observation"], "exclude_mental_models": true, "refresh_after_consolidation": true}`). Set only the fields you want to change — e.g. `{"refresh_cron": "0 * * * *"}` makes new pages refresh hourly instead of after every consolidation. A trigger sent when creating the page still wins; existing pages are not changed. Configurable per bank. | - |
 | `HINDSIGHT_API_MENTAL_MODEL_HISTORY_MAX_ENTRIES` | Max history rows kept per mental model. On each refresh the previous version is inserted into the `mental_model_history` table and the oldest rows beyond this cap are deleted, so per-model history can't grow without bound. `0` or a negative value **removes the cap** (history then grows with every refresh — unbounded); to turn history off entirely set `HINDSIGHT_API_ENABLE_MENTAL_MODEL_HISTORY=false` instead. | `50` |
 
 The five embedding-dependent gates—main semantic retrieval, graph seeds, temporal retrieval, semantic-link
@@ -1640,17 +1668,21 @@ host content on that origin.
 
 What happens to the bytes:
 
-- They are hashed (sha256) and stored **content-addressed**, so the same
-  attachment across many documents or re-ingests is stored once, and re-retaining
-  an unchanged document is a no-op.
+- They are hashed (sha256) and stored **content-addressed** under the document
+  that carries them, so the same bytes always have the same id, an attachment
+  repeated within one document is stored once, and re-retaining an unchanged
+  document is a no-op. Two *different* documents carrying the same attachment
+  hold a copy each — dedup across documents is deliberately given up, so that
+  deleting a document never has to ask whether another one still needs the bytes.
 - Storage goes through the same backend as uploaded files — `native`
   (PostgreSQL), `s3`, `gcs`, `azure`. See [File storage](#file-storage).
 - The document's stored text keeps a placeholder (`⟦hs-att:...⟧`) where the
   attachment sat, so chunking, idempotency, `update_mode=append` and
   re-extraction behave exactly as they do for text.
-- `document_attachments` records which documents reference which attachment,
-  derived from that text on every write. Deleting a document reclaims only the
-  blobs nothing else still references.
+- Which attachments a document carries is derived from that text on every write,
+  and each `attachments` row names its owning document. So deleting a document —
+  or re-retaining it without the attachment — reclaims exactly its own, the same
+  way on every backend, including a bank whose documents live in a memories store.
 - Every read surface returns the attachments alongside the text —
   `chunks[].attachments` and each memory's `attachments` on recall, plus
   get-document, get-chunk, get-memory and list-memories — each with a
@@ -2023,7 +2055,7 @@ Files uploaded via the file retain API are stored in an object storage backend b
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `HINDSIGHT_API_FILE_STORAGE_TYPE` | Storage backend: `native`, `s3`, `gcs`, or `azure` | `native` |
-| `HINDSIGHT_API_FILE_STORAGE_EXTENSION` | `module.path:ClassName` naming your own `FileStorage` implementation, used instead of the built-in backends. Every other `HINDSIGHT_API_FILE_STORAGE_*` variable is passed to it as a lowercased config dict. | unset |
+| `HINDSIGHT_API_FILE_STORAGE_EXTENSION` | `module.path:ClassName` naming your own `FileStorage` implementation, used instead of the built-in backends. Every other `HINDSIGHT_API_FILE_STORAGE_*` variable is passed to it as a lowercased config dict. Implement `delete_prefix` too, or deleting a bank leaves that bank's stored files in your backend. | unset |
 
 #### Native (PostgreSQL)
 
@@ -2222,9 +2254,9 @@ export HINDSIGHT_API_OBSERVATIONS_MISSION="Observations are recurring patterns i
 | `HINDSIGHT_API_REFLECT_MISSION` | Global reflect mission (identity and reasoning framing). Overridden per bank via config API. | - |
 | `HINDSIGHT_API_REFLECT_SOURCE_FACTS_MAX_TOKENS` | Token budget for source facts in `search_observations` during reflect. `-1` disables source facts (default), `0` enables with no limit, `>0` enables with a token budget. Hierarchical — can be overridden per bank via config API. | `-1` |
 
-#### Internal recall (used by mental model refresh)
+#### Internal recall (used by reflect and mental model refresh)
 
-These knobs control the recall tool that runs inside `reflect_async` (e.g. when refreshing a mental model). They are hierarchical — overridable per bank via the config API, and individually overridable per mental model via the `trigger.include_chunks`, `trigger.recall_max_tokens`, and `trigger.recall_chunks_max_tokens` fields.
+These knobs control the recall tool the reflect agent runs (including when refreshing a mental model). They set what a `recall` tool call gets when the model does not ask for a specific budget; an explicit ask from the model wins, within the bounds reflect applies to any model-supplied token argument. They are hierarchical — overridable per bank via the config API, and individually overridable per mental model via the `trigger.include_chunks`, `trigger.recall_max_tokens`, and `trigger.recall_chunks_max_tokens` fields.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
@@ -2321,6 +2353,8 @@ Configuration for background task processing. By default, the API processes task
 | `HINDSIGHT_API_WORKER_REFRESH_MENTAL_MODEL_RESERVED_SLOTS` | Reserved (minimum) slots for refresh_mental_model within `WORKER_MAX_SLOTS`. | `0` |
 | `HINDSIGHT_API_WORKER_GRAPH_MAINTENANCE_RESERVED_SLOTS` | Reserved (minimum) slots for graph_maintenance within `WORKER_MAX_SLOTS`. | `0` |
 | `HINDSIGHT_API_WORKER_IMPORT_DOCUMENTS_RESERVED_SLOTS` | Reserved (minimum) slots for import_documents within `WORKER_MAX_SLOTS`. | `0` |
+| `HINDSIGHT_API_WORKER_EXPORT_BANK_RESERVED_SLOTS` | Reserved (minimum) slots for export_bank within `WORKER_MAX_SLOTS`. | `0` |
+| `HINDSIGHT_API_WORKER_IMPORT_BANK_RESERVED_SLOTS` | Reserved (minimum) slots for import_bank within `WORKER_MAX_SLOTS`. | `0` |
 | `HINDSIGHT_API_WORKER_<TYPE>_MAX_SLOTS` | **Deprecated** alias for `..._RESERVED_SLOTS`, where `<TYPE>` is one of `CONSOLIDATION`, `RETAIN`, `FILE_CONVERT_RETAIN`, `REFRESH_MENTAL_MODEL`, `GRAPH_MAINTENANCE`, `IMPORT_DOCUMENTS`. The name is misleading — it always set the reservation floor, never a ceiling. Still honored but logs a warning; will be removed in a future release. Setting both it and `..._RESERVED_SLOTS` is an error. | _(unset)_ |
 
 Terminal operations use one coherent retention window for the entire row. Hindsight does not scrub the task payload when an operation finishes: failed and cancelled operations need it for retry, while `include_payload=true` on completed operations is an explicit debugging surface. Keeping payload, result metadata, progress, and status together also avoids partial operation histories. Once a terminal row's `updated_at` is older than the configured window, the background maintenance loop prunes it in bounded per-schema batches, alongside the other scheduled sweeps. PostgreSQL only — the maintenance loop does not run on Oracle. Pending and processing rows are never pruned by this cleanup.

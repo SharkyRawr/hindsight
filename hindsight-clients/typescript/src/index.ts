@@ -116,16 +116,35 @@ export function retryAfterMs(response: Response | undefined): number | null {
 export async function retryOnCapacity<T extends { response?: Response }>(
   send: () => Promise<T>,
   maxAttempts: number,
-  random: () => number = Math.random
+  random: () => number = Math.random,
+  signal?: AbortSignal
 ): Promise<T> {
+  signal?.throwIfAborted();
   let result = await send();
+  signal?.throwIfAborted();
   for (let attempt = 1; attempt < maxAttempts; attempt++) {
     const status = result.response?.status;
     if (status !== 429 && status !== 503) return result;
     const wait = retryAfterMs(result.response) ?? FALLBACK_BACKOFF_MS * 2 ** (attempt - 1);
     // Full jitter: sleep somewhere in [0, wait] so a synchronised burst spreads out.
-    await new Promise((resolve) => setTimeout(resolve, random() * wait));
+    // A cancelled caller must not wait out Retry-After or start another request.
+    // Clean up on either outcome: successful reads should not accumulate listeners.
+    await new Promise<void>((resolve, reject) => {
+      const onAbort = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        reject(signal?.reason);
+      };
+      const timer = setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      }, random() * wait);
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) onAbort();
+    });
+    signal?.throwIfAborted();
     result = await send();
+    signal?.throwIfAborted();
   }
   return result;
 }
@@ -566,7 +585,9 @@ export class HindsightClient {
           },
           signal: options?.signal,
         }),
-      this.maxAttempts
+      this.maxAttempts,
+      Math.random,
+      options?.signal
     );
 
     return this.validateResponse(response, "recall");
@@ -636,7 +657,9 @@ export class HindsightClient {
           },
           signal: options?.signal,
         }),
-      this.maxAttempts
+      this.maxAttempts,
+      Math.random,
+      options?.signal
     );
 
     return this.validateResponse(response, "reflect");
@@ -884,6 +907,8 @@ export class HindsightClient {
       consolidationSourceFactsMaxTokensPerObservation?: number;
       /** Debounce between mental-model refreshes. */
       mentalModelMinRefreshIntervalSeconds?: number;
+      /** Trigger fields merged over the built-in default for new knowledge pages. */
+      knowledgePageDefaultTrigger?: Record<string, unknown>;
       /** Token budget for source facts during reflect. -1 disables. */
       reflectSourceFactsMaxTokens?: number;
       /** Token budget for facts returned by recall. */
@@ -981,6 +1006,8 @@ export class HindsightClient {
     if (options.mentalModelMinRefreshIntervalSeconds !== undefined)
       updates.mental_model_min_refresh_interval_seconds =
         options.mentalModelMinRefreshIntervalSeconds;
+    if (options.knowledgePageDefaultTrigger !== undefined)
+      updates.knowledge_page_default_trigger = options.knowledgePageDefaultTrigger;
     if (options.reflectSourceFactsMaxTokens !== undefined)
       updates.reflect_source_facts_max_tokens = options.reflectSourceFactsMaxTokens;
     if (options.recallMaxTokens !== undefined) updates.recall_max_tokens = options.recallMaxTokens;
@@ -1692,6 +1719,188 @@ export class HindsightClient {
     const submission = this.validateResponse(submitResponse, "exportDocuments");
     const operationId = submission.operation_id;
 
+    const pollInterval = options?.pollIntervalMs ?? 2000;
+    const timeout = options?.timeoutMs ?? 300000;
+    const deadline = Date.now() + timeout;
+    let resultMetadata: Record<string, unknown> | null | undefined;
+    for (;;) {
+      const statusResponse = await sdk.getOperationStatus({
+        client: this.client,
+        path: { bank_id: bankId, operation_id: operationId },
+        signal: options?.signal,
+      });
+      const status = this.validateResponse(statusResponse, "getOperationStatus");
+      if (status.status === "completed") {
+        resultMetadata = status.result_metadata;
+        break;
+      }
+      if (status.status === "failed" || status.status === "cancelled") {
+        throw new HindsightError(
+          `Export operation ${operationId} ${status.status}: ${status.error_message ?? ""}`
+        );
+      }
+      if (Date.now() >= deadline) {
+        throw new HindsightError(
+          `Export operation ${operationId} did not complete within ${timeout}ms`
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, pollInterval));
+    }
+
+    const downloadUrl = (resultMetadata as { download_url?: string } | null | undefined)
+      ?.download_url;
+    if (!downloadUrl) {
+      throw new HindsightError(`Export operation ${operationId} completed without a download_url`);
+    }
+    // Fetch the server-provided download_url directly (it carries the raw,
+    // slash-bearing storage key). Going through the templated `downloadFile`
+    // would percent-encode the slashes, which fronting proxies often reject.
+    const downloadResponse = await this.client.get({
+      url: downloadUrl,
+      parseAs: "arrayBuffer",
+      signal: options?.signal,
+    });
+    const data = this.validateResponse(downloadResponse as { data?: ArrayBuffer }, "downloadFile");
+    return new Uint8Array(data);
+  }
+
+  /**
+   * Export a whole bank as a transfer ZIP archive (blocking convenience).
+   *
+   * Three flags decide what the archive carries. `includeData` covers the memories
+   * and everything backing them (documents, facts, observations, attachments and
+   * their bytes, the curation archive, the operations log and the maintenance
+   * queues); `includeBankConfig` the bank's own config, mental models and their
+   * history, knowledge pages, directives and webhooks; `includeHistory` the audit
+   * and LLM-request logs. Embeddings never travel — the importing instance
+   * regenerates them, which is what makes an archive portable.
+   *
+   * @throws {HindsightError} if the export fails, times out, or completes without an archive.
+   */
+  async exportBank(
+    bankId: string,
+    options?: {
+      includeData?: boolean;
+      includeBankConfig?: boolean;
+      includeHistory?: boolean;
+      /** Milliseconds between operation-status polls (default 2000). */
+      pollIntervalMs?: number;
+      /** Maximum milliseconds to wait for the export to finish (default 300000). */
+      timeoutMs?: number;
+      signal?: AbortSignal;
+    }
+  ): Promise<Uint8Array> {
+    const submitResponse = await sdk.exportBankTransfer({
+      client: this.client,
+      path: { bank_id: bankId },
+      query: {
+        ...(options?.includeData !== undefined ? { include_data: options.includeData } : {}),
+        ...(options?.includeBankConfig !== undefined
+          ? { include_bank_config: options.includeBankConfig }
+          : {}),
+        ...(options?.includeHistory !== undefined
+          ? { include_history: options.includeHistory }
+          : {}),
+      },
+      signal: options?.signal,
+    });
+    const submission = this.validateResponse(submitResponse, "exportBankTransfer");
+    return this.downloadOperationArchive(bankId, submission.operation_id, options);
+  }
+
+  /**
+   * Restore a bank archive into a fresh bank, and resolve with the operation id.
+   *
+   * The restore runs in the background (facts are re-embedded and entities
+   * re-resolved); poll `sdk.getOperationStatus` for its progress and counts.
+   *
+   * `targetBankId` must NOT already exist — this restores a whole bank rather than
+   * merging into one. `bankId` is simply the bank the operation is recorded
+   * against, because the target does not exist yet. To fold an archive's documents
+   * into an existing bank instead, use `sdk.importDocuments`.
+   */
+  async importBank(
+    bankId: string,
+    archive: Blob | File,
+    options?: {
+      targetBankId?: string;
+      includeData?: boolean;
+      includeBankConfig?: boolean;
+      includeHistory?: boolean;
+      signal?: AbortSignal;
+    }
+  ): Promise<string> {
+    const response = await sdk.importBankTransfer({
+      client: this.client,
+      path: { bank_id: bankId },
+      query: {
+        ...(options?.targetBankId !== undefined ? { target_bank_id: options.targetBankId } : {}),
+        ...(options?.includeData !== undefined ? { include_data: options.includeData } : {}),
+        ...(options?.includeBankConfig !== undefined
+          ? { include_bank_config: options.includeBankConfig }
+          : {}),
+        ...(options?.includeHistory !== undefined
+          ? { include_history: options.includeHistory }
+          : {}),
+      },
+      body: { file: archive },
+      signal: options?.signal,
+    });
+    const submission = this.validateResponse(response, "importBankTransfer");
+    return submission.operation_id;
+  }
+
+  /**
+   * Copy a bank into a new one, and resolve with the clone operation's id.
+   *
+   * The clone starts with the source's memories as they are at clone time and
+   * evolves independently from then on. It runs server-side as the export and
+   * import back to back, so no archive travels over the wire and no LLM is called;
+   * poll `sdk.getOperationStatus` for progress and the per-component counts.
+   *
+   * `targetBankId` must NOT already exist. Note that webhooks travel with
+   * `includeBankConfig`: a clone made with the defaults will call the source's
+   * webhook endpoints.
+   */
+  async cloneBank(
+    bankId: string,
+    targetBankId: string,
+    options?: {
+      includeData?: boolean;
+      includeBankConfig?: boolean;
+      includeHistory?: boolean;
+      signal?: AbortSignal;
+    }
+  ): Promise<string> {
+    const response = await sdk.cloneBank({
+      client: this.client,
+      path: { bank_id: bankId },
+      query: {
+        target_bank_id: targetBankId,
+        ...(options?.includeData !== undefined ? { include_data: options.includeData } : {}),
+        ...(options?.includeBankConfig !== undefined
+          ? { include_bank_config: options.includeBankConfig }
+          : {}),
+        ...(options?.includeHistory !== undefined
+          ? { include_history: options.includeHistory }
+          : {}),
+      },
+      signal: options?.signal,
+    });
+    const submission = this.validateResponse(response, "cloneBank");
+    return submission.operation_id;
+  }
+
+  /**
+   * Poll an export operation to completion and download the archive it produced.
+   * Shared by `exportDocuments` and `exportBank` — both submit an operation whose
+   * `result_metadata` names the finished archive.
+   */
+  private async downloadOperationArchive(
+    bankId: string,
+    operationId: string,
+    options?: { pollIntervalMs?: number; timeoutMs?: number; signal?: AbortSignal }
+  ): Promise<Uint8Array> {
     const pollInterval = options?.pollIntervalMs ?? 2000;
     const timeout = options?.timeoutMs ?? 300000;
     const deadline = Date.now() + timeout;
