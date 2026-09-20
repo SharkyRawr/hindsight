@@ -157,7 +157,6 @@ class LocalSTCrossEncoder(CrossEncoderModel):
         fp16: bool = False,
         bucket_batching: bool = False,
         batch_size: int = DEFAULT_RERANKER_LOCAL_BATCH_SIZE,
-        allow_mps: bool = False,
     ):
         """
         Initialize local SentenceTransformers cross-encoder.
@@ -172,16 +171,13 @@ class LocalSTCrossEncoder(CrossEncoderModel):
             trust_remote_code: Allow loading models with custom code (security risk).
                               Required for some models like jina-reranker-v2-base-multilingual.
                               Default: False (disabled for security)
-            fp16: Use FP16 (half precision) inference. Faster on MPS and CUDA,
+            fp16: Use FP16 (half precision) inference. Faster on CUDA,
                   may be slower on CPU. Default: False (opt-in via env var).
             bucket_batching: Sort pairs by token length before batching to reduce
                             padding waste. 36-54% speedup, quality-identical.
                             Default: False (opt-in via env var).
             batch_size: Batch size for predict() calls. Optimal values vary by
-                       hardware and model (MPS: 32, CUDA: 128+). Default: 32.
-            allow_mps: Opt in to the Apple Silicon MPS GPU. Disabled by default
-                      because MPS leaks memory under variable-length workloads
-                      (see engine/local_device.py). Default: False
+                       hardware and model (CPU: 32, CUDA: 128+). Default: 32.
         """
         self.model_name = model_name or DEFAULT_RERANKER_LOCAL_MODEL
         self.force_cpu = force_cpu
@@ -189,7 +185,6 @@ class LocalSTCrossEncoder(CrossEncoderModel):
         self.fp16 = fp16
         self.bucket_batching = bucket_batching
         self.batch_size = batch_size
-        self.allow_mps = allow_mps
         self._model = None
         self._device_type: str = "cpu"
         LocalSTCrossEncoder._max_concurrent = max_concurrent
@@ -222,8 +217,8 @@ class LocalSTCrossEncoder(CrossEncoderModel):
         # cause issues when accelerate is installed but no GPU is available.
         # Note: We do NOT use device_map because CrossEncoder internally calls .to(device)
         # after loading, which conflicts with accelerate's device_map handling.
-        # MPS is opt-in (allow_mps) — see engine/local_device.py for why.
-        device = select_local_device(self.force_cpu, self.allow_mps)
+        # MPS is never used — see engine/local_device.py for why.
+        device = select_local_device(self.force_cpu)
 
         # Patch transformers 5.x compatibility for models using XLM-RoBERTa
         # (e.g., jina-reranker-v2-base-multilingual). transformers 5.x removed
@@ -1412,8 +1407,8 @@ class JinaMLXCrossEncoder(CrossEncoderModel):
         _ = transformers.AutoTokenizer
 
         try:
-            import mlx.core  # noqa: F401
-            import mlx_lm  # noqa: F401
+            import mlx.core  # noqa: F401  # ty: ignore[unresolved-import]
+            import mlx_lm  # noqa: F401  # ty: ignore[unresolved-import]
         except ImportError as exc:
             # Only swallow "package not installed" errors. Anything else (e.g. a
             # transitive import failure inside mlx_lm) must surface verbatim so
@@ -1422,9 +1417,16 @@ class JinaMLXCrossEncoder(CrossEncoderModel):
             msg = str(exc)
             if "mlx" not in msg and "mlx_lm" not in msg:
                 raise
+            # mlx is Apple's Metal/unified-memory framework, so the local-ml extra
+            # only installs it on macOS arm64 (see pyproject.toml). Missing here
+            # therefore usually means "wrong platform", not "forgot the extra" —
+            # say both, and name the way out.
             raise ImportError(
-                "mlx and mlx-lm are required for JinaMLXCrossEncoder. "
-                "Install with: pip install mlx>=0.31.0 mlx-lm>=0.31.1 safetensors>=0.6.2"
+                "mlx and mlx-lm are required for the 'jina-mlx' reranker, and are only "
+                "installed on Apple Silicon — mlx is Apple's Metal framework, and its "
+                "Linux build is CPU-only and slower than the 'local' provider. Set "
+                "HINDSIGHT_API_RERANKER_PROVIDER=local (or a hosted provider), or install "
+                "them yourself: pip install mlx>=0.31.0 mlx-lm>=0.31.1 safetensors>=0.6.2"
             ) from exc
 
         loop = asyncio.get_event_loop()
@@ -1874,7 +1876,6 @@ def _create_cross_encoder_backend(member: RerankerMemberConfig) -> CrossEncoderM
             fp16=member.local_fp16,
             bucket_batching=member.local_bucket_batching,
             batch_size=member.local_batch_size,
-            allow_mps=member.local_allow_mps,
         )
     elif provider == "cohere":
         api_key = member.cohere_api_key

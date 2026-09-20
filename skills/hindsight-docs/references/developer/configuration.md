@@ -268,7 +268,7 @@ For non-English banks (especially CJK) and the language/extraction-language trad
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `HINDSIGHT_API_LLM_PROVIDER` | Provider: `openai`, `openai-responses`, `openai-codex`, `claude-code`, `github-copilot`, `anthropic`, `gemini`, `groq`, `minimax`, `deepseek`, `zai`, `opencode-go`, `meta`, `nous`, `xai-oauth`, `fireworks`, `ollama`, `ollama-cloud`, `lmstudio`, `llamacpp`, `vertexai`, `bedrock`, `litellm`, `litellmrouter`, `volcano`, `openrouter`, `requesty`, `none` | `openai` |
+| `HINDSIGHT_API_LLM_PROVIDER` | Provider: `openai`, `openai-responses`, `openai-codex`, `claude-code`, `cursor`, `github-copilot`, `anthropic`, `gemini`, `groq`, `minimax`, `deepseek`, `zai`, `opencode-go`, `meta`, `nous`, `xai-oauth`, `fireworks`, `ollama`, `ollama-cloud`, `lmstudio`, `llamacpp`, `vertexai`, `bedrock`, `litellm`, `litellmrouter`, `volcano`, `openrouter`, `requesty`, `none` | `openai` |
 | `HINDSIGHT_API_LLM_API_KEY` | API key for providers that require one; unused by `github-copilot` | - |
 | `HINDSIGHT_API_LLM_MODEL` | Model name | `gpt-5-mini` |
 | `HINDSIGHT_API_LLM_BASE_URL` | Custom LLM endpoint | Provider default |
@@ -277,9 +277,9 @@ For non-English banks (especially CJK) and the language/extraction-language trad
 | `HINDSIGHT_API_LLM_INITIAL_BACKOFF` | Initial retry backoff in seconds (exponential backoff) | `1.0` |
 | `HINDSIGHT_API_LLM_MAX_BACKOFF` | Max retry backoff cap in seconds | `60.0` |
 | `HINDSIGHT_API_LLM_TIMEOUT` | LLM request timeout in seconds. Honoured by every provider as a **total** deadline for one request, including the time spent reading a streamed response — a backend that keeps sending bytes is cut off at the deadline rather than read indefinitely. Raise it if your provider is legitimately slow; the per-operation variables below override it. | `120` |
-| `HINDSIGHT_API_LLM_CONNECT_TIMEOUT` | Ceiling on the **connect** phase (TCP + TLS handshake) of an LLM request, in seconds. The read, write and pool phases keep the full `HINDSIGHT_API_LLM_TIMEOUT` budget; capping connect separately means an unreachable or wedged endpoint fails in seconds instead of consuming the whole request timeout. Effective value is the smaller of this and the request timeout. Set to `0` to disable the cap and use one value across all four phases. Applies to every provider whose HTTP client Hindsight constructs (all OpenAI-compatible backends, `openai-responses`, `anthropic`, `openai-codex`, `xai-oauth`, `fireworks`, `nous`, `llamacpp`); `litellm`/`litellmrouter` and `gemini`/`vertexai` own their transports and take a single total deadline instead, and `claude-code`/`github-copilot` drive a CLI rather than a socket. | `10` |
+| `HINDSIGHT_API_LLM_CONNECT_TIMEOUT` | Ceiling on the **connect** phase (TCP + TLS handshake) of an LLM request, in seconds. The read, write and pool phases keep the full `HINDSIGHT_API_LLM_TIMEOUT` budget; capping connect separately means an unreachable or wedged endpoint fails in seconds instead of consuming the whole request timeout. Effective value is the smaller of this and the request timeout. Set to `0` to disable the cap and use one value across all four phases. Applies to every provider whose HTTP client Hindsight constructs (all OpenAI-compatible backends, `openai-responses`, `anthropic`, `openai-codex`, `xai-oauth`, `fireworks`, `nous`, `llamacpp`); `litellm`/`litellmrouter` and `gemini`/`vertexai` own their transports and take a single total deadline instead, and `claude-code`/`cursor`/`github-copilot` drive a CLI rather than a socket. | `10` |
 | `HINDSIGHT_API_LLM_HTTP_LOG_LEVEL` | Log level for the `httpx` and `httpcore` loggers. Set to `DEBUG` to trace each LLM request through its transport phases (`connect_tcp`, `send_request_headers`, `receive_response_headers`) — the way to tell a request that stalled before it was ever sent from one that was sent and never answered. Verbose; for diagnosis only. | `WARNING` |
-| `HINDSIGHT_API_LLM_REASONING_EFFORT` | Reasoning effort for providers/models that support it (for example `none`, `low`, `medium`, `high`, `xhigh`). Set it and the value is sent as given, whatever your model is called — which is how you control thinking-token volume on a self-hosted reasoning model (vLLM, Ollama, llama.cpp, TGI), where `none` is often the only value that removes the thinking block. Leave it unset and no reasoning parameter is sent at all, so each model runs at its own default effort. Honoured by `openai` and every OpenAI-compatible provider, `openai-responses`, `openai-codex`, `xai`, `llamacpp`, and `litellm`/`litellmrouter` (which translate it per target provider). The native `gemini`/`vertexai`, `anthropic` and `claude-code` providers have no reasoning-effort control and log a warning at startup if you set one — reach those models through `litellm` to apply it. | Unset (model's own default) |
+| `HINDSIGHT_API_LLM_REASONING_EFFORT` | Reasoning effort for providers/models that support it (for example `none`, `low`, `medium`, `high`, `xhigh`). Set it and the value is sent as given, whatever your model is called — which is how you control thinking-token volume on a self-hosted reasoning model (vLLM, Ollama, llama.cpp, TGI), where `none` is often the only value that removes the thinking block. Leave it unset and no reasoning parameter is sent at all, so each model runs at its own default effort. Honoured by `openai` and every OpenAI-compatible provider, `openai-responses`, `openai-codex`, `xai`, `llamacpp`, and `litellm`/`litellmrouter` (which translate it per target provider). The native `gemini`/`vertexai`, `anthropic`, `claude-code` and `cursor` providers have no reasoning-effort control and log a warning at startup if you set one — reach those models through `litellm` to apply it. | Unset (model's own default) |
 | `HINDSIGHT_API_LLM_TEMPERATURE` | Global override for the sampling temperature of internal LLM calls. Set a number in `[0.0, 2.0]`, or `none` (also `default`/`off`/empty) to **omit** the temperature parameter entirely — required for models that reject explicit temperatures, e.g. Azure `gpt-5.5`, which only accepts its default value. Per-operation variables below override this. | Per-operation defaults |
 | `HINDSIGHT_API_LLM_TEMPERATURE_VERIFICATION` | Temperature for the startup connection check. Number in `[0.0, 2.0]` or `none` to omit. Overrides `HINDSIGHT_API_LLM_TEMPERATURE`. | `0.0` |
 | `HINDSIGHT_API_LLM_TEMPERATURE_RETAIN` | Temperature for fact extraction during retain. Number in `[0.0, 2.0]` or `none` to omit. Overrides `HINDSIGHT_API_LLM_TEMPERATURE`. | `0.1` |
@@ -421,6 +421,20 @@ export HINDSIGHT_API_LLM_MODEL=gpt-5.4-mini
 export HINDSIGHT_API_LLM_PROVIDER=claude-code
 export HINDSIGHT_API_LLM_MODEL=claude-sonnet-4-5-20250929
 # No API key needed - uses claude auth login credentials
+
+# Cursor (Cursor subscription - drives the cursor-agent CLI in headless mode)
+export HINDSIGHT_API_LLM_PROVIDER=cursor
+export HINDSIGHT_API_LLM_MODEL=auto   # or any id from `cursor-agent --list-models`
+# No API key needed - uses `cursor-agent login` credentials.
+# Set HINDSIGHT_API_LLM_API_KEY (or CURSOR_API_KEY) to authenticate with a key instead.
+# An agent CLI turn takes 15-30s, well past the 30s reflect default, so raise the
+# timeouts or reflect burns its first iteration on a timeout retry.
+export HINDSIGHT_API_LLM_TIMEOUT=300
+export HINDSIGHT_API_REFLECT_LLM_TIMEOUT=180
+# The CLI exposes no response-format or tool-definition flags, so Hindsight emulates
+# structured output and tool calling through the prompt and parses the JSON back. That
+# is less reliable than a native schema: prefer a stronger named model over `auto` for
+# reflect, which is the operation that leans hardest on tool calls.
 
 # Volcano Engine (ByteDance - OpenAI-compatible)
 export HINDSIGHT_API_LLM_PROVIDER=volcano
@@ -832,8 +846,7 @@ server-level only (not overridable per tenant/bank) and a change requires a rest
 | `HINDSIGHT_API_EMBEDDINGS_PASSAGE_PREFIX` | Text prepended to every stored memory/document before it is embedded — e.g. `title: none \| text: ` for `google/embeddinggemma-300m`, or `passage: ` for E5. Same providers as above. Trailing spaces are kept as written. | - (no prefix) |
 | `HINDSIGHT_API_EMBEDDINGS_LOCAL_MODEL` | Model for local provider. Models that ship their own search-text and stored-text instructions (e.g. the Qwen3-Embedding family) have them applied automatically — see the note below. | `BAAI/bge-small-en-v1.5` |
 | `HINDSIGHT_API_EMBEDDINGS_LOCAL_TRUST_REMOTE_CODE` | Allow loading models with custom code (security risk, disabled by default) | `false` |
-| `HINDSIGHT_API_EMBEDDINGS_LOCAL_FORCE_CPU` | Force CPU mode for local embeddings (avoids MPS/XPC issues on macOS) | `false` |
-| `HINDSIGHT_API_EMBEDDINGS_LOCAL_ALLOW_MPS` | Opt in to the Apple Silicon MPS GPU for local embeddings. Disabled by default because MPS caches a distinct kernel/allocator pool per input shape and never releases it, so under variable-length workloads memory grows without bound (idle instances reached ~20 GB). CUDA/XPU are unaffected and still auto-select. | `false` |
+| `HINDSIGHT_API_EMBEDDINGS_LOCAL_FORCE_CPU` | Force CPU mode for local embeddings even when CUDA/XPU is available | `false` |
 | `HINDSIGHT_API_EMBEDDINGS_ONNX_MODEL_ID` | Hugging Face model repo for the ONNX provider. Used for auto-download and as the tokenizer fallback. | `intfloat/multilingual-e5-small` |
 | `HINDSIGHT_API_EMBEDDINGS_ONNX_MODEL_PATH` | Local path to the ONNX graph. When unset, Hindsight downloads `HINDSIGHT_API_EMBEDDINGS_ONNX_FILE` from `HINDSIGHT_API_EMBEDDINGS_ONNX_MODEL_ID`. | - |
 | `HINDSIGHT_API_EMBEDDINGS_ONNX_TOKENIZER_NAME_OR_PATH` | Hugging Face tokenizer repo or local tokenizer directory. Set this when using `HINDSIGHT_API_EMBEDDINGS_ONNX_MODEL_PATH`. | Falls back to `HINDSIGHT_API_EMBEDDINGS_ONNX_MODEL_ID` |
@@ -1163,11 +1176,10 @@ ZeroEntropy's `zembed-1` supports Matryoshka dimensions: `2560`, `1280`, `640`, 
 | `HINDSIGHT_API_RERANKER_LOCAL_MODEL` | Model for local provider | `cross-encoder/ms-marco-MiniLM-L-6-v2` |
 | `HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT` | Max concurrent local reranking (prevents CPU thrashing under load) | `4` |
 | `HINDSIGHT_API_RERANKER_LOCAL_TRUST_REMOTE_CODE` | Allow loading models with custom code (security risk, disabled by default) | `false` |
-| `HINDSIGHT_API_RERANKER_LOCAL_FORCE_CPU` | Force CPU mode for local reranker (avoids MPS/XPC issues on macOS) | `false` |
-| `HINDSIGHT_API_RERANKER_LOCAL_ALLOW_MPS` | Opt in to the Apple Silicon MPS GPU for the local reranker. Disabled by default because MPS caches a distinct kernel/allocator pool per input shape and never releases it, so under variable-length workloads memory grows without bound (idle instances reached ~20 GB). CUDA/XPU are unaffected and still auto-select. | `false` |
-| `HINDSIGHT_API_RERANKER_LOCAL_FP16` | Half-precision (FP16) inference for the local reranker. 27–36% faster on MPS; quality-identical. Disabled by default to avoid regressions on non-MPS deployments — some CPUs lack native FP16 support. | `false` |
+| `HINDSIGHT_API_RERANKER_LOCAL_FORCE_CPU` | Force CPU mode for local reranker even when CUDA/XPU is available | `false` |
+| `HINDSIGHT_API_RERANKER_LOCAL_FP16` | Half-precision (FP16) inference for the local reranker. Faster on CUDA; quality-identical. Disabled by default because some CPUs lack native FP16 support. | `false` |
 | `HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING` | Sort pairs by token length before batching to reduce padding waste. 36–54% faster across models; quality-identical by construction. | `false` |
-| `HINDSIGHT_API_RERANKER_LOCAL_BATCH_SIZE` | Batch size for local reranker `predict()`. Optimal value varies by hardware and model (smaller batches can outperform larger ones on MPS). | `32` |
+| `HINDSIGHT_API_RERANKER_LOCAL_BATCH_SIZE` | Batch size for local reranker `predict()`. Optimal value varies by hardware and model (smaller batches can outperform larger ones). | `32` |
 | `HINDSIGHT_API_RERANKER_TEI_URL` | TEI server URL | - |
 | `HINDSIGHT_API_RERANKER_TEI_BATCH_SIZE` | Batch size for TEI reranking | `128` |
 | `HINDSIGHT_API_RERANKER_TEI_MAX_CONCURRENT` | Max concurrent TEI reranking requests | `8` |
@@ -1209,6 +1221,19 @@ ZeroEntropy's `zembed-1` supports Matryoshka dimensions: `2560`, `1280`, `640`, 
 | `HINDSIGHT_API_RERANKER_FLASHRANK_CPU_MEM_ARENA` | Enable ONNX Runtime CPU memory arena for FlashRank. When `true`, ONNX pre-allocates a memory arena that never shrinks, causing RSS to grow monotonically. `false` trades slightly slower per-call allocation for bounded RSS. | `false` |
 | `HINDSIGHT_API_RERANKER_FLASHRANK_BATCH_SIZE` | Passages scored per FlashRank forward pass. Each pass allocates attention tensors sized `batch × heads × seq²`, and FlashRank pads a batch to its longest passage, so raising this raises peak memory sharply on long candidates. Lower it if the reranker is the memory ceiling on a large bank. | `32` |
 | `HINDSIGHT_API_RERANKER_JINA_MLX_MODEL_PATH` | Local path to downloaded `jina-reranker-v3-mlx` model (auto-downloads from HuggingFace if unset) | - |
+
+:::note Apple Silicon: the local providers run on CPU
+
+PyTorch's MPS (Metal) backend is never used for the local embeddings or reranker
+models. It caches a kernel and allocator pool per input tensor shape and never releases
+them, so a variable-length workload grows without bound (idle instances reached ~20 GB),
+and concurrent inference aborts the process with a Metal validation assertion. The
+`HINDSIGHT_API_EMBEDDINGS_LOCAL_ALLOW_MPS` and `HINDSIGHT_API_RERANKER_LOCAL_ALLOW_MPS`
+flags that used to opt in have been removed; setting them now logs a warning and does
+nothing. For GPU reranking on Apple Silicon use `HINDSIGHT_API_RERANKER_PROVIDER=jina-mlx`.
+CUDA and Intel XPU are unaffected and still auto-select.
+
+:::
 
 #### Reranker failover chain
 
@@ -1381,6 +1406,8 @@ Both support the same providers:
 #### Jina MLX (Apple Silicon)
 
 The `jina-mlx` provider uses [`jinaai/jina-reranker-v3-mlx`](https://huggingface.co/jinaai/jina-reranker-v3-mlx), optimized for Apple Silicon. The model (~1.2 GB) is downloaded from HuggingFace Hub automatically on first startup and cached locally.
+
+`mlx` is Apple's Metal framework, so the `local-ml` extra only installs it on Apple Silicon — its Linux build is CPU-only and slower than the `local` provider. Selecting `jina-mlx` elsewhere fails at startup unless you install `mlx`/`mlx-lm` yourself.
 
 :::note License
 `jina-reranker-v3-mlx` is licensed under CC BY-NC 4.0. Contact Jina AI for commercial usage.
@@ -1601,6 +1628,7 @@ Controls the retain (memory ingestion) pipeline.
 | `HINDSIGHT_API_RETAIN_MISSION` | What this bank should pay attention to during extraction. Steers the LLM without replacing the extraction rules — works alongside any extraction mode. | - |
 | `HINDSIGHT_API_RETAIN_CUSTOM_INSTRUCTIONS` | Full prompt override for fact extraction (only used when mode is `custom`). Replaces built-in extraction rules entirely. | - |
 | `HINDSIGHT_API_RETAIN_EXTRACT_CAUSAL_LINKS` | Extract causal relationships between facts | `true` |
+| `HINDSIGHT_API_RETAIN_OPTIONAL_FACT_DIMENSIONS` | Let a fact leave `when`/`where`/`who`/`why` empty instead of writing `"N/A"`. The four keys stay required in the schema; their values become `string \| null` and the prompt stops naming a placeholder. Turn it on for a small self-hosted model under `HINDSIGHT_API_LLM_STRICT_SCHEMA`, where "every property is required" means a fact with no date of its own must still emit *some* string — and the nearest plausible one is a date the text stated about something else. Off by default because it is not neutral on a capable model: with `why` droppable, "the user asked me to refactor X" tends to come back as its own `world` fact instead of riding along as the agent fact's rationale. Server-level, not per-bank. | `false` |
 | `HINDSIGHT_API_RETAIN_BATCH_ENABLED` | Use LLM Batch API for fact extraction (50% cost savings, only with async operations) | `false` |
 | `HINDSIGHT_API_RETAIN_MAX_CONCURRENT` | Max concurrent retain DB phases (HNSW reads + writes). Limits I/O contention during high-concurrency ingestion. | `4` |
 | `HINDSIGHT_API_RETAIN_SUBBATCH_CONCURRENCY` | Sub-batches of one document processed at a time. Most of a sub-batch is a store round-trip, so overlapping a few hides that wait. `1` keeps the splitter one slice ahead of the work, which bounds how much of a large document is resident. | `1` |
@@ -2253,6 +2281,7 @@ export HINDSIGHT_API_OBSERVATIONS_MISSION="Observations are recurring patterns i
 | `HINDSIGHT_API_REFLECT_WALL_TIMEOUT` | Wall-clock timeout in seconds for the entire reflect operation. If exceeded, the request returns HTTP 504. | `300` |
 | `HINDSIGHT_API_REFLECT_MISSION` | Global reflect mission (identity and reasoning framing). Overridden per bank via config API. | - |
 | `HINDSIGHT_API_REFLECT_SOURCE_FACTS_MAX_TOKENS` | Token budget for source facts in `search_observations` during reflect. `-1` disables source facts (default), `0` enables with no limit, `>0` enables with a token budget. Hierarchical — can be overridden per bank via config API. | `-1` |
+| `HINDSIGHT_API_REFLECT_DEFAULT_OPTIONS` | Default reflect options as a JSON object, applied whenever a reflect request — or a mental model's trigger — leaves the option unset. `reflect_search_observations_max_tokens` sets the budget for the `search_observations` tool (a smaller budget drops the lowest-ranked observations and shrinks the reflect context); `reflect_search_observations_include_entities` turns off the resolved entity names attached to each observation, which can be more than half the tool payload. E.g. `{"reflect_search_observations_max_tokens": 3000, "reflect_search_observations_include_entities": false}`. Hierarchical — can be overridden per bank via config API. | - |
 
 #### Internal recall (used by reflect and mental model refresh)
 
