@@ -746,7 +746,12 @@ async def test_xai_mode_keeps_existing_default_header_behavior():
 async def test_header_mode_coexists_with_required_opencode_header():
     from hindsight_api.engine.cache_affinity import OPENCODE_SESSION_HEADER
 
-    llm = _llm("header", provider="opencode-go", cache_affinity_header="x-session-id")
+    llm = _llm(
+        "header",
+        provider="opencode-go",
+        base_url="https://opencode.ai/zen/go/v1",
+        cache_affinity_header="x-session-id",
+    )
     create = await _call(llm, AsyncMock(return_value=_chat_response()))
     headers = create.call_args.kwargs["extra_headers"]
     assert headers["x-session-id"] == headers[OPENCODE_SESSION_HEADER]

@@ -583,6 +583,7 @@ from .reflect.structured_doc import StructuredDocument
 from .reflect.tools import tool_expand, tool_recall, tool_search_mental_models, tool_search_observations
 from .response_models import (
     VALID_RECALL_FACT_TYPES,
+    ConsolidationStrategiesPreview,
     DryRunExtractionResult,
     EntityState,
     LLMCallTrace,
@@ -8656,9 +8657,9 @@ class MemoryEngine(MemoryEngineInterface):
             bm25_results.sort(key=lambda r: r.bm25_score if hasattr(r, "bm25_score") else 0, reverse=True)
             graph_results.sort(key=lambda r: r.activation if hasattr(r, "activation") else 0, reverse=True)
             if temporal_results:
-                temporal_results.sort(
-                    key=lambda r: r.combined_score if hasattr(r, "combined_score") else 0, reverse=True
-                )
+                # temporal_score is the temporal arm's own ranking signal (float | None on
+                # RetrievalResult); combined_score only exists on ScoredResult, after fusion.
+                temporal_results.sort(key=lambda r: r.temporal_score or 0, reverse=True)
 
             # Cap each source independently before fusion so a single
             # over-expanding backend (e.g. VectorChord returning hundreds of
@@ -11352,6 +11353,12 @@ class MemoryEngine(MemoryEngineInterface):
         # Drop any cached stats for this bank — counts have changed and the
         # TTL would otherwise serve pre-delete values for up to a minute.
         await self._bank_stats_cache.invalidate(get_current_schema(), bank_id)
+        if delete_bank_profile:
+            # The cached profile/config rows too: otherwise the bank reads as existing for up to the
+            # cache TTL, and a restore or clone into the same id is refused with "already exists".
+            from .bank_info_cache import invalidate as _invalidate_bank_info
+
+            await _invalidate_bank_info(bank_id)
 
         if invalidated_obs > 0:
             config = await self._config_resolver.resolve_full_config(bank_id, request_context)
@@ -11477,6 +11484,43 @@ class MemoryEngine(MemoryEngineInterface):
             logger.warning(f"Failed to invalidate bank stats cache after clearing observations for bank {bank_id}: {e}")
 
         return {"deleted_count": count or 0}
+
+    # Distinct scopes a consolidation-strategy preview scans. Past this the preview
+    # reports complete=False and its counts become lower bounds, rather than making
+    # an editor that re-previews as the user types scan an unbounded set.
+    _STRATEGY_PREVIEW_SCOPE_CAP = 10_000
+
+    async def preview_consolidation_strategies(
+        self,
+        bank_id: str,
+        strategies: list[Any],
+        *,
+        sample_limit: int = 5,
+        request_context: "RequestContext",
+    ) -> "ConsolidationStrategiesPreview":
+        """Which existing observation scopes each consolidation strategy would apply to.
+
+        ``strategies`` is a draft ``consolidation_strategies`` value — typically the
+        one being edited, not yet saved. Nothing is written. The matching and the
+        first-strategy-wins rule are the consolidator's own
+        (``preview_consolidation_strategies``), so the answer is exactly what the
+        next consolidation would do for the scopes that exist now. Scopes with no
+        observations yet do not exist and cannot be previewed.
+
+        Authentication and bank checks go through :meth:`list_observation_scopes`.
+        """
+        from .consolidation.consolidator import preview_consolidation_strategies
+
+        listing = await self.list_observation_scopes(
+            bank_id, limit=self._STRATEGY_PREVIEW_SCOPE_CAP, offset=0, request_context=request_context
+        )
+        scopes = [(list(scope["tags"]), int(scope["count"])) for scope in listing["scopes"]]
+        return preview_consolidation_strategies(
+            strategies,
+            scopes,
+            sample_limit=sample_limit,
+            complete=listing["total"] <= len(scopes),
+        )
 
     async def list_observation_scopes(
         self,
@@ -14941,24 +14985,32 @@ class MemoryEngine(MemoryEngineInterface):
         """
         await self._authenticate_tenant(request_context)
         await self._get_backend()
-        banks = await bank_utils.list_banks(self._backend, search_query=search_query)
-        if self._operation_validator:
-            from hindsight_api.extensions import BankListContext
-
-            result = await self._operation_validator.filter_bank_list(
-                BankListContext(banks=banks, request_context=request_context)
-            )
-            banks = result.banks
-        # Paging happens here rather than in SQL because filter_bank_list may drop any
-        # bank: a SQL page would hand back short (or empty) pages and a total counting
-        # banks the caller isn't allowed to see.
-        total = len(banks)
         # Clamped because the page is a Python slice, not a SQL LIMIT: a negative value
         # from a caller the HTTP layer doesn't validate (the MCP tool) would silently
         # trim from the end instead of raising.
         limit = max(limit, 0)
         offset = max(offset, 0)
-        page = banks[offset : offset + limit]
+        if self._operation_validator:
+            # The validator may drop ANY bank, so the page has to be cut after it runs — and it
+            # takes the list, not a page. Ranking the tenant is the price of a filter that can
+            # reject anything, and it is paid only by deployments that install one.
+            from hindsight_api.extensions import BankListContext
+
+            banks = await bank_utils.list_banks(self._backend, search_query=search_query)
+            result = await self._operation_validator.filter_bank_list(
+                BankListContext(banks=banks, request_context=request_context)
+            )
+            banks = result.banks
+            total = len(banks)
+            page = banks[offset : offset + limit]
+        else:
+            # No filter, so the page can be cut before the rows are read: the order comes from the
+            # store, already sorted, and Postgres fills the page by id. O(page) rather than
+            # O(total banks) — see `bank_utils.list_banks_page`.
+            bank_page = await bank_utils.list_banks_page(
+                self._backend, limit=limit, offset=offset, search_query=search_query
+            )
+            page, total = bank_page.banks, bank_page.total
         # Per-bank work below is done for the returned page only — the SQL fact count, a
         # live store count for banks whose memories live outside SQL, plus config resolution.
         await bank_utils.apply_sql_fact_counts(self._backend, page)
@@ -17536,7 +17588,7 @@ class MemoryEngine(MemoryEngineInterface):
         from .reflect.delta_ops import (
             DeltaOperationList,
             apply_operations,
-            parse_delta_operation_list,
+            request_delta_operations,
         )
         from .reflect.prompts import (
             STRUCTURED_DELTA_SYSTEM_PROMPT,
@@ -17619,17 +17671,14 @@ class MemoryEngine(MemoryEngineInterface):
                             max_output_tokens=max(2048, int(doc_max_tokens * 1.5)),
                         )
                         unsay_llm = await _op_llm()
-                        unsay_call = await unsay_llm.call(
-                            messages=[
-                                {"role": "system", "content": STRUCTURED_RETRACTION_SYSTEM_PROMPT},
-                                {"role": "user", "content": unsay_prompt},
-                            ],
+                        unsay_ops = await request_delta_operations(
+                            unsay_llm,
+                            system_prompt=STRUCTURED_RETRACTION_SYSTEM_PROMPT,
+                            user_prompt=unsay_prompt,
+                            scope="mental_model_retraction_ops",
                             max_completion_tokens=get_config().reflect_max_completion_tokens,
                             temperature=get_config().llm_temperature_consolidation,
-                            scope="mental_model_retraction_ops",
                         )
-                        raw_unsay = unsay_call.content
-                        unsay_ops = parse_delta_operation_list(raw_unsay)
                         unsay_outcome = apply_operations(current_doc, unsay_ops.operations)
                         retraction_operations = MentalModelDeltaOperations(
                             applied=unsay_outcome.applied, skipped=unsay_outcome.skipped
@@ -17730,9 +17779,11 @@ class MemoryEngine(MemoryEngineInterface):
                 try:
                     # Structured-output call, following the retain extraction path:
                     # the schema is sent, ``strict_schema`` is resolved from reflect's
-                    # own flag, and ``skip_validation`` keeps the raw JSON so
-                    # ``parse_delta_operation_list`` still validates op-by-op (a single
-                    # malformed op is dropped, not the whole batch).
+                    # own flag, and ``skip_validation`` keeps the raw JSON so the
+                    # op-by-op parser sees it. A reply that misses the schema is
+                    # refused whole and asked for again with the errors attached —
+                    # ``request_delta_operations`` owns that, for this call and the
+                    # retraction pass alike.
                     #
                     # This was a text-mode call until #3901: pydantic renders the
                     # eight-op discriminated union as ``oneOf`` + ``discriminator``,
@@ -17752,20 +17803,17 @@ class MemoryEngine(MemoryEngineInterface):
                     # same decoupling reflect's synthesis got in #3365/#3389 — the
                     # document-length budget lives in the prompt (``max_output_tokens``
                     # above), never in the transport cap.
-                    delta_call = await delta_llm.call(
-                        messages=[
-                            {"role": "system", "content": STRUCTURED_DELTA_SYSTEM_PROMPT},
-                            {"role": "user", "content": user_prompt},
-                        ],
+                    op_list = await request_delta_operations(
+                        delta_llm,
+                        system_prompt=STRUCTURED_DELTA_SYSTEM_PROMPT,
+                        user_prompt=user_prompt,
+                        scope="mental_model_delta_ops",
                         response_format=DeltaOperationList,
                         strict_schema=get_config().llm_strict_schema_reflect,
-                        skip_validation=True,  # Get raw JSON; the op-by-op parser validates leniently
+                        skip_validation=True,  # Get raw JSON; the parser validates op-by-op
                         max_completion_tokens=get_config().reflect_max_completion_tokens,
                         temperature=get_config().llm_temperature_consolidation,
-                        scope="mental_model_delta_ops",
                     )
-                    raw = delta_call.content
-                    op_list = parse_delta_operation_list(raw)
                     apply_outcome = apply_operations(current_doc, op_list.operations)
                     delta_operations = MentalModelDeltaOperations(
                         applied=apply_outcome.applied, skipped=apply_outcome.skipped
