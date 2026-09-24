@@ -635,11 +635,9 @@ export type BankTemplateConfig = {
   /**
    * Consolidation Strategies
    *
-   * Per-scope consolidation settings: [{"scopes": [{"tags": ["company:*"]}], "observations_mission": "Record only generalized trends.", "max_observations_per_scope": 20}]. Each strategy lists the scopes it claims — a scope is a list of fnmatch tag-globs, and a consolidation pass is claimed when any of the strategy's patterns matches its tags. Each pattern is {"tags": [...], "tags_match": ...}; "tags_match" is "all" (default) — the scope has every tag in the pattern, other tags allowed — or "exact" — the scope has exactly the pattern's tags and no others. A strategy may set any of observations_mission, max_observations_per_scope, consolidation_source_facts_max_tokens and consolidation_source_facts_max_tokens_per_observation; each is optional. Exactly one strategy applies to a scope: the first in the list that claims it. Whatever that strategy leaves unset — and every scope no strategy claims — uses the bank-wide value; a later strategy never fills the gaps. Supersedes observation_scope_limits. Lets one bank be federated across user/team/company tag scopes, each consolidating under its own brief.
+   * Per-scope consolidation settings: [{"scopes": [{"tags": ["company:*"]}], "observations_mission": "Record only generalized trends.", "max_observations_per_scope": 20}]. Each strategy lists the rules it claims scopes with — a rule's tags are fnmatch globs that must all be on the scope, and its "tags_match" decides whether the scope may carry others ("all", the default) or not ("exact"). The rules are alternatives: any one matching claims the scope. A strategy may set any of observations_mission, max_observations_per_scope, consolidation_source_facts_max_tokens and consolidation_source_facts_max_tokens_per_observation; each is optional. Exactly one strategy applies to a scope: the first in the list that claims it. Whatever that strategy leaves unset — and every scope no strategy claims — uses the bank-wide value; a later strategy never fills the gaps. Supersedes observation_scope_limits. Lets one bank be federated across user/team/company tag scopes, each consolidating under its own brief.
    */
-  consolidation_strategies?: Array<{
-    [key: string]: unknown;
-  }> | null;
+  consolidation_strategies?: Array<ConsolidationStrategySpec> | null;
   /**
    * Reflect Source Facts Max Tokens
    *
@@ -1285,6 +1283,36 @@ export type ConsolidationResponse = {
 };
 
 /**
+ * ConsolidationScopePattern
+ *
+ * One rule of a consolidation strategy: tags, and how they must match.
+ *
+ * ``tags`` may be empty — that is a rule still being filled in, which the editor
+ * saves as typed and consolidation ignores. The type pins the *shape*, not
+ * completeness: a string where the tag list belongs is rejected at the door
+ * instead of being stored and silently ignored for the life of the bank.
+ *
+ * Unknown keys are rejected too, but by :class:`StrictConsolidationStrategySpec`
+ * on the write path rather than by ``extra="forbid"`` here: that would put
+ * ``additionalProperties: false`` in the schema, which openapi-generator cannot
+ * process ("Codegen Property not yet supported in getPydanticType").
+ */
+export type ConsolidationScopePattern = {
+  /**
+   * Tags
+   *
+   * fnmatch tag patterns, e.g. company:*
+   */
+  tags?: Array<string>;
+  /**
+   * Tags Match
+   *
+   * "all" (the default when omitted): the scope has every tag in the rule, other tags allowed. "exact": exactly these tags and no others.
+   */
+  tags_match?: string | null;
+};
+
+/**
  * ConsolidationStrategiesPreview
  *
  * Which existing observation scopes each consolidation strategy would apply to.
@@ -1320,15 +1348,45 @@ export type ConsolidationStrategiesPreviewRequest = {
    *
    * Draft consolidation_strategies value
    */
-  strategies: Array<{
-    [key: string]: unknown;
-  }>;
+  strategies: Array<ConsolidationStrategySpec>;
   /**
    * Sample Limit
    *
    * Example scopes returned per rule
    */
   sample_limit?: number;
+};
+
+/**
+ * ConsolidationStrategySpec
+ *
+ * One `consolidation_strategies` entry: the rules it claims scopes with, and
+ * the observation settings those scopes use. Every setting is optional; unset
+ * ones come from the bank-wide values.
+ */
+export type ConsolidationStrategySpec = {
+  /**
+   * Scopes
+   *
+   * Alternatives: the strategy claims a scope when any rule matches it
+   */
+  scopes?: Array<ConsolidationScopePattern>;
+  /**
+   * Observations Mission
+   */
+  observations_mission?: string | null;
+  /**
+   * Max Observations Per Scope
+   */
+  max_observations_per_scope?: number | null;
+  /**
+   * Consolidation Source Facts Max Tokens
+   */
+  consolidation_source_facts_max_tokens?: number | null;
+  /**
+   * Consolidation Source Facts Max Tokens Per Observation
+   */
+  consolidation_source_facts_max_tokens_per_observation?: number | null;
 };
 
 /**
@@ -2765,6 +2823,12 @@ export type KnowledgeNode = {
    */
   is_stale?: boolean | null;
   /**
+   * Last Refresh Failed At
+   *
+   * Pages only: when this page's most recent refresh failed, in ISO format, or null when the last one succeeded. While it is set the page does not rebuild itself on its trigger — see the same field on the mental model. An explicit refresh still runs.
+   */
+  last_refresh_failed_at?: string | null;
+  /**
    * Pages only: the page's refresh settings — when it rebuilds itself (`refresh_after_consolidation` or `refresh_cron`), in which mode, and over which facts. This is the EFFECTIVE policy: a setting the page never stored is reported at its default, so compare the fields you care about rather than the whole object against a patch you sent. Absent on folders, which have no backing mental model, and on a page with no trigger stored.
    */
   trigger?: MentalModelTriggerOutput | null;
@@ -2841,13 +2905,13 @@ export type KnowledgePageResponse = {
   /**
    * Body
    *
-   * The page's synthesized markdown body.
+   * The page's synthesized markdown body, exactly as stored. Empty until a refresh writes one — unlike `markdown`, which says so in words. Build a UI's own empty state off this field; read `markdown` to show the document itself.
    */
   body?: string | null;
   /**
    * Markdown
    *
-   * The full markdown document: YAML frontmatter + markdown body.
+   * The full markdown document: YAML frontmatter + markdown body. A page with no body yet renders 'No content yet.' as its body rather than frontmatter alone, which reads as a page that failed to render. The notice is added here on the way out; the stored body in `body` stays empty, and the export bundle keeps the bare document.
    */
   markdown: string;
 };
@@ -2888,6 +2952,8 @@ export type KnowledgePageSearchResult = {
   mental_model_id?: string | null;
   /**
    * Snippet
+   *
+   * The page's opening text. A page whose body is still empty says so in words — 'No content yet.' — rather than coming back blank, so a caller can tell an unwritten page from a page whose snippet simply did not render. The marker is produced on the way out; the stored body stays empty and out of the search index.
    */
   snippet: string;
   /**
@@ -4397,6 +4463,12 @@ export type MentalModelResponse = {
    * How far through the bank's memories this model is written — the newest in-scope memory the last refresh saw, in ISO format. Stands still when nothing in the model's scope has been written, however often it is refreshed. At or after the bank's `last_memory_write_at` (GET /stats) the model is provably up to date; when it is older, `is_stale` settles it against the model's own scope. Null for a model no refresh has stamped yet.
    */
   last_memory_seen_at?: string | null;
+  /**
+   * Last Refresh Failed At
+   *
+   * When this model's most recent refresh failed, in ISO format, or null when the last one succeeded. While this is set the automatic triggers (`refresh_after_consolidation`, `refresh_cron`) skip the model — a refresh that cannot succeed is not retried on every tick. An explicit refresh still runs, and a successful one clears this. The failure itself, with its reason, is in the model's history.
+   */
+  last_refresh_failed_at?: string | null;
   /**
    * Created At
    */

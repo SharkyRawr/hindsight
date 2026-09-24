@@ -152,7 +152,59 @@ def _authorize_nested_operations() -> "Iterator[None]":
         _nested_operation_authorized.reset(token)
 
 
-MENTAL_MODEL_PENDING_CONTENT = "Generating content..."
+#: What a page's body was set to at creation before pages were created empty. Only
+#: ever read, never written: an upgraded bank still holds rows carrying it, and every
+#: check that asks "has this page been written yet?" has to treat it as unwritten —
+#: the delta baseline, the sibling readability query, the refresh outcome's
+#: populated_content, and read metering.
+_LEGACY_PENDING_PLACEHOLDER = "Generating content..."
+
+
+def _is_unwritten_body(content: str | None) -> bool:
+    """Has nothing been written into this page's body yet?
+
+    Empty is the state a page is created in; the legacy placeholder is the state
+    an upgraded bank's pages were created in before that. Both mean the same
+    thing to every caller that has to decide whether a page carries anything.
+
+    Whitespace counts as unwritten, which the emptiness checks this replaced did
+    not all do consistently — a body of spaces was skipped by some and priced at
+    zero by others. Only an explicit ``update_mental_model(content="   ")`` can
+    produce one: a refresh that synthesizes nothing but whitespace is rejected
+    before it is stored.
+    """
+    return not content or content.strip() in ("", _LEGACY_PENDING_PLACEHOLDER)
+
+
+def _knowledge_snippet(content: str | None) -> str:
+    """The snippet a search result shows, including when the page has no body.
+
+    An empty body is a real state a searcher has to act on, and the empty string
+    does not convey it: a page titled for the topic with nothing under it reads as
+    "matched, but the snippet came back blank", which is how an agent concludes the
+    topic is uncovered and creates a second page for one that already exists.
+
+    Produced HERE, at the read boundary, never stored as the page body. Stored text
+    is embedded and BM25-indexed, which is exactly what made a brand-new page
+    searchable as its own placeholder before this — the reader needs the signal, the
+    index must never carry it.
+
+    One wording for every empty page, deliberately. "Generating..." would be the more
+    useful message but there is nothing to found it on: ``last_refreshed_at`` is NOT
+    NULL DEFAULT now(), so it is stamped at creation and a page that has never
+    refreshed is indistinguishable here from one that refreshed and found nothing to
+    say. Promising content that may never come is worse than describing the state
+    that is actually observable.
+
+    The wording itself lives with the other read-time page rendering, so searching for
+    a page and reading it tell the reader the same thing in the same words.
+    """
+    # Imported here rather than at module scope: ``hindsight_api.api`` pulls in
+    # MemoryEngine, so a top-level import of anything under it would close a cycle.
+    from ..api.page_markdown import EMPTY_PAGE_NOTICE
+
+    return (content or "").strip() or EMPTY_PAGE_NOTICE
+
 
 # ``mental_model_history`` holds two kinds of row in one JSONB blob: the version
 # snapshots a successful refresh writes, and the failure records a refused one
@@ -1668,6 +1720,12 @@ def _resolve_refresh_tag_filtering(
     return RefreshTagFiltering(tags=model_tags, tags_match=tags_match, tag_groups=None)
 
 
+def _knowledge_tree_sort_key(row: Any) -> tuple[bool, int, str]:
+    """ORDER BY sort_order, name (PostgreSQL ASC: NULL sort_order last), in Python."""
+    sort_order = row["sort_order"]
+    return (sort_order is None, sort_order or 0, row["name"] or "")
+
+
 def _may_need_refresh(last_refreshed_at: datetime | None, watermark: datetime | None) -> bool:
     """Cheap half of staleness: rule a model current from the bank watermark alone.
 
@@ -1687,6 +1745,12 @@ def _may_need_refresh(last_refreshed_at: datetime | None, watermark: datetime | 
         return True  # Never refreshed — nothing to be current with.
     if watermark is None:
         return False  # Empty bank.
+    # Oracle's TIMESTAMP columns come back naive while the bank watermark is aware;
+    # compare both in UTC, as engine/reflect/tools.py already does for last_refreshed_at.
+    if last_refreshed_at.tzinfo is None:
+        last_refreshed_at = last_refreshed_at.replace(tzinfo=UTC)
+    if watermark.tzinfo is None:
+        watermark = watermark.replace(tzinfo=UTC)
     return watermark > last_refreshed_at
 
 
@@ -2362,6 +2426,16 @@ class MemoryEngine(MemoryEngineInterface):
         reflect_call_defaults = _op_defaults("reflect_")
         consolidation_call_defaults = _op_defaults("consolidation_")
         mental_model_refresh_call_defaults = _op_defaults("mental_model_refresh_", fallback=reflect_call_defaults)
+        # Refresh never inherits reflect's timeout. Reflect's is sized for a caller
+        # holding a request open (30s by default); a refresh runs in the background,
+        # and its final answer over a 30k-90k-token prompt cannot finish in 30s: it
+        # timed out on every retry and every tick (#4532). So refresh takes its own
+        # timeout, else the global LLM one, like the other background operations.
+        mental_model_refresh_call_defaults = replace(
+            mental_model_refresh_call_defaults,
+            timeout=config.mental_model_refresh_llm_timeout or config.llm_timeout,
+        )
+        refresh_timeout_differs = mental_model_refresh_call_defaults.timeout != reflect_call_defaults.timeout
 
         # Initialize LLM configuration (default, used as fallback)
         _default_base_llm = LLMConfig(
@@ -2537,13 +2611,17 @@ class MemoryEngine(MemoryEngineInterface):
             **reflect_call_defaults.as_kwargs(),
         )
         self._reflect_llm_config = _build_llm(_reflect_base_llm, config, "reflect_", reflect_call_defaults)
+        self._reflect_llm_config_at_init = self._reflect_llm_config
 
         # Mental-model refresh LLM config - the automatic refresh runs the reflect
         # pipeline in the background, where a human is not waiting and the job must
         # not destabilise interactive latency. Unset means it *is* the reflect config
         # (same object, so no extra provider, no extra verification), which is the
         # backwards-compatible path (issue #4463).
-        if not config.has_mental_model_refresh_llm_override():
+        # Only the timeout differs from reflect: see the property, which then still
+        # follows a reflect provider swapped in after __init__.
+        self._mental_model_refresh_llm_timeout_only = not config.has_mental_model_refresh_llm_override()
+        if self._mental_model_refresh_llm_timeout_only and not refresh_timeout_differs:
             # None, not an alias to the reflect config: callers reassign
             # ``_reflect_llm_config`` after __init__ (tests swapping in a real
             # provider, most of all), and an alias captured here would keep
@@ -4162,7 +4240,24 @@ class MemoryEngine(MemoryEngineInterface):
         retry-exhausted alike). The poller calls this afterwards, from outside the
         cancelled task, so a timed-out consolidation still reaches subscribers instead
         of going silent. Best-effort: ``_fire_consolidation_webhook`` logs and swallows.
+
+        A timed-out mental-model refresh is recorded like any other failed refresh,
+        for the same reason: its ``except`` blocks never ran, and without the record
+        the automatic triggers would queue it again on the next tick (#4532).
         """
+        if task_dict.get("type") == "refresh_mental_model":
+            token = _current_schema.set(schema)
+            try:
+                await self._record_mental_model_refresh_failure(
+                    task_dict.get("bank_id", ""),
+                    task_dict.get("mental_model_id", ""),
+                    outcome="refresh_failed_error",
+                    failure_reason="unexpected_error",
+                    error_message=error_message,
+                )
+            finally:
+                _current_schema.reset(token)
+            return
         if task_dict.get("type") != "consolidation":
             return
         operation_id = task_dict.get("operation_id")
@@ -4681,11 +4776,13 @@ class MemoryEngine(MemoryEngineInterface):
         based_on = reflect_response.get("based_on") or {}
         outcome = RefreshMentalModelOutcomeMetadata(
             content_len=len(content),
-            # The pending placeholder completes wire-successful but carries no
-            # real synthesis — a length check alone would read it as populated.
-            # Reflect's own failure stubs are gone: a run with no answer now
-            # raises (#2959), so no refresh reaches here carrying one.
-            populated_content=bool(stripped) and stripped != MENTAL_MODEL_PENDING_CONTENT,
+            # Whitespace-only is not synthesis, and neither is the legacy placeholder
+            # an upgraded bank may still be holding: a skipped refresh preserves that
+            # body, and a length check alone would report it as populated — which is
+            # what this field exists to tell apart. Reflect's own failure stubs are
+            # gone: a run with no answer now raises (#2959), so no refresh reaches
+            # here carrying one.
+            populated_content=bool(stripped) and stripped != _LEGACY_PENDING_PLACEHOLDER,
             based_on_counts={fact_type: len(facts or []) for fact_type, facts in based_on.items()},
             delta_ops_applied=len(reflect_response.get("delta_operations_applied") or []),
             delta_ops_skipped=len(reflect_response.get("delta_operations_skipped") or []),
@@ -5438,6 +5535,30 @@ class MemoryEngine(MemoryEngineInterface):
         if not self._initialized:
             await self.initialize()
         return self._backend
+
+    @asynccontextmanager
+    async def _store_read_conn(self, bank_id: str) -> AsyncIterator[DatabaseConnection | None]:
+        """The connection for a read the memories store answers entirely by itself.
+
+        A store-owned bank keeps its memories outside SQL, so these reads never touch the
+        connection they are handed — yet holding one still takes a pool slot for the whole
+        remote call, and on a busy pod that slot is what a SQL request is queued behind. Such a
+        bank gets ``None``; every other bank gets a pooled connection exactly as before.
+
+        Only for blocks whose every use of the connection is a store read that ignores it. A
+        store-owned store still reads SQL for some calls (its entity names live in Postgres), so
+        a block that reaches one of those, or runs SQL itself, keeps ``acquire_with_retry``.
+        """
+        from .memories import get_memories
+
+        # Before the store is consulted: this is also what initializes the engine, memories
+        # extension included.
+        backend = await self._get_backend()
+        if get_memories().store_owned_for(bank_id):
+            yield None
+            return
+        async with acquire_with_retry(backend) as conn:
+            yield conn
 
     async def health_check(self) -> dict:
         """
@@ -9149,7 +9270,7 @@ class MemoryEngine(MemoryEngineInterface):
                     # were read into a local and discarded), so the store-owned chunk walk in Step
                     # 5.5 and the source-facts step reuse them instead of reading them a second time.
                     if not all(sr.retrieval.source_memory_ids is not None for sr in observation_srs):
-                        async with acquire_with_retry(backend) as dedup_conn:
+                        async with self._store_read_conn(bank_id) as dedup_conn:
                             obs_by_id = {
                                 m.unit_id: [str(s) for s in (m.source_memory_ids or [])]
                                 for m in await get_memories().get_memories(
@@ -11557,10 +11678,9 @@ class MemoryEngine(MemoryEngineInterface):
             )
             await self._validate_operation(self._operation_validator.validate_bank_read(ctx))
         await self._require_bank_exists(bank_id)
-        backend = await self._get_backend()
         from .memories import get_memories
 
-        async with acquire_with_retry(backend) as conn:
+        async with self._store_read_conn(bank_id) as conn:
             return await get_memories().observation_scope_counts(
                 conn=conn, fq_table=fq_table, bank_id=bank_id, limit=limit, offset=offset
             )
@@ -14617,13 +14737,14 @@ class MemoryEngine(MemoryEngineInterface):
 
         Items carrying no content are skipped: nothing was delivered, so there
         is nothing to report. That covers a model that has never been refreshed,
-        one still generating its first content, and every detail level that
-        drops the column — so "report what was delivered" is read off the items
-        themselves rather than inferred from the caller's ``detail`` argument.
+        one an upgraded bank still holds the legacy placeholder for, and every
+        detail level that drops the column — so "report what was delivered" is
+        read off the items themselves rather than inferred from the caller's
+        ``detail`` argument.
         """
         for item in items:
             content = item.get("content")
-            if not content or content.strip() == MENTAL_MODEL_PENDING_CONTENT:
+            if _is_unwritten_body(content):
                 continue
             await self._record_mental_model_read(bank_id, str(item["id"]), content, request_context=request_context)
 
@@ -14639,6 +14760,17 @@ class MemoryEngine(MemoryEngineInterface):
 
         Best-effort by design: the caller already has the content, so a failure
         here must not turn a served read into an error.
+
+        An unwritten body prices at zero rather than by its length. That is the
+        legacy placeholder an upgraded bank still holds: nobody wrote it, so
+        billing for it would charge for text the deployment never asked for. It
+        is sized here, where every read route converges, so the same page costs
+        the same whether it arrived through a get or a list.
+
+        Zero tokens, not a skipped hook. A gated read that reports no completion
+        is the shape this hook exists to prevent — a deployment could authorize a
+        read it then never records — so the pairing holds even when the answer is
+        "nothing was delivered".
         """
         if not self._operation_validator:
             return
@@ -14650,7 +14782,7 @@ class MemoryEngine(MemoryEngineInterface):
                     bank_id=bank_id,
                     mental_model_id=mental_model_id,
                     request_context=request_context,
-                    output_tokens=len(content) // 4 if content else 0,
+                    output_tokens=0 if _is_unwritten_body(content) else len(content or "") // 4,
                     success=True,
                 )
             )
@@ -15037,9 +15169,16 @@ class MemoryEngine(MemoryEngineInterface):
         Resolved per access rather than stored: with no
         MENTAL_MODEL_REFRESH_LLM_* override this *is* whatever
         ``_reflect_llm_config`` currently holds, including a provider swapped in
-        after __init__ (issue #4463).
+        after __init__ (issue #4463). The same holds when the override exists only
+        to give refresh a longer timeout: a swapped-in reflect provider wins.
         """
-        return self._mental_model_refresh_llm_override or self._reflect_llm_config
+        override = self._mental_model_refresh_llm_override
+        if override is None or (
+            self._mental_model_refresh_llm_timeout_only
+            and self._reflect_llm_config is not self._reflect_llm_config_at_init
+        ):
+            return self._reflect_llm_config
+        return override
 
     def _llm_for_reflect_operation(self, operation_label: str) -> "LLMConfig | MultiLLMProvider":
         """Pick the LLM for a reflect-pipeline run: interactive, or background refresh.
@@ -15823,8 +15962,7 @@ class MemoryEngine(MemoryEngineInterface):
 
         from .memories import get_memories
 
-        backend = await self._get_backend()
-        async with acquire_with_retry(backend) as conn:
+        async with self._store_read_conn(bank_id) as conn:
             page = await get_memories().list_tags(conn=conn, fq_table=fq_table, bank_id=bank_id, limit=MAX_VOCABULARY)
 
         if page["total"] > MAX_VOCABULARY:
@@ -15882,8 +16020,7 @@ class MemoryEngine(MemoryEngineInterface):
         # SQL stores that is one paged query, never the whole histogram over the wire.
         from .memories import get_memories
 
-        backend = await self._get_backend()
-        async with acquire_with_retry(backend) as conn:
+        async with self._store_read_conn(bank_id) as conn:
             return await get_memories().list_tags(
                 conn=conn, fq_table=fq_table, bank_id=bank_id, pattern=pattern, limit=limit, offset=offset
             )
@@ -16188,7 +16325,6 @@ class MemoryEngine(MemoryEngineInterface):
             )
             await self._validate_operation(self._operation_validator.validate_bank_read(ctx))
 
-        backend = await self._get_backend()
         # The current reflect() caller reads last_consolidated_at,
         # pending_consolidation and last_memory_write_at, but `failed` is part of
         # this method's published contract (see interface.get_bank_freshness) so
@@ -16196,7 +16332,7 @@ class MemoryEngine(MemoryEngineInterface):
         # come from one scan, so keeping `failed` costs nothing extra.
         from .memories import get_memories
 
-        async with acquire_with_retry(backend) as conn:
+        async with self._store_read_conn(bank_id) as conn:
             fresh = await get_memories().consolidation_freshness(conn=conn, fq_table=fq_table, bank_id=bank_id)
 
         last = fresh["last_consolidated_at"]
@@ -16325,8 +16461,7 @@ class MemoryEngine(MemoryEngineInterface):
         # store gets a concrete `since` rather than a dialect interval string.
         since = datetime.now(timezone.utc) - cfg.step * cfg.count
 
-        backend = await self._get_backend()
-        async with acquire_with_retry(backend) as conn:
+        async with self._store_read_conn(bank_id) as conn:
             rows = await get_memories().memories_timeseries(
                 conn=conn, fq_table=fq_table, bank_id=bank_id, time_field=time_field, trunc=cfg.trunc, since=since
             )
@@ -16555,7 +16690,7 @@ class MemoryEngine(MemoryEngineInterface):
             rows = await conn.fetch(
                 f"""
                 SELECT id, bank_id, name, source_query, content, tags,
-                       last_refreshed_at, last_memory_seen_at, created_at, reflect_response,
+                       last_refreshed_at, last_memory_seen_at, last_refresh_failed_at, created_at, reflect_response,
                        max_tokens, trigger, structured_content
                 FROM {fq_table("mental_models")}
                 WHERE bank_id = $1 {tag_filter}
@@ -16628,7 +16763,7 @@ class MemoryEngine(MemoryEngineInterface):
             row = await conn.fetchrow(
                 f"""
                 SELECT id, bank_id, name, source_query, content, tags,
-                       last_refreshed_at, last_memory_seen_at, created_at, reflect_response,
+                       last_refreshed_at, last_memory_seen_at, last_refresh_failed_at, created_at, reflect_response,
                        max_tokens, trigger, structured_content
                 FROM {fq_table("mental_models")}
                 WHERE bank_id = $1 AND id = $2
@@ -16960,7 +17095,7 @@ class MemoryEngine(MemoryEngineInterface):
             VALUES ($1, $2, 'pinned', $3::text, ' ', $4, $5, $6, $7, COALESCE($8, 2048),
                     COALESCE($9, '{{"refresh_after_consolidation": false}}'::jsonb), $10{sv_val})
             RETURNING id, bank_id, name, source_query, content, tags,
-                      last_refreshed_at, last_memory_seen_at, created_at, reflect_response,
+                      last_refreshed_at, last_memory_seen_at, last_refresh_failed_at, created_at, reflect_response,
                       max_tokens, trigger, structured_content
             """,
             mental_model_id,
@@ -17159,10 +17294,16 @@ class MemoryEngine(MemoryEngineInterface):
         excluded, not its full ``exclude_mental_model_ids`` list: over-counting keeps a
         refresh running, which is the safe direction to be wrong in.
 
-        A sibling still holding the ``Generating content...`` placeholder does not
-        count. That is exactly the state a bank's default pages are all in while they
-        wait on each other, and treating it as content would defeat the emptiness check
-        for the case it was written for (#3875).
+        A sibling that has not yet been refreshed does not count. That is exactly the
+        state a bank's default pages are all in while they wait on each other, and
+        treating it as content would defeat the emptiness check for the case it was
+        written for (#3875).
+
+        Which is why the legacy placeholder is excluded too, not just the empty body
+        that pages carry now. A bank upgraded from a version that wrote
+        ``Generating content...`` still holds those rows, and they are unrefreshed
+        pages by any other measure — counting them because the column happens to be
+        non-empty would re-open #3875 for exactly the banks the check protects.
         """
         backend = await self._get_backend()
         async with acquire_with_retry(backend) as conn:
@@ -17171,10 +17312,10 @@ class MemoryEngine(MemoryEngineInterface):
                 f"WHERE bank_id = $1 AND id <> $2 AND LENGTH(TRIM(content)) > 0 AND content NOT LIKE $3",
                 bank_id,
                 excluding_id,
-                # Prefix match, not equality: the placeholder is stored as written but read
-                # back through the structured render, which ends it with a newline. It
-                # carries no LIKE wildcard of its own, so the pattern needs no escaping.
-                f"{MENTAL_MODEL_PENDING_CONTENT}%",
+                # Prefix match, not equality: the placeholder was stored as written but
+                # read back through the structured render, which ends it with a newline.
+                # It carries no LIKE wildcard of its own, so it needs no escaping.
+                f"{_LEGACY_PENDING_PLACEHOLDER}%",
             )
         return bool(other_documents)
 
@@ -17231,7 +17372,15 @@ class MemoryEngine(MemoryEngineInterface):
         use_delta = False
         mode_fallback_reason: ModeFallbackReason | None = None
         stored_structured_content: dict[str, Any] | None = None
-        has_delta_baseline = bool(current_content) and current_content != MENTAL_MODEL_PENDING_CONTENT
+        # The legacy placeholder is not a baseline. Pages are created empty now, but a
+        # page created before that change still holds the literal string and has never
+        # refreshed — and a never-refreshed page has no last_refreshed_source_query, so
+        # the check below turns delta ON. Treating the placeholder as content would send
+        # that first refresh down the delta path, where ops that do not apply fail it
+        # (refresh_failed_delta_not_applied) and preserve the placeholder, leaving the
+        # page stuck on it forever. Cheaper than a migration; delete once no bank can
+        # still hold one.
+        has_delta_baseline = bool(current_content) and current_content != _LEGACY_PENDING_PLACEHOLDER
         if requested_mode == "delta" and not has_delta_baseline:
             mode_fallback_reason = "no_baseline_content"
         elif requested_mode == "delta":
@@ -17466,8 +17615,7 @@ class MemoryEngine(MemoryEngineInterface):
                 from .memories import get_memories
 
                 store = get_memories()
-                backend = await self._get_backend()
-                async with acquire_with_retry(backend) as conn:
+                async with self._store_read_conn(bank_id) as conn:
                     live_ids = await store.live_memory_ids(
                         conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=cited_ids
                     )
@@ -17808,6 +17956,7 @@ class MemoryEngine(MemoryEngineInterface):
                         system_prompt=STRUCTURED_DELTA_SYSTEM_PROMPT,
                         user_prompt=user_prompt,
                         scope="mental_model_delta_ops",
+                        document=current_doc,
                         response_format=DeltaOperationList,
                         strict_schema=get_config().llm_strict_schema_reflect,
                         skip_validation=True,  # Get raw JSON; the parser validates op-by-op
@@ -18162,7 +18311,10 @@ class MemoryEngine(MemoryEngineInterface):
                     bank_id,
                     mental_model_id,
                     reflect_response=reflect_response_payload,
-                    last_refreshed_source_query=run.source_query,
+                    # No last_refreshed_source_query either: it decides full vs delta,
+                    # and stamping the query of a run that wrote nothing makes the
+                    # retry after a failed full refresh (source_query changed) run as
+                    # a delta against the old query's document (#4579).
                     request_context=request_context,
                 )
                 # ``refresh_skipped`` above is only readable until the next refresh
@@ -18197,7 +18349,8 @@ class MemoryEngine(MemoryEngineInterface):
                     outcome="refresh_failed_delta_not_applied",
                     detail=(
                         "delta operations did not reach the document, and the reflect candidate covers only "
-                        "memories newer than the last refresh, so writing it would drop the rest of the document."
+                        "memories newer than the last refresh, so writing it would drop the rest of the document. "
+                        "If this keeps happening, set the model's refresh mode to full."
                     ),
                 )
 
@@ -18551,6 +18704,10 @@ class MemoryEngine(MemoryEngineInterface):
             # direct content edit. A *failed* refresh passes neither, so it stays put.
             if content is not None or refresh_completed:
                 updates.append("last_refreshed_at = NOW()")
+                # This refresh worked (or the content was edited by hand), so the model is
+                # no longer the one that keeps failing: let the automatic triggers have it
+                # back rather than making the next reader wonder why it never refreshes.
+                updates.append("last_refresh_failed_at = NULL")
             # last_memory_seen_at — data watermark, "how far through the bank's memories
             # this document is written". Staleness keys off it. A row that commits after
             # the refresh snapshot stays newer than the watermark and is caught next
@@ -18614,7 +18771,7 @@ class MemoryEngine(MemoryEngineInterface):
                 SET {", ".join(updates)}
                 WHERE bank_id = $1 AND id = $2
                 RETURNING id, bank_id, name, source_query, content, tags,
-                          last_refreshed_at, last_memory_seen_at, created_at, reflect_response,
+                          last_refreshed_at, last_memory_seen_at, last_refresh_failed_at, created_at, reflect_response,
                           max_tokens, trigger, structured_content
             """
 
@@ -18731,20 +18888,23 @@ class MemoryEngine(MemoryEngineInterface):
         failure_reason: "RefreshFailureReason",
         error_message: str,
     ) -> None:
-        """Record a refusal to write in the model's own history.
+        """Record a refusal to write: stamp the model, and add a row to its history.
 
         A failed refresh writes no content, so before this it left no trace on the
         model at all: the History tab kept rendering the last SUCCESSFUL trace as
         though it were current, and the only record of the failure was prose on an
         async-operation row that a mental-model view never reads (#2894).
 
+        ``last_refresh_failed_at`` is what stops the automatic triggers: the failure
+        leaves ``last_refreshed_at`` behind, so the model still looks stale and the
+        scheduler used to queue the same doomed refresh every tick, paying the LLM
+        each time (#4532). See ``_automatic_refresh_paused``.
+
         Best-effort by design — the refresh has already failed and is about to
-        raise; losing the audit row must not also swallow that exception, and the
+        raise; losing either write must not also swallow that exception, and the
         operation still carries the same reason in its typed ``details``.
         """
         config = get_config()
-        if not config.enable_mental_model_history:
-            return
         content = json.dumps(
             {
                 "kind": _MM_HISTORY_KIND_FAILURE,
@@ -18756,16 +18916,26 @@ class MemoryEngine(MemoryEngineInterface):
         try:
             backend = await self._get_backend()
             async with acquire_with_retry(backend) as conn:
-                await self._insert_mental_model_history_row(
-                    conn,
+                # Stamp first, on its own statement: it is the one that stops the
+                # automatic triggers, so it must land even if the audit row below
+                # (optional, and capped) cannot be written.
+                await conn.execute(
+                    f"UPDATE {fq_table('mental_models')} SET last_refresh_failed_at = now() "
+                    "WHERE bank_id = $1 AND id = $2",
                     bank_id,
                     mental_model_id,
-                    content,
-                    config.mental_model_history_max_entries,
-                    is_failure=True,
                 )
+                if config.enable_mental_model_history:
+                    await self._insert_mental_model_history_row(
+                        conn,
+                        bank_id,
+                        mental_model_id,
+                        content,
+                        config.mental_model_history_max_entries,
+                        is_failure=True,
+                    )
         except Exception as e:
-            logger.warning(f"Failed to record refresh failure history for mental model {mental_model_id}: {e}")
+            logger.warning(f"Failed to record refresh failure for mental model {mental_model_id}: {e}")
 
     async def clear_mental_model(
         self,
@@ -18831,10 +19001,11 @@ class MemoryEngine(MemoryEngineInterface):
                 SET content = '',
                     structured_content = NULL,
                     last_refreshed_source_query = NULL,
+                    last_refresh_failed_at = NULL,
                     embedding = $3{sv_clause}
                 WHERE bank_id = $1 AND id = $2
                 RETURNING id, bank_id, name, source_query, content, tags,
-                          last_refreshed_at, last_memory_seen_at, created_at, reflect_response,
+                          last_refreshed_at, last_memory_seen_at, last_refresh_failed_at, created_at, reflect_response,
                           max_tokens, trigger, structured_content
                 """,
                 bank_id,
@@ -19038,6 +19209,10 @@ class MemoryEngine(MemoryEngineInterface):
             node["tags"] = list(row["mm_tags"] or [])
             node["source_query"] = row["mm_source_query"]
             node["last_refreshed_at"] = row["mm_last_refreshed_at"].isoformat() if row["mm_last_refreshed_at"] else None
+            # A page whose backing model keeps failing is not refreshing itself any more;
+            # the tree is where a reader notices that (#4532).
+            failed_at = row["mm_last_refresh_failed_at"] if "mm_last_refresh_failed_at" in row else None
+            node["last_refresh_failed_at"] = failed_at.isoformat() if failed_at else None
             # Carried on the read so a client can see WHEN a page refreshes and how much that
             # costs, and can tell whether its own settings still apply, without walking to the
             # mental-models API for every page (the knowledge base is the only surface some
@@ -19054,6 +19229,7 @@ class MemoryEngine(MemoryEngineInterface):
         "mm.tags AS mm_tags, mm.source_query AS mm_source_query, "
         "mm.trigger AS mm_trigger, "
         "mm.last_refreshed_at AS mm_last_refreshed_at, "
+        "mm.last_refresh_failed_at AS mm_last_refresh_failed_at, "
         "mm.last_memory_seen_at AS mm_last_memory_seen_at"
     )
 
@@ -19284,10 +19460,12 @@ class MemoryEngine(MemoryEngineInterface):
                 SELECT {self._KP_PAGE_SELECT}
                 FROM {self._kp_join()}
                 WHERE kp.bank_id = $1
-                ORDER BY kp.sort_order, kp.name
                 """,
                 bank_id,
             )
+            # Sorted here, not in SQL: knowledge_pages.name is a CLOB on Oracle and
+            # ORDER BY on a CLOB raises ORA-22848.
+            rows = sorted(rows, key=_knowledge_tree_sort_key)
             nodes = [self._row_to_knowledge_node(r) for r in rows]
             if with_staleness:
                 by_id = {n["id"]: n for n in nodes}
@@ -19459,7 +19637,7 @@ class MemoryEngine(MemoryEngineInterface):
                     "id": r["id"],
                     "name": r["name"],
                     "mental_model_id": r["mental_model_id"],
-                    "snippet": (r["snippet"] or "").strip(),
+                    "snippet": _knowledge_snippet(r["snippet"]),
                     # Same normalized single-arm RRF curve as the SQL paths below, so a
                     # store-owned bank's scores mean what a Postgres-ranked bank's do.
                     "score": _KNOWLEDGE_RRF_NORM / (_KNOWLEDGE_RRF_K + 1 + order[r["mental_model_id"]]),
@@ -19604,7 +19782,7 @@ class MemoryEngine(MemoryEngineInterface):
                 "id": r["id"],
                 "name": r["name"],
                 "mental_model_id": r["mental_model_id"],
-                "snippet": (r["snippet"] or "").strip(),
+                "snippet": _knowledge_snippet(r["snippet"]),
                 "score": float(r["score"]) if r["score"] is not None else 0.0,
                 "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
             }
@@ -20181,6 +20359,11 @@ class MemoryEngine(MemoryEngineInterface):
             "tags": row["tags"] or [],
             "last_refreshed_at": row["last_refreshed_at"].isoformat() if row["last_refreshed_at"] else None,
             "last_memory_seen_at": (row["last_memory_seen_at"].isoformat() if row["last_memory_seen_at"] else None),
+            # Carried at every detail level, including the list's: it is what tells a
+            # reader the model is not refreshing itself any more (#4532).
+            "last_refresh_failed_at": (
+                row["last_refresh_failed_at"].isoformat() if row.get("last_refresh_failed_at") else None
+            ),
             "created_at": row["created_at"].isoformat() if row["created_at"] else None,
         }
         if detail == "metadata":
@@ -22688,11 +22871,15 @@ class MemoryEngine(MemoryEngineInterface):
         Returns:
             Dict with operation_id — the surviving operation's when this submit was
             suppressed, together with ``deduplicated=True``, so the caller can poll
-            that one to completion either way.
+            that one to completion either way. An automatic submit for a model whose
+            last refresh failed queues nothing and returns ``{"paused": True}``.
         """
         self._raise_if_mental_model_refresh_unavailable()
 
         await self._authenticate_tenant(request_context)
+
+        if automatic and await self._automatic_refresh_paused(bank_id, mental_model_id):
+            return {"paused": True}
 
         # Pre-operation validation (credit check)
         if self._operation_validator:
@@ -22746,6 +22933,27 @@ class MemoryEngine(MemoryEngineInterface):
             await self._clear_refresh_park(submitted["operation_id"], bank_id)
 
         return submitted
+
+    async def _automatic_refresh_paused(self, bank_id: str, mental_model_id: str) -> bool:
+        """True when the model's last refresh failed, so automatic triggers must skip it.
+
+        A failed refresh already had its worker retries. Re-queuing it on the next
+        scheduler tick or consolidation round sends the same prompt to the same model
+        and fails the same way, forever, on the caller's LLM bill (#4532). It stays
+        paused until a refresh succeeds, which only an explicit one can do now: that
+        moves ``last_refreshed_at`` past ``last_refresh_failed_at``.
+        """
+        backend = await self._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            row = await conn.fetchrow(
+                f"SELECT last_refresh_failed_at, last_refreshed_at FROM {fq_table('mental_models')} "
+                "WHERE bank_id = $1 AND id = $2",
+                bank_id,
+                mental_model_id,
+            )
+        if row is None or row["last_refresh_failed_at"] is None:
+            return False
+        return row["last_refreshed_at"] is None or row["last_refresh_failed_at"] > row["last_refreshed_at"]
 
     async def _clear_refresh_park(self, operation_id: str, bank_id: str) -> None:
         """Make a queued refresh claimable now, and no longer min-interval eligible.
