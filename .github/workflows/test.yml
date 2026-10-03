@@ -80,6 +80,7 @@ jobs:
       integrations-dify: ${{ steps.filter.outputs.integrations-dify }}
       integrations-gemini-spark: ${{ steps.filter.outputs.integrations-gemini-spark }}
       integrations-meta-muse: ${{ steps.filter.outputs.integrations-meta-muse }}
+      integrations-grok-bot: ${{ steps.filter.outputs.integrations-grok-bot }}
       integrations-vapi: ${{ steps.filter.outputs.integrations-vapi }}
       integrations-flowise: ${{ steps.filter.outputs.integrations-flowise }}
       integrations-google-adk: ${{ steps.filter.outputs.integrations-google-adk }}
@@ -281,6 +282,10 @@ jobs:
             - 'hindsight-integrations/gemini-spark/**'
           integrations-meta-muse:
             - 'hindsight-integrations/meta-muse/**'
+          integrations-grok-bot:
+            - 'hindsight-integrations/grok-bot/**'
+            - '.cursor-plugin/**'
+            - 'hindsight-api-slim/hindsight_api/mcp_tools.py'
           integrations-vapi:
             - 'hindsight-integrations/vapi/**'
           integrations-flowise:
@@ -322,6 +327,51 @@ jobs:
 
     - name: Check integration lockfiles resolve from the npm registry
       run: ./scripts/check-integration-lockfiles.sh
+
+  typecheck-api:
+    # `ty check` over hindsight-api-slim. Green today, and it stays green: the rules it enforces
+    # are listed in `[tool.ty.rules]`, with the ones not yet clean marked "ignore" there rather
+    # than silenced here, so this job and a local `uv run ty check` always agree.
+    #
+    # Today that is `invalid-argument-type` -- a call passing the wrong type to a declared
+    # parameter. Python does not enforce annotations and a dataclass does not validate at
+    # construction, so without this such a call runs fine until the value is used, which can be
+    # in another process entirely.
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.core == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    # Same install as `test-api`, `--all-extras` included, and that is load-bearing rather than
+    # copy-paste: a checker only knows a third-party call's types if the package is installed.
+    # Without the extras, `mlx`, `oracledb` and the parser stack resolve to `Unknown`, every call
+    # into them becomes unverifiable, and the rule passes by knowing nothing -- which looks
+    # identical to passing by being correct.
+    - name: Install dependencies
+      working-directory: ./hindsight-api-slim
+      run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
+
+    - name: ty check
+      working-directory: ./hindsight-api-slim
+      run: uv run ty check
 
   build-api-python-versions:
     needs: [detect-changes]
@@ -1365,6 +1415,33 @@ jobs:
     - name: Run tests
       working-directory: ./hindsight-integrations/meta-muse
       run: uv run pytest tests -v
+
+  test-grok-bot-integration:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.integrations-grok-bot == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    # The plugin is manifests and skills — no Python package of its own, like claude-code.
+    - name: Install pytest
+      run: pip install pytest pydantic
+
+    - name: Run tests
+      working-directory: ./hindsight-integrations/grok-bot
+      run: python -m pytest tests -v
 
   test-roo-code-integration:
     needs: [detect-changes]
@@ -5721,6 +5798,7 @@ jobs:
       - test-pipecat-integration
       - test-gemini-spark-integration
       - test-meta-muse-integration
+      - test-grok-bot-integration
       - test-vapi-integration
       - test-google-adk-integration
       - test-roo-code-integration

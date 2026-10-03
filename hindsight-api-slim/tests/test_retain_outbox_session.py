@@ -45,17 +45,20 @@ async def test_completion_counts_committed_document(
             raise RuntimeError("commit failed")
         visible_count = committed_count
 
-    async def count(**kwargs) -> dict[str, int]:
+    async def count(**kwargs) -> int:
         assert kwargs["bank_id"] == "test-bank"
-        assert kwargs["document_ids"] == ["test-document"]
+        assert kwargs["document_id"] == "test-document"
         steps.append("count")
-        return {"test-document": visible_count}
+        return visible_count
 
-    session = MagicMock(commit=AsyncMock(side_effect=commit))
+    async def abort() -> None:
+        steps.append("abort")
+
+    session = MagicMock(commit=AsyncMock(side_effect=commit), abort=AsyncMock(side_effect=abort))
     store = MagicMock(
         store_owned_for=MagicMock(return_value=True),
         begin_retain=AsyncMock(return_value=session),
-        document_memory_counts=AsyncMock(side_effect=count),
+        count_document_memories=AsyncMock(side_effect=count),
     )
     monkeypatch.setattr("hindsight_api.engine.memories.get_memories", lambda: store)
 
@@ -109,8 +112,11 @@ async def test_completion_counts_committed_document(
     if failure:
         with pytest.raises(RuntimeError, match=f"{failure} failed"):
             await execution
-        # The partial-retain cleanup still commits, but no success event may escape.
-        assert steps == ["commit"]
+        # A failed single-batch retain aborts instead of committing: committing would store the
+        # document's chunks with none of their facts, and the retry would skip them as unchanged.
+        # A failed commit aborts too — it releases what the session still buffers. Either way no
+        # success event may escape.
+        assert steps == (["abort"] if failure == "retain" else ["commit", "abort"])
         engine._webhook_manager.fire_event_with_conn.assert_not_awaited()
         return
 

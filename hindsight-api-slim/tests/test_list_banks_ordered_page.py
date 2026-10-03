@@ -18,7 +18,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 import hindsight_api.engine.memories as memories_mod
-from hindsight_api.engine.memories.base import BankWritePage, BankWriteTime
+from hindsight_api.engine.memories.base import BankWritePage, BankWriteTime, MemoriesExtension
 from hindsight_api.models import RequestContext
 
 #: The store's write times, anchored ahead of the run rather than at a fixed date.
@@ -90,11 +90,28 @@ class _OrderingStore:
     async def count_memories(self, *, conn, fq_table, bank_id: str) -> dict:
         return {}
 
-    async def list_entities(self, *, conn, fq_table, bank_id: str, search=None, limit=100, offset=0) -> dict:
+    async def list_entities(
+        self,
+        *,
+        conn,
+        fq_table,
+        bank_id: str,
+        search=None,
+        tags=None,
+        tags_match="any",
+        tag_groups=None,
+        limit=100,
+        offset=0,
+    ) -> dict:
         return {"items": [], "total": 0, "limit": limit, "offset": offset}
 
     async def delete_observations(self, *, conn, fq_table, bank_id: str) -> None:
         return None
+
+    # The teardown's bank delete asks these, with the interface's store-owned defaults (they
+    # reach only the methods above, plus the Postgres rows every store keeps).
+    count_bank_contents = MemoriesExtension.count_bank_contents
+    purge_bank_rows = MemoriesExtension.purge_bank_rows
 
 
 async def _make_banks(memory, request_context, names: list[str]) -> None:

@@ -22,6 +22,7 @@ from __future__ import annotations
 import pytest
 
 import hindsight_api.engine.memories as memories_mod
+from hindsight_api.engine.memories.base import MemoriesExtension
 from hindsight_api.models import RequestContext
 
 
@@ -55,7 +56,19 @@ class _NonSqlStore:
     async def count_documents(self, *, bank_id: str) -> int:
         return 0
 
-    async def list_entities(self, *, conn, fq_table, bank_id: str, search=None, limit=100, offset=0) -> dict:
+    async def list_entities(
+        self,
+        *,
+        conn,
+        fq_table,
+        bank_id: str,
+        search=None,
+        tags=None,
+        tags_match="any",
+        tag_groups=None,
+        limit=100,
+        offset=0,
+    ) -> dict:
         return {"items": [], "total": 0, "limit": limit, "offset": offset}
 
     async def count_memories(self, *, conn, fq_table, bank_id: str) -> dict:
@@ -72,6 +85,11 @@ class _NonSqlStore:
     async def drop_bank_storage(self, bank_id: str) -> None:
         """``delete_bank`` routes the drop through the store for a non-SQL bank, so the
         teardown below reaches this. Nothing to drop — the counts above are synthetic."""
+
+    # The teardown's bank delete asks these, with the interface's store-owned defaults (they
+    # reach only the methods above, plus the Postgres rows every store keeps).
+    count_bank_contents = MemoriesExtension.count_bank_contents
+    purge_bank_rows = MemoriesExtension.purge_bank_rows
 
 
 @pytest.mark.asyncio

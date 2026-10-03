@@ -3,63 +3,32 @@ Link creation utilities for temporal, semantic, and entity links.
 """
 
 import logging
-import re
 import time
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from typing import cast
 
 import numpy as np
 
-from ..._vector_index import ann_search_tuning_settings, configured_vector_extension
-from ..causal_links import (
+from ...._vector_index import ann_search_tuning_settings, configured_vector_extension
+from ...causal_links import (
     CANONICAL_CAUSAL_LINK_TYPES,
     CAUSAL_LINK_TYPES,
     DEFAULT_CAUSAL_LINK_WEIGHT,
     LEGACY_CAUSAL_LINK_TYPES,
     CausalLinkDescriptor,
 )
-from ..db.base import DatabaseConnection
-from ..db.ops import DataAccessOps
-from ..db.postgresql import setting_rejected_by_server
-from ..memory_engine import fq_table
-from .types import CausalRelation, EmbeddingLike, EntityResolutionResult, embedding_to_pgvector
+from ...db.base import DatabaseConnection
+from ...db.ops import DataAccessOps
+from ...db.postgresql import setting_rejected_by_server
+from ...retain.entity_processing import _MAX_ENTITY_NAME_CHARS, _normalize_entity_name
+from ...retain.types import CausalRelation, EmbeddingLike, EntityResolutionResult, embedding_to_pgvector
+from ...schema import fq_store_table as fq_table
 
 logger = logging.getLogger(__name__)
 
 # Sentinel UUID used in the unique index to represent NULL entity_id
 _NIL_ENTITY_UUID = "00000000-0000-0000-0000-000000000000"
-
-# Any run of whitespace, including the \n / \r / \t that extraction sometimes
-# leaves inside a candidate entity name.
-_WHITESPACE_RUN_RE = re.compile(r"\s+")
-
-# Longest candidate entity name intake will accept. `entities.canonical_name` is
-# unbounded TEXT, but `idx_entities_bank_name` is a btree on (bank_id,
-# canonical_name) and a btree tuple cannot exceed ~2704 bytes, so a longer name
-# fails the INSERT with ProgramLimitExceededError — and takes the whole retain
-# with it, not just the one entity. 512 characters stays under that limit even at
-# 4 bytes per character plus a long bank_id. Real names never get close: on a
-# production bank set of ~11M entities the median was 13 characters and p99.9 was
-# 96; everything past a few hundred was an extraction artifact — SVG path data,
-# base64, a fragment of serialized JSON.
-# This cap counts characters, which is what the PostgreSQL btree needs. Oracle
-# declares canonical_name as VARCHAR2(512) — byte-counted — so a multibyte name
-# under this cap can still be rejected there; that is a narrower, pre-existing
-# limit of the Oracle schema, not something this cap is sized for.
-_MAX_ENTITY_NAME_CHARS = 512
-
-
-def _normalize_entity_name(name: str) -> str:
-    """Collapse internal whitespace runs to a single space and strip the ends.
-
-    Extraction can hand back names carrying embedded newlines/tabs, which then
-    become ``entities.canonical_name`` values that shear every line-oriented
-    consumer (``psql -A`` output, log lines, exports) — issue #3275. Case is
-    deliberately untouched: the entity registry already matches on
-    ``LOWER(canonical_name)``, so lowercasing here would only lose the display
-    form.
-    """
-    return _WHITESPACE_RUN_RE.sub(" ", name).strip()
 
 
 def _entity_resolve_flag(ent) -> bool:
@@ -284,7 +253,7 @@ def _prepare_entities_for_resolution(
     sentences: list[str],
     fact_dates: list,
     llm_entities: list[list[dict]],
-    log_buffer: list[str] = None,
+    log_buffer: list[str] | None = None,
 ) -> tuple[list[dict], list[list[dict]], list[tuple]]:
     """
     Convert LLM entities into the flat format expected by entity resolver.
@@ -323,7 +292,9 @@ def _prepare_entities_for_resolution(
             else:
                 continue
 
-            normalized_text = _normalize_entity_name(raw_text)
+            # `raw_text` is read out of a heterogeneous entity dict, so it widens to object;
+            # both branches above assign a string.
+            normalized_text = _normalize_entity_name(cast(str, raw_text))
             if not normalized_text:
                 # A blank or whitespace-only candidate would otherwise be created
                 # as an entity with an empty canonical_name — the resolver has no
@@ -412,7 +383,7 @@ async def resolve_entities_only(
     context: str,
     fact_dates: list,
     llm_entities: list[list[dict]],
-    log_buffer: list[str] = None,
+    log_buffer: list[str] | None = None,
     entity_labels: list | None = None,
 ) -> EntityResolutionResult:
     """
@@ -488,7 +459,7 @@ async def create_temporal_links_batch_per_fact(
     bank_id: str,
     unit_ids: list[str],
     time_window_hours: int = 24,
-    log_buffer: list[str] = None,
+    log_buffer: list[str] | None = None,
     ops=None,
 ) -> int:
     """
@@ -610,7 +581,7 @@ async def compute_semantic_links_ann(
     top_k: int = 50,
     *,
     threshold: float,
-    log_buffer: list[str] = None,
+    log_buffer: list[str] | None = None,
 ) -> list[tuple]:
     """
     Phase 1: ANN search for semantic neighbors among existing units.
@@ -892,7 +863,7 @@ async def create_semantic_links_batch(
     top_k: int = 50,
     *,
     threshold: float,
-    log_buffer: list[str] = None,
+    log_buffer: list[str] | None = None,
     pre_computed_ann_links: list[tuple] | None = None,
     ops=None,
 ) -> int:

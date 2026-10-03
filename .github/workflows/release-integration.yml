@@ -69,13 +69,13 @@ jobs:
 
     # ── TypeScript integrations (ai-sdk, chat, openclaw) ────────────────────
 
-    # ── Plugin integrations (claude-code) — no package to publish ───────────
+    # ── Plugin integrations (claude-code, grok-bot) — no package to publish ─
 
     - name: Plugin release
       if: steps.type.outputs.type == 'plugin'
       run: |
         echo "Plugin integration ${{ steps.info.outputs.integration }} v${{ steps.info.outputs.version }} — no package to publish."
-        echo "Users install via: claude plugin marketplace add vectorize-io/hindsight"
+        echo "Users install it from the marketplace manifest at the tagged commit."
 
     # ── TypeScript integrations (ai-sdk, chat, openclaw) ────────────────────
 

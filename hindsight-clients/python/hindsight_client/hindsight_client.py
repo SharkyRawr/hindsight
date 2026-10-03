@@ -7,6 +7,7 @@ easy-to-use interface on top of the auto-generated OpenAPI client.
 
 import asyncio
 import json
+import math
 import random
 import warnings
 from collections.abc import Awaitable, Callable, Iterator
@@ -16,6 +17,7 @@ from datetime import datetime
 from importlib import metadata
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import quote
 
 import aiohttp
 from yarl import URL
@@ -185,7 +187,8 @@ def _retry_after_seconds(e: "ApiException") -> float | None:
     if raw is None:
         return None
     try:
-        return max(0.0, float(raw))
+        seconds = float(raw)
+        return max(0.0, seconds) if math.isfinite(seconds) else None
     except (TypeError, ValueError):
         # HTTP-date form; the fallback backoff is a better answer than parsing dates.
         return None
@@ -605,7 +608,7 @@ class Hindsight:
         file_data = []
         for file_path in files:
             path = Path(file_path)
-            file_data.append((path.name, path.read_bytes()))
+            file_data.append((path.name, await asyncio.to_thread(path.read_bytes)))
 
         meta = files_metadata or [{"context": context} if context else {} for _ in files]
 
@@ -798,6 +801,8 @@ class Hindsight:
         end_date: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        tags: list[str] | None = None,
+        tags_match: str | None = None,
     ) -> ListMemoryUnitsResponse:
         """
         List memory units with pagination (sync wrapper — prefer :meth:`alist_memories` in async code).
@@ -815,6 +820,8 @@ class Hindsight:
                 end_date=end_date,
                 limit=limit,
                 offset=offset,
+                tags=tags,
+                tags_match=tags_match,
             )
         )
 
@@ -829,6 +836,8 @@ class Hindsight:
         end_date: str | None = None,
         limit: int = 100,
         offset: int = 0,
+        tags: list[str] | None = None,
+        tags_match: str | None = None,
     ) -> ListMemoryUnitsResponse:
         """List memory units with pagination (async — preferred over :meth:`list_memories`).
 
@@ -841,6 +850,9 @@ class Hindsight:
         ``[start_date, end_date)`` given as ISO-8601 strings. Memories carrying no
         value on that axis are excluded, so ``total`` counts the window rather than
         the bank.
+
+        tags / tags_match filter by the memories' tags ('any', 'all', 'any_strict',
+        'all_strict', 'exact'; the server defaults to 'any').
         """
         return await self._memory_api.list_memories(
             bank_id=bank_id,
@@ -852,6 +864,8 @@ class Hindsight:
             end_date=end_date,
             limit=limit,
             offset=offset,
+            tags=tags,
+            tags_match=tags_match,
             _request_timeout=self._timeout,
         )
 
@@ -1008,9 +1022,9 @@ class Hindsight:
         if enable_reranking is not None:
             body["enable_reranking"] = enable_reranking
 
-        url = f"{self._base_url}/v1/default/banks/{bank_id}"
+        url = f"{self._base_url}/v1/default/banks/{quote(bank_id, safe='')}"
         headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(trust_env=True) as session:
             async with session.put(
                 url, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=self._timeout)
             ) as resp:
@@ -1854,15 +1868,29 @@ class Hindsight:
 
     # Knowledge base methods
 
-    def get_knowledge_base_tree(self, bank_id: str):
+    def get_knowledge_base_tree(
+        self,
+        bank_id: str,
+        tags: list[str] | None = None,
+        tags_match: str | None = None,
+        tag_groups: list[dict[str, Any]] | None = None,
+    ):
         """
         Get the knowledge base as a nested folder/page tree (sync wrapper — prefer :meth:`aget_knowledge_base_tree` in async code).
 
         See :meth:`aget_knowledge_base_tree` for the full argument and return documentation.
         """
-        return _run_async(self.aget_knowledge_base_tree(bank_id=bank_id))
+        return _run_async(
+            self.aget_knowledge_base_tree(bank_id=bank_id, tags=tags, tags_match=tags_match, tag_groups=tag_groups)
+        )
 
-    async def aget_knowledge_base_tree(self, bank_id: str):
+    async def aget_knowledge_base_tree(
+        self,
+        bank_id: str,
+        tags: list[str] | None = None,
+        tags_match: str | None = None,
+        tag_groups: list[dict[str, Any]] | None = None,
+    ):
         """
         Get the knowledge base as a nested folder/page tree (async — preferred over :meth:`get_knowledge_base_tree`).
 
@@ -1870,11 +1898,23 @@ class Hindsight:
 
         Args:
             bank_id: The memory bank ID
+            tags: Only return pages carrying these tags, matched per ``tags_match`` (recall semantics).
+                Folders are kept only on the path to a matching page.
+            tags_match: 'any', 'all', 'any_strict', 'all_strict' or 'exact' (server default 'any',
+                which also returns untagged pages)
+            tag_groups: Compound boolean tag filter, same shape as recall's ``tag_groups``
 
         Returns:
             KnowledgeTreeResponse with roots
         """
-        return await self._knowledge_base_api.get_knowledge_base_tree(bank_id, _request_timeout=self._timeout)
+        return await self._knowledge_base_api.get_knowledge_base_tree(
+            bank_id,
+            tags=tags,
+            tags_match=tags_match,
+            # Sent as one JSON query param: the endpoint is a GET, and a boolean tree has no flat form.
+            tag_groups=json.dumps(tag_groups) if tag_groups else None,
+            _request_timeout=self._timeout,
+        )
 
     def create_knowledge_folder(self, bank_id: str, name: str, parent_id: str | None = None):
         """
@@ -2006,15 +2046,35 @@ class Hindsight:
         """
         return await self._knowledge_base_api.get_knowledge_page(bank_id, page_id, _request_timeout=self._timeout)
 
-    def search_knowledge_base(self, bank_id: str, q: str, limit: int | None = None):
+    def search_knowledge_base(
+        self,
+        bank_id: str,
+        q: str,
+        limit: int | None = None,
+        tags: list[str] | None = None,
+        tags_match: str | None = None,
+        tag_groups: list[dict[str, Any]] | None = None,
+    ):
         """
         Hybrid search over knowledge pages (sync wrapper — prefer :meth:`asearch_knowledge_base` in async code).
 
         See :meth:`asearch_knowledge_base` for the full argument and return documentation.
         """
-        return _run_async(self.asearch_knowledge_base(bank_id=bank_id, q=q, limit=limit))
+        return _run_async(
+            self.asearch_knowledge_base(
+                bank_id=bank_id, q=q, limit=limit, tags=tags, tags_match=tags_match, tag_groups=tag_groups
+            )
+        )
 
-    async def asearch_knowledge_base(self, bank_id: str, q: str, limit: int | None = None):
+    async def asearch_knowledge_base(
+        self,
+        bank_id: str,
+        q: str,
+        limit: int | None = None,
+        tags: list[str] | None = None,
+        tags_match: str | None = None,
+        tag_groups: list[dict[str, Any]] | None = None,
+    ):
         """
         Hybrid search over knowledge pages (async — preferred over :meth:`search_knowledge_base`).
 
@@ -2022,12 +2082,22 @@ class Hindsight:
             bank_id: The memory bank ID
             q: Search query
             limit: Maximum results to return (1-50, defaults to 10 server-side)
+            tags: Only return pages carrying these tags, matched per ``tags_match`` (recall semantics)
+            tags_match: 'any', 'all', 'any_strict', 'all_strict' or 'exact' (server default 'any',
+                which also returns untagged pages)
+            tag_groups: Compound boolean tag filter, same shape as recall's ``tag_groups``
 
         Returns:
             KnowledgePageSearchResponse with ranked results
         """
         return await self._knowledge_base_api.search_knowledge_base(
-            bank_id, q, limit=limit, _request_timeout=self._timeout
+            bank_id,
+            q,
+            limit=limit,
+            tags=tags,
+            tags_match=tags_match,
+            tag_groups=json.dumps(tag_groups) if tag_groups else None,
+            _request_timeout=self._timeout,
         )
 
     def update_knowledge_node(
@@ -2498,7 +2568,11 @@ class Hindsight:
             auth_settings=[],
         )
         response = await self._api_client.call_api(*request, _request_timeout=self._timeout)
-        return bytes(await response.read())
+        archive = await response.read()
+        # Called only for its status check: it raises ApiException on a non-2XX download, which
+        # would otherwise hand the error body back as the archive.
+        self._api_client.response_deserialize(response, response_types_map={"2XX": "bytearray"})
+        return bytes(archive)
 
     # Directives methods
 
@@ -2732,9 +2806,9 @@ class Hindsight:
         return await self._aget_bank_config(bank_id)
 
     async def _aget_bank_config(self, bank_id: str) -> dict[str, Any]:
-        url = f"{self._base_url}/v1/default/banks/{bank_id}/config"
+        url = f"{self._base_url}/v1/default/banks/{quote(bank_id, safe='')}/config"
         headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(trust_env=True) as session:
             async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=self._timeout)) as resp:
                 resp.raise_for_status()
                 return await resp.json()
@@ -3071,9 +3145,9 @@ class Hindsight:
         return await self._aupdate_bank_config(bank_id, updates)
 
     async def _aupdate_bank_config(self, bank_id: str, updates: dict[str, Any]) -> dict[str, Any]:
-        url = f"{self._base_url}/v1/default/banks/{bank_id}/config"
+        url = f"{self._base_url}/v1/default/banks/{quote(bank_id, safe='')}/config"
         headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(trust_env=True) as session:
             async with session.patch(
                 url, json={"updates": updates}, headers=headers, timeout=aiohttp.ClientTimeout(total=self._timeout)
             ) as resp:
@@ -3103,9 +3177,9 @@ class Hindsight:
         return await self._areset_bank_config(bank_id)
 
     async def _areset_bank_config(self, bank_id: str) -> dict[str, Any]:
-        url = f"{self._base_url}/v1/default/banks/{bank_id}/config"
+        url = f"{self._base_url}/v1/default/banks/{quote(bank_id, safe='')}/config"
         headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(trust_env=True) as session:
             async with session.delete(url, headers=headers, timeout=aiohttp.ClientTimeout(total=self._timeout)) as resp:
                 resp.raise_for_status()
                 return await resp.json()

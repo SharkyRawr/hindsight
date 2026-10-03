@@ -12,15 +12,19 @@ import logging
 import uuid
 from dataclasses import replace
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
-from ..chunk_ids import resolve_chunk_id_in
+from ..prompt_utils import truncate_context_for_prompt
+from ..search.tags import TagGroup, TagsMatch, tags_satisfy_groups
+from ..source_scope import ids_passing, tag_filter_is_active, visible_document_ids
 from .tokenization import count_prompt_tokens
 
 if TYPE_CHECKING:
-    from asyncpg import Connection
-
+    # The engine's own connection abstraction, which is what every caller passes. This said
+    # `asyncpg.Connection` -- the concrete driver type -- which predates that abstraction and
+    # was never what arrived here; only `.fetch()` is used, and both provide it.
     from ...api.http import RequestContext
+    from ..db.base import DatabaseConnection
     from ..memory_engine import MemoryEngine
 
 logger = logging.getLogger(__name__)
@@ -66,13 +70,15 @@ _UNREAD_RESULT_FIELDS = ("scores", "chunk_id", "document_id")
 
 
 def _drop_unread_fields(d: dict[str, Any]) -> dict[str, Any]:
-    """Strip retrieval plumbing from one serialized tool result.
+    """Strip retrieval plumbing from one serialized tool result and cap its ``context``.
 
     Mutates and returns ``d``, which is always a fresh ``model_dump()`` by the
     time it gets here -- never a caller's dict.
     """
     for k in _UNREAD_RESULT_FIELDS:
         d.pop(k, None)
+    if "context" in d:
+        d["context"] = truncate_context_for_prompt(d["context"])
     return d
 
 
@@ -111,14 +117,14 @@ def _document_metadata_from_retain_params(retain_params: Any) -> dict[str, Any] 
 
 async def tool_search_mental_models(
     memory_engine: "MemoryEngine",
-    conn: "Connection",
+    conn: "DatabaseConnection",
     bank_id: str,
     query: str,
     query_embedding: list[float],
     max_results: int = 5,
     top_result_max_tokens: int = 4000,
     tags: list[str] | None = None,
-    tags_match: str = "any",
+    tags_match: TagsMatch = "any",
     tag_groups: "list | None" = None,
     exclude_ids: list[str] | None = None,
     last_memory_write_at: datetime | None = None,
@@ -302,10 +308,11 @@ async def tool_search_mental_models(
 
 
 async def tool_read_mental_models(
-    conn: "Connection",
+    conn: "DatabaseConnection",
     bank_id: str,
     mental_model_ids: list[str],
     max_tokens: int = 6000,
+    tag_scope: list[TagGroup] | None = None,
 ) -> dict[str, Any]:
     """Read the full text of mental models the search returned as snippets.
 
@@ -314,6 +321,9 @@ async def tool_read_mental_models(
     the failure ``search_mental_models`` used to have by returning five of them
     whole (#4533). A page that does not fit at all is reported by name rather
     than silently missing.
+
+    ``tag_scope`` is the caller's forced tag scope: a page outside it reads as missing,
+    even when the model asks for it by id.
     """
     from ..memory_engine import fq_table
 
@@ -336,7 +346,7 @@ async def tool_read_mental_models(
     spent = 0
     for wanted in mental_model_ids:
         row = by_id.get(str(wanted))
-        if row is None:
+        if row is None or (tag_scope and not tags_satisfy_groups(row["tags"], tag_scope)):
             omitted.append(str(wanted))
             continue
         content = row["content"] or ""
@@ -370,7 +380,7 @@ async def tool_search_observations(
     request_context: "RequestContext",
     max_tokens: int = 5000,
     tags: list[str] | None = None,
-    tags_match: str = "any",
+    tags_match: TagsMatch = "any",
     tag_groups: "list | None" = None,
     last_consolidated_at: datetime | None = None,
     pending_consolidation: int = 0,
@@ -463,7 +473,7 @@ async def tool_recall(
     request_context: "RequestContext",
     max_tokens: int = 2048,
     tags: list[str] | None = None,
-    tags_match: str = "any",
+    tags_match: TagsMatch = "any",
     tag_groups: "list | None" = None,
     connection_budget: int = 1,
     max_chunk_tokens: int = 1000,
@@ -530,19 +540,32 @@ async def tool_recall(
 
 
 async def tool_expand(
-    conn: "Connection",
+    conn: "DatabaseConnection",
     bank_id: str,
     memory_ids: list[str],
     depth: str,
+    *,
+    tags: list[str] | None,
+    tags_match: TagsMatch,
+    tag_groups: list[TagGroup] | None,
 ) -> dict[str, Any]:
     """
     Expand multiple memories to get chunk or document context.
+
+    The reader's tag filter applies twice (#5030): a memory outside it reads as not
+    found, and a visible memory's chunk or document is returned only when that
+    DOCUMENT passes the filter too — a fact shared through a tag such as ``kind:rule``
+    does not open the rest of a document the reader cannot see. The filter arguments
+    are required so no caller can forget them and expand the whole bank.
 
     Args:
         conn: Database connection
         bank_id: Bank identifier
         memory_ids: List of memory unit IDs
         depth: "chunk" or "document"
+        tags: The reader's tag filter (same as the recall it expands)
+        tags_match: How ``tags`` is matched
+        tag_groups: The reader's compound tag filter, already fuzzy-resolved
 
     Returns:
         Dict with results array, each containing memory, chunk, and optionally document data
@@ -567,37 +590,41 @@ async def tool_expand(
 
     valid_uuids = list(uuid_by_id.values())
 
-    # Batch fetch all memory units. A store that keeps memories outside SQL answers by id
-    # through the store; normalize its records to the same UUID-keyed dict shape the SQL rows
-    # have so the result-building below stays store-agnostic.
+    # Batch fetch all memory units. Postgres hands back its rows; a store that keeps memories
+    # outside SQL normalizes its records to the same UUID-keyed mapping shape, so the
+    # result-building below stays store-agnostic.
     from ..memories import get_memories
 
     _store = get_memories()
-    if not _store.store_owned_for(bank_id):
-        memories = await conn.fetch(
-            f"""
-            SELECT id, text, chunk_id, document_id, fact_type, context
-            FROM {fq_table("memory_units")}
-            WHERE id = ANY($1) AND bank_id = $2
-            """,
-            valid_uuids,
-            bank_id,
+    memories = await _store.expand_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=valid_uuids)
+    # A memory outside the reader's filter is dropped here, so below it reads as "not found"
+    # rather than revealing that it exists.
+    scoped = tag_filter_is_active(tags, tags_match, tag_groups)
+    if scoped:
+        _visible_ids = ids_passing(
+            {str(m["id"]): m["tags"] for m in memories}, tags=tags, tags_match=tags_match, tag_groups=tag_groups
         )
-    else:
-        stored = await _store.get_memories(
-            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=[str(u) for u in valid_uuids]
-        )
-        memories = [
-            {
-                "id": uuid.UUID(s.unit_id),
-                "text": s.text,
-                "chunk_id": s.chunk_id,
-                "document_id": s.document_id,
-                "fact_type": s.fact_type,
-                "context": s.context,
-            }
-            for s in stored
-        ]
+        memories = [m for m in memories if str(m["id"]) in _visible_ids]
+    # Source text follows its document's tags, not the fact's. Resolved before any chunk or
+    # document text is read, so a hidden source is never fetched at all.
+    visible_docs = await visible_document_ids(
+        conn,
+        fq_table,
+        bank_id,
+        (m["document_id"] for m in memories),
+        tags=tags,
+        tags_match=tags_match,
+        tag_groups=tag_groups,
+    )
+    # A chunk with no document on the memory cannot be checked, so under a filter it is
+    # withheld too: fail closed.
+    withheld_ids = {
+        m["id"]
+        for m in memories
+        if (m["document_id"] and m["document_id"] not in visible_docs)
+        or (scoped and m["chunk_id"] and not m["document_id"])
+    }
+    memories = [{**dict(m), "chunk_id": None, "document_id": None} if m["id"] in withheld_ids else m for m in memories]
     memory_map = {row["id"]: row for row in memories}
 
     # Collect chunk_ids and document_ids for batch fetching
@@ -605,94 +632,27 @@ async def tool_expand(
     doc_ids_from_chunks: set[str] = set()
     doc_ids_direct: set[str] = set()
 
-    # Batch fetch all chunks. A store that owns the document store leaves the `chunks` and
-    # `documents` tables empty, so the SQL below would return nothing and `expand` would answer
-    # without the chunk or document it was asked for — the memories read above was routed to the
-    # store but these two were not.
-    _docs_in_store = _store.store_owned_for(bank_id)
+    # Batch fetch all chunks, and the documents behind them — both through the store, which
+    # owns the `chunks` and `documents` rows as well as the memories.
     chunk_map: dict[str, Any] = {}
-    if chunk_ids and _docs_in_store:
-        # The store addresses a chunk by (document_id, index), and the index is what remains
-        # once the known bank/document prefix is removed (see `engine/chunk_ids.py`). Anchored
-        # on the ids in hand rather than split on "_", which a bank or document id containing
-        # one would break.
-        # Deduped by chunk_id: co-located memories share one chunk, and the SQL branch collapses
-        # them through `= ANY($1)`. Without this the store is asked for the same chunk once per
-        # memory sitting in it.
-        refs: list[tuple[str, int]] = []
-        ref_owner: list[dict] = []
-        _seen_chunks: set[str] = set()
-        for m in memories:
-            cid, did = m["chunk_id"], m["document_id"]
-            if not cid or not did:
-                continue
-            if cid in _seen_chunks:
-                continue
-            ref = resolve_chunk_id_in(cid, bank_id)
-            if ref is None or ref.document_id != did:
-                continue
-            index = ref.chunk_index
-            _seen_chunks.add(cid)
-            refs.append((did, index))
-            ref_owner.append({"chunk_id": cid, "document_id": did, "chunk_index": index})
-        if refs:
-            texts = await _store.get_chunk_texts(bank_id=bank_id, refs=refs)
-            for owner, text in zip(ref_owner, texts):
-                if text is None:
-                    continue
-                chunk_map[owner["chunk_id"]] = {**owner, "chunk_text": text}
+    if chunk_ids:
+        chunk_map = await _store.expand_chunks(
+            conn=conn, fq_table=fq_table, bank_id=bank_id, memories=memories, chunk_ids=chunk_ids
+        )
         if depth == "document":
             doc_ids_from_chunks = {c["document_id"] for c in chunk_map.values() if c["document_id"]}
-    elif chunk_ids:
-        chunks = await conn.fetch(
-            f"""
-            SELECT chunk_id, chunk_text, chunk_index, document_id
-            FROM {fq_table("chunks")}
-            WHERE chunk_id = ANY($1)
-            """,
-            chunk_ids,
-        )
-        chunk_map = {row["chunk_id"]: row for row in chunks}
-        if depth == "document":
-            doc_ids_from_chunks = {c["document_id"] for c in chunks if c["document_id"]}
 
     # Collect direct document IDs (memories without chunks)
     if depth == "document":
         for m in memories:
             if not m["chunk_id"] and m["document_id"]:
-                doc_ids_direct.add(m["document_id"])
+                doc_ids_direct.add(cast(str, m["document_id"]))
 
     # Batch fetch all documents
     doc_map: dict[str, Any] = {}
     all_doc_ids = list(doc_ids_from_chunks | doc_ids_direct)
-    if all_doc_ids and _docs_in_store:
-        # One read per document: the store addresses a document by id and has no batch form here.
-        # The set is the documents behind the memories being expanded, which is bounded by the
-        # caller's own memory_ids rather than by corpus size.
-        for did in all_doc_ids:
-            record = await _store.get_document_record(bank_id=bank_id, document_id=did, include_text=True)
-            if record is None:
-                continue
-            # The store has no `retain_params` column; it keeps the retain params inside the
-            # document record's metadata bag, under that key and serialised as JSON. So they are
-            # read back out of the bag rather than reconstructed — `_document_metadata_from_retain_params`
-            # already parses the JSON form, which is the same thing Postgres hands it from JSONB.
-            doc_map[did] = {
-                "id": did,
-                "original_text": record.get("original_text"),
-                "retain_params": (record.get("metadata") or {}).get("retain_params"),
-            }
-    elif all_doc_ids:
-        docs = await conn.fetch(
-            f"""
-            SELECT id, original_text, retain_params
-            FROM {fq_table("documents")}
-            WHERE id = ANY($1) AND bank_id = $2
-            """,
-            all_doc_ids,
-            bank_id,
-        )
-        doc_map = {row["id"]: row for row in docs}
+    if all_doc_ids:
+        doc_map = await _store.expand_documents(conn=conn, fq_table=fq_table, bank_id=bank_id, document_ids=all_doc_ids)
 
     # Build results
     results: list[dict[str, Any]] = []
@@ -712,13 +672,18 @@ async def tool_expand(
                 "id": str(memory["id"]),
                 "text": memory["text"],
                 "type": memory["fact_type"],
-                "context": memory["context"],
+                "context": truncate_context_for_prompt(memory["context"]),
             },
         }
 
+        if memory["id"] in withheld_ids:
+            # Said outright so the agent stops asking, rather than retrying a depth that will
+            # never answer.
+            item["source_withheld"] = "The source of this memory is outside the current tag scope."
+
         # Add chunk if available
         if memory["chunk_id"] and memory["chunk_id"] in chunk_map:
-            chunk = chunk_map[memory["chunk_id"]]
+            chunk = chunk_map[cast(str, memory["chunk_id"])]
             item["chunk"] = {
                 "id": chunk["chunk_id"],
                 "text": chunk["chunk_text"],
@@ -736,7 +701,7 @@ async def tool_expand(
                 }
         elif memory["document_id"] and depth == "document" and memory["document_id"] in doc_map:
             # No chunk, but has document_id
-            doc = doc_map[memory["document_id"]]
+            doc = doc_map[cast(str, memory["document_id"])]
             item["document"] = {
                 "id": doc["id"],
                 "full_text": doc["original_text"],

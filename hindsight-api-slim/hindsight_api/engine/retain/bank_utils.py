@@ -10,7 +10,7 @@ import uuid
 from contextlib import aclosing
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, TypedDict, cast
 
 from pydantic import BaseModel, Field
 
@@ -21,7 +21,7 @@ from ..memory_engine import fq_table, get_current_schema
 from ..response_models import DispositionTraits
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncGenerator
 
     from ..db.base import DatabaseConnection
     from ..db.ops import DataAccessOps
@@ -164,13 +164,20 @@ async def create_bank_vector_indexes(
         logger.debug("Skipping per-bank vector indexes for store-owned bank %s", bank_id)
         return
 
-    await ops.create_bank_vector_indexes(
-        conn,
-        fq_table("memory_units"),
-        bank_id,
-        internal_id,
-        index_clause,
-        _BANK_INDEX_FACT_TYPES,
+    # The SQL store, not the configured one: this line is only reached once the bank has been
+    # decided SQL-backed (or undecidable, which falls back to SQL-backed above), so these are
+    # Postgres's indexes over Postgres's rows, which only the Postgres store builds — a
+    # non-Postgres store has no such method.
+    from ..memories import sql_memories
+
+    await sql_memories().create_bank_vector_indexes(
+        conn=conn,
+        ops=ops,
+        fq_table=fq_table,
+        bank_id=bank_id,
+        internal_id=internal_id,
+        index_clause=index_clause,
+        fact_types=_BANK_INDEX_FACT_TYPES,
     )
 
 
@@ -697,10 +704,6 @@ async def list_banks(pool, *, search_query: str | None = None) -> list:
         List of dicts with bank info and stats (fact_count, last_document_at, last_write_at),
         most recently written bank first.
     """
-    banks_table = fq_table("banks")
-    docs_table = fq_table("documents")
-    mu_table = fq_table("memory_units")
-
     # Spelled out as UPPER(...) LIKE UPPER(...) rather than ILIKE: the Oracle
     # rewriter only recognizes ILIKE on an unqualified column, and these are
     # alias-qualified.
@@ -717,35 +720,15 @@ async def list_banks(pool, *, search_query: str | None = None) -> list:
         )
         params = [f"%{search_query}%", f"%{search_query}%", f"%{search_query}%"]
 
+    from ..memories import sql_memories
+
     async with acquire_with_retry(pool) as conn:
-        rows = await conn.fetch(
-            f"""
-            SELECT
-                b.bank_id, b.name, b.disposition, b.mission,
-                b.created_at, b.updated_at,
-                d.last_document_at,
-                d.last_document_write_at,
-                -- Per bank, off `idx_memory_units_bank_updated_at`: one index entry read instead of
-                -- the GROUP BY over all of memory_units this replaced. `updated_at`, not
-                -- `created_at`, because that index is the one that exists — and it is the right
-                -- column anyway: this feeds `last_write_at` only, and every write to a fact bumps
-                -- `updated_at`, so the watermark is the same or newer, which is what "last written"
-                -- means. The documents half stays a GROUP BY: correlating it would be random reads
-                -- over the same rows, since this query lists every bank before paging, and
-                -- `last_document_at` must stay ingestion time (frozen when a document is rewritten).
-                (SELECT MAX(m.updated_at) FROM {mu_table} m WHERE m.bank_id = b.bank_id) AS last_fact_at
-            FROM {banks_table} b
-            LEFT JOIN (
-                SELECT bank_id,
-                       MAX(created_at) AS last_document_at,
-                       MAX(updated_at) AS last_document_write_at
-                FROM {docs_table}
-                GROUP BY bank_id
-            ) d ON d.bank_id = b.bank_id
-            {where_clause}
-            ORDER BY b.bank_id
-            """,
-            *params,
+        # The bank rows with their document and fact write watermarks, read from Postgres for
+        # every bank: the ids are not known before this query, so it cannot be split by owner.
+        # A bank whose memories live in another store has no rows there and gets NULL
+        # watermarks, which `_apply_store_last_write` below fills in from that store.
+        rows = await sql_memories().list_bank_rows(
+            conn=conn, fq_table=fq_table, where_clause=where_clause, params=params
         )
 
         # Which alias made a bank match, so a result found by an id the bank does not
@@ -814,7 +797,8 @@ async def list_banks(pool, *, search_query: str | None = None) -> list:
     # under load, and the retain path enforces the same rule everywhere else.
     await _apply_store_last_write(result, sort_keys)
 
-    result.sort(key=lambda bank: sort_keys[bank["bank_id"]], reverse=True)
+    # The row dicts are heterogeneous, so their value type is a union; the id is a str.
+    result.sort(key=lambda bank: sort_keys[cast(str, bank["bank_id"])], reverse=True)
     return result
 
 
@@ -912,6 +896,33 @@ async def list_banks_page(pool, *, limit: int, offset: int, search_query: str | 
     return BankPage(banks=rows, total=await _count_banks(pool))
 
 
+async def list_banks_among(pool, bank_ids: list[str], *, search_query: str | None = None) -> list:
+    """The banks among ``bank_ids`` (canonical ids), most recently written first.
+
+    For a caller that may see only these banks. Reads those rows by id rather than ranking the
+    tenant and filtering: O(allowed banks), and — through :func:`_bank_rows` — without naming
+    ``memory_units`` for a store-owned set, whose planning alone costs seconds on a tenant with
+    tens of thousands of banks. Ids that name no bank drop out.
+
+    A search goes through :func:`list_banks`, which matches names and aliases in SQL, and is then
+    narrowed to the set — the cost of an unscoped search, which is small because a search is.
+    """
+    wanted = list(dict.fromkeys(bank_ids))
+    if search_query:
+        allowed = set(wanted)
+        return [bank for bank in await list_banks(pool, search_query=search_query) if bank["bank_id"] in allowed]
+    banks = await _bank_rows(pool, wanted)
+    # The same key :func:`list_banks` ranks by: last write, else creation, else the epoch — then
+    # overlaid with the store's write time for banks whose memories live there.
+    sort_keys: dict[str, datetime] = {}
+    for bank in banks:
+        when = bank["last_write_at"] or bank["created_at"]
+        sort_keys[bank["bank_id"]] = datetime.fromisoformat(when) if when else _UNIX_EPOCH
+    await _apply_store_last_write(banks, sort_keys)
+    banks.sort(key=lambda bank: sort_keys[bank["bank_id"]], reverse=True)
+    return banks
+
+
 #: Banks per store page. The merge consumes one page for a page-1 request however large the tenant.
 _STORE_PAGE = 100
 
@@ -962,7 +973,10 @@ async def _merge_ordered_bank_ids(pool, store, want: int, first: "BankWritePage"
     return out
 
 
-async def _store_write_stream(store, first: "BankWritePage") -> "AsyncIterator[BankWriteTime]":
+# `AsyncGenerator`, not `AsyncIterator`: the caller wraps this in `aclosing`, which needs the
+# `aclose()` an iterator does not promise -- and closing it early is the whole point of the
+# generator (see the docstring), so the weaker type contradicted the use.
+async def _store_write_stream(store, first: "BankWritePage") -> "AsyncGenerator[BankWriteTime, None]":
     """The store's banks as one continuous newest-written-first stream, page by page.
 
     A generator rather than a list so the merge pulls only the pages it needs: a page-1 request
@@ -976,7 +990,10 @@ async def _store_write_stream(store, first: "BankWritePage") -> "AsyncIterator[B
     page = first
     while True:
         for bank in page.banks:
-            yield BankWriteTime(bank_id=bank.bank_id, last_write_at=_as_utc(bank.last_write_at))
+            # `_as_utc` is None-tolerant for callers that may not have a timestamp; the store
+            # always records one for a bank it returns here, and `BankWriteTime` declares it
+            # non-optional.
+            yield BankWriteTime(bank_id=bank.bank_id, last_write_at=cast(datetime, _as_utc(bank.last_write_at)))
         if not page.next_page_token:
             return
         page = await store.list_banks_by_write(limit=_STORE_PAGE, page_token=page.next_page_token)
@@ -1033,47 +1050,14 @@ async def _bank_rows(pool, bank_ids: "list[str]") -> list:
     """
     if not bank_ids:
         return []
-    from ..memories import get_memories
+    from ..memories import get_memories, sql_memories
 
     store = get_memories()
     sql_owned = [b for b in bank_ids if not store.store_owned_for(b)]
-    banks_table = fq_table("banks")
-    docs_table = fq_table("documents")
-    if sql_owned:
-        mu_table = fq_table("memory_units")
-        fact_select = "f.last_fact_at"
-        fact_join = f"""
-            LEFT JOIN (
-                SELECT bank_id, MAX(updated_at) AS last_fact_at
-                FROM {mu_table}
-                WHERE bank_id = ANY($2::text[])
-                GROUP BY bank_id
-            ) f ON f.bank_id = b.bank_id"""
-        params = (bank_ids, sql_owned)
-    else:
-        # Not `NULL::timestamptz` off a join that is simply empty — the table must not appear.
-        fact_select = "NULL::timestamptz AS last_fact_at"
-        fact_join = ""
-        params = (bank_ids,)
+    # The SQL store runs the page query: it reads the `banks` rows, and joins `memory_units` for
+    # exactly the `sql_owned` banks. Postgres-only deployments get the same instance back.
     async with acquire_with_retry(pool) as conn:
-        rows = await conn.fetch(
-            f"""
-            SELECT b.bank_id, b.name, b.disposition, b.mission, b.created_at, b.updated_at,
-                   d.last_document_at, d.last_document_write_at,
-                   {fact_select}
-            FROM {banks_table} b
-            LEFT JOIN (
-                SELECT bank_id,
-                       MAX(created_at) AS last_document_at,
-                       MAX(updated_at) AS last_document_write_at
-                FROM {docs_table}
-                WHERE bank_id = ANY($1::text[])
-                GROUP BY bank_id
-            ) d ON d.bank_id = b.bank_id{fact_join}
-            WHERE b.bank_id = ANY($1::text[])
-            """,
-            *params,
-        )
+        rows = await sql_memories().bank_page_rows(conn=conn, fq_table=fq_table, bank_ids=bank_ids, sql_owned=sql_owned)
     by_id = {}
     for row in rows:
         disposition_data = row["disposition"]
@@ -1210,7 +1194,7 @@ async def apply_sql_fact_counts(pool, banks: list[dict]) -> None:
     """
     if not banks:
         return
-    from ..memories import get_memories
+    from ..memories import get_memories, sql_memories
 
     store = get_memories()
     # Zeroed up front so a store-owned bank still carries a number if the store cannot be reached
@@ -1223,16 +1207,8 @@ async def apply_sql_fact_counts(pool, banks: list[dict]) -> None:
     if not sql_owned:
         return
     async with acquire_with_retry(pool) as conn:
-        rows = await conn.fetch(
-            f"""
-            SELECT bank_id, COUNT(*) AS fact_count
-            FROM {fq_table("memory_units")}
-            WHERE bank_id = ANY($1)
-            GROUP BY bank_id
-            """,
-            list(sql_owned),
-        )
-    counts = {row["bank_id"]: row["fact_count"] for row in rows}
+        # Every bank asked about here is SQL-backed, so the SQL store counts them.
+        counts = await sql_memories().bank_fact_counts(conn=conn, fq_table=fq_table, bank_ids=list(sql_owned))
     # Only the SQL-owned ones: a store-owned bank keeps the zero above for `apply_store_fact_counts`
     # to replace, rather than being re-zeroed here by a query that never asked about it.
     for bank in banks:
