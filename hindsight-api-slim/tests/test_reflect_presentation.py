@@ -70,6 +70,21 @@ def test_aliases_the_model_writes_back_resolve_to_real_ids():
     }
 
 
+def test_aliases_cited_in_the_answer_become_real_ids():
+    """The answer and a mental model's content outlive the reflect, its aliases do not (#4876)."""
+    presenter = ToolResultPresenter()
+    presenter.present(_observations("uuid-a", "uuid-b"))
+    args = {
+        "answer": "o1 contradicts o2 (see [o2]); c9 and vitamin C1 are untouched",
+        "document": {"sections": [{"heading": "o1", "level": 2, "blocks": ["o2 supersedes o1."]}]},
+    }
+    assert presenter.resolve(args) == {
+        "answer": "uuid-a contradicts uuid-b (see [uuid-b]); c9 and vitamin C1 are untouched",
+        "document": {"sections": [{"heading": "uuid-a", "level": 2, "blocks": ["uuid-b supersedes uuid-a."]}]},
+    }
+    assert presenter.resolve_text("o10 is not o1") == "o10 is not uuid-a"
+
+
 def test_an_item_already_shown_is_referenced_not_repeated():
     presenter = ToolResultPresenter()
     presenter.present(_observations("uuid-a"))
@@ -118,3 +133,13 @@ def test_chunks_lose_their_long_keys_and_bookkeeping():
 def test_error_results_pass_through_untouched():
     error = {"error": "recall requires a query parameter"}
     assert ToolResultPresenter().present(error) is error
+
+
+def test_drop_unseen_ids_keeps_only_uuids_the_model_read():
+    seen = "3f2a9c1e-0b4d-4e6f-8a1b-2c3d4e5f6a7b"
+    presenter = ToolResultPresenter()
+    presenter.see("asked about 11111111-2222-4333-8444-555555555555")
+    presenter.present({"memories": [{"id": seen, "text": "x"}]})
+
+    text = f"{seen.upper()} 11111111-2222-4333-8444-555555555555 3f2a9c1e-0000-4e6f-8a1b-2c3d4e5f6a7b"
+    assert presenter.drop_unseen_ids(text) == f"{seen.upper()} 11111111-2222-4333-8444-555555555555 [unverified id]"

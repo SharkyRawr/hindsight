@@ -80,12 +80,15 @@ _NOT_ALL_RE = re.compile(r"!=\s*ALL\s*\(\s*:(\d+)\s*\)", re.IGNORECASE)
 # LIKE ANY / NOT LIKE ALL — capture the column name before the operator
 _LIKE_ANY_RE = re.compile(r"(\w+)\s+LIKE\s+ANY\s*\(\s*:(\d+)\s*\)", re.IGNORECASE)
 _NOT_LIKE_ALL_RE = re.compile(r"(\w+)\s+NOT\s+LIKE\s+ALL\s*\(\s*:(\d+)\s*\)", re.IGNORECASE)
+# array_position(:N, col) — PostgreSQL idiom for "keep the input list order"
+_ARRAY_POSITION_RE = re.compile(r"\barray_position\s*\(\s*:(\d+)\s*,\s*([\w.]+)\s*\)", re.IGNORECASE)
 
 _JSON_ARROW_TEXT_RE = re.compile(r'("?\w+"?)\s*->>\s*\'(\w+)\'')  # handles both col and "col"
 # Reserved-word columns ("trigger") are already quoted by the time this runs, so the
 # column group must accept the quoted form too — same shape as the arrow regex above.
 _JSON_HAS_KEY_RE = re.compile(r"(\"?\w+\"?)\s*\?\s*'(\w+)'")
 _JSONB_CONTAINS_RE = re.compile(r"(\w+)\s*@>\s*:(\d+)")
+_RESULT_METADATA_CONTAINS_RE = re.compile(r"((?:\w+\.)?result_metadata)\s*@>\s*:(\d+)", re.IGNORECASE)
 
 # ---------------------------------------------------------------------------
 # Argument conversion helpers
@@ -139,6 +142,24 @@ def _needs_clob_bind(val: Any) -> bool:
     if not isinstance(val, str) or not val:
         return False
     return val[0] in ("{", "[") or (len(val) > 1000 and len(val.encode()) > 4000)
+
+
+def _needs_clob_lob(val: Any) -> bool:
+    """Text past 32 767 bytes: bind as a real CLOB.
+
+    A CLOB input size covers 4 000-32 767 bytes, but past that the thin driver still
+    sends the string as LONG and ``MERGE ... USING (SELECT :N AS col FROM DUAL)``
+    fails with ORA-01461 (a long ``documents.original_text``).
+    """
+    return isinstance(val, str) and len(val) > 8191 and len(val.encode()) > 32767
+
+
+def _needs_blob_bind(val: Any) -> bool:
+    """Bytes past RAW's 2000-byte SQL limit (a file in ``file_storage``): bind as BLOB.
+
+    UUIDs (16 bytes, RAW(16)) stay RAW.
+    """
+    return isinstance(val, (bytes, bytearray)) and len(val) > 2000
 
 
 def _convert_args_list(args_list: list[tuple[Any, ...]]) -> list[tuple[Any, ...]]:
@@ -332,6 +353,15 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
     # $N → :N
     query = _PG_PARAM_RE.sub(r":\1", query)
 
+    # LEFT(expr, n) does not exist in Oracle (ORA-00904). DBMS_LOB.SUBSTR takes
+    # VARCHAR2 and CLOB alike and returns VARCHAR2, so snippets stay plain strings.
+    query = re.sub(
+        r"\bLEFT\s*\(\s*([\w.]+)\s*,\s*(\d+|:\w+)\s*\)",
+        r"DBMS_LOB.SUBSTR(\1, \2, 1)",
+        query,
+        flags=re.IGNORECASE,
+    )
+
     # JSONB merge operator: col || :N::jsonb → JSON_MERGEPATCH(col, :N RETURNING CLOB)
     # Must happen BEFORE cast strip so we can detect ::jsonb
     # RETURNING CLOB is required: without it JSON_MERGEPATCH returns VARCHAR2(4000)
@@ -466,6 +496,18 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
     # JSON operators
     query = _JSON_ARROW_TEXT_RE.sub(r"JSON_VALUE(\1, '$.\2')", query)
     query = _JSON_HAS_KEY_RE.sub(r"JSON_EXISTS(\1, '$.\2')", query)
+    # result_metadata::jsonb @> :N — every call site binds a single-key
+    # {"parent_operation_id": <uuid>} document to find an operation's
+    # siblings/children (poller rollup, orphan reconciliation, operation
+    # detail and retry). Oracle has no bound-document containment, so
+    # single-key containment becomes a JSON_VALUE comparison on both sides.
+    # Runs BEFORE the generic rewrite below: that one emits
+    # JSON_EXISTS(col, '$' PASSING :N AS cond), which declares a bind variable
+    # the '$' path never references — Oracle evaluates it to false for every
+    # row, so a batch_retain parent never found its children and stayed pending.
+    query = _RESULT_METADATA_CONTAINS_RE.sub(
+        r"JSON_VALUE(\1, '$.parent_operation_id') = JSON_VALUE(:\2, '$.parent_operation_id')", query
+    )
     query = _JSONB_CONTAINS_RE.sub(r"JSON_EXISTS(\1, '$' PASSING :\2 AS cond)", query)
 
     # pgvector distance operator: col <=> :N → VECTOR_DISTANCE(col, :N, COSINE)
@@ -606,6 +648,11 @@ def _rewrite_pg_to_oracle(query: str) -> RewriteResult:
 
     # col NOT LIKE ALL(:N) → (col NOT LIKE :p0 AND col NOT LIKE :p1 AND ...)
     query = _NOT_LIKE_ALL_RE.sub(r"\1 /*NOT_LIKE_ALL:\2:\1*/", query)
+
+    # array_position(:N, col) → CASE col WHEN :v0 THEN 1 ... END (expanded with the list).
+    # Oracle has no array_position; left as is, the list bind arrives as a JSON string and
+    # fails with ORA-00932 (CHAR vs JSON).
+    query = _ARRAY_POSITION_RE.sub(r"/*ARRAY_POSITION:\1:\2*/", query)
 
     # CTE AS MATERIALIZED (...) → AS (...) — Oracle doesn't support MATERIALIZED CTE hint
     query = re.sub(r"\bAS\s+MATERIALIZED\s*\(", "AS (", query, flags=re.IGNORECASE)
@@ -797,6 +844,27 @@ class OracleConnection(DatabaseConnection):
 
         return params
 
+    async def _bind_large_values_as_lobs(self, params: dict[str, Any] | None) -> None:
+        """Bind bytes past RAW's 2000-byte limit as a BLOB and text past 32 767 bytes as a CLOB.
+
+        The thin driver binds bytes as RAW and does not honour a DB_TYPE_BLOB input size
+        for them, so storing a file past that size fails with ORA-01461 ("can bind a LONG
+        value only for insert into a LONG column"); the same happens to text past 32 767 bytes despite a
+        DB_TYPE_CLOB input size. A temporary LOB holding the value binds as a real LOB.
+        """
+        if not params:
+            return
+        oracledb = _import_oracledb()
+        for key, val in params.items():
+            if _needs_blob_bind(val):
+                lob = await self._conn.createlob(oracledb.DB_TYPE_BLOB)
+                await lob.write(bytes(val))
+                params[key] = lob
+            elif _needs_clob_lob(val):
+                lob = await self._conn.createlob(oracledb.DB_TYPE_CLOB)
+                await lob.write(val)
+                params[key] = lob
+
     @staticmethod
     def _apply_clob_input_sizes(cursor: Any, query: str, params: dict[str, Any] | None) -> None:
         """Tell oracledb to bind typed input sizes for ambiguous parameters.
@@ -960,6 +1028,32 @@ class OracleConnection(DatabaseConnection):
 
         query = not_like_all_re.sub(_replace_not_like_all, query)
 
+        # Expand ARRAY_POSITION: /*ARRAY_POSITION:N:col*/ → CASE col WHEN :ap_0 THEN 1 ... END
+        # (1-based like PostgreSQL; rows not in the list get NULL, which sorts last in ASC).
+        array_position_re = re.compile(r"/\*ARRAY_POSITION:(\d+):([\w.]+)\*/")
+
+        def _replace_array_position(m):
+            param_key = m.group(1)
+            col = m.group(2)
+            from_json = isinstance(params.get(param_key), str)
+            val = OracleConnection._resolve_list_param(params, param_key)
+            if not val:
+                return "NULL"
+            OracleConnection._expand_counter += 1
+            prefix = f"ap{OracleConnection._expand_counter}"
+            whens = []
+            for i, item in enumerate(val):
+                # Same UUID handling as /*EXPAND*/: JSON-serialized UUIDs bind as RAW(16).
+                if from_json and isinstance(item, str) and _UUID_STR_RE.match(item):
+                    item = _uuid_mod.UUID(item).bytes
+                k = f"{prefix}_{i}"
+                params[k] = item
+                whens.append(f"WHEN :{k} THEN {i + 1}")
+            keys_to_remove.add(param_key)
+            return f"CASE {col} {' '.join(whens)} END"
+
+        query = array_position_re.sub(_replace_array_position, query)
+
         # Remove original list params that were expanded — their placeholder
         # (:N) no longer exists in the query, and leaving them causes DPY-4008.
         # Only remove if the key's placeholder is truly gone from the query.
@@ -1058,6 +1152,7 @@ class OracleConnection(DatabaseConnection):
         try:
             params = self._make_bind_params(cursor, args, ret_cols)
             query, params = self._expand_any_lists(query, params)
+            await self._bind_large_values_as_lobs(params)
             self._apply_clob_input_sizes(cursor, query, params)
             if ignore_dup:
                 try:
@@ -1097,6 +1192,7 @@ class OracleConnection(DatabaseConnection):
                 # Row-by-row with individual dup suppression
                 for row in converted:
                     params = {str(i + 1): v for i, v in enumerate(row)}
+                    await self._bind_large_values_as_lobs(params)
                     self._apply_clob_input_sizes(cursor, query, params)
                     try:
                         await cursor.execute(query, params)
@@ -1104,7 +1200,10 @@ class OracleConnection(DatabaseConnection):
                         if "ORA-00001" not in str(e):
                             raise
             else:
-                # Convert tuples to dicts for named binding (:1, :2, ...)
+                # Convert tuples to dicts for named binding (:1, :2, ...). No temporary
+                # LOBs here: the batched callers are plain INSERT ... VALUES (chunks,
+                # attachments, links), where a CLOB input size binds long text fine —
+                # ORA-01461 only hits a bind in a select list such as MERGE ... USING.
                 converted_dicts = [{str(i + 1): v for i, v in enumerate(row)} for row in converted]
                 # The driver types each column from the first row, so a column holding
                 # any CLOB-sized value must be declared CLOB for the whole batch.
@@ -1160,6 +1259,7 @@ class OracleConnection(DatabaseConnection):
         try:
             params = self._make_bind_params(cursor, args, ret_cols)
             query, params = self._expand_any_lists(query, params)
+            await self._bind_large_values_as_lobs(params)
             self._apply_clob_input_sizes(cursor, query, params)
             if ignore_dup:
                 try:
@@ -1201,6 +1301,7 @@ class OracleConnection(DatabaseConnection):
         try:
             params = self._make_bind_params(cursor, args, ret_cols)
             query, params = self._expand_any_lists(query, params)
+            await self._bind_large_values_as_lobs(params)
             self._apply_clob_input_sizes(cursor, query, params)
             if ignore_dup:
                 try:
@@ -1242,6 +1343,7 @@ class OracleConnection(DatabaseConnection):
         try:
             params = self._make_bind_params(cursor, args, ret_cols)
             query, params = self._expand_any_lists(query, params)
+            await self._bind_large_values_as_lobs(params)
             self._apply_clob_input_sizes(cursor, query, params)
             if ignore_dup:
                 try:

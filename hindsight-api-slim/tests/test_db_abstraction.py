@@ -567,6 +567,37 @@ class TestOracleQueryRewriter:
         query2, _, _ = _rewrite_pg_to_oracle("WHERE a = $1 AND b = $2")
         assert ":2" in query2
 
+    def test_left_becomes_dbms_lob_substr(self):
+        # LEFT() does not exist in Oracle (ORA-00904); knowledge-page snippets use it.
+        from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
+
+        query, _, _ = _rewrite_pg_to_oracle("SELECT LEFT(mm.content, 280) AS snippet FROM t LEFT JOIN u ON 1=1")
+        assert "DBMS_LOB.SUBSTR(mm.content, 280, 1) AS snippet" in query
+        assert "LEFT JOIN u" in query
+        query, _, _ = _rewrite_pg_to_oracle("SELECT left(name, $2) FROM t")
+        assert "DBMS_LOB.SUBSTR(name, :2, 1)" in query
+
+    def test_array_position_keeps_list_order(self):
+        # Oracle has no array_position(); the list param must expand into a CASE ordinal.
+        import json
+        import uuid
+
+        from hindsight_api.engine.db.oracle import OracleConnection, _rewrite_pg_to_oracle
+
+        query, _, _ = _rewrite_pg_to_oracle(
+            "SELECT id FROM memory_units WHERE id = ANY($1::uuid[]) ORDER BY array_position($1::uuid[], id)"
+        )
+        assert "array_position(" not in query.lower()
+        assert "/*ARRAY_POSITION:1:id*/" in query
+
+        ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+        expanded, params = OracleConnection._expand_any_lists(query, {"1": json.dumps(ids)})
+        assert "ORDER BY CASE id WHEN :ap" in expanded
+        assert "THEN 1" in expanded and "THEN 2" in expanded
+        assert "1" not in params  # every reference to the list was expanded
+        ap_values = [v for k, v in params.items() if k.startswith("ap")]
+        assert ap_values == [uuid.UUID(i).bytes for i in ids]  # RAW(16) binds, list order kept
+
     def test_cast_removal(self):
         from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
 
@@ -634,6 +665,21 @@ class TestOracleQueryRewriter:
         assert "@>" not in query
         assert "result_metadata IS NOT NULL" in query
         assert "JSON_VALUE(result_metadata, '$.is_parent') = 'true'" in query
+
+    def test_result_metadata_contains_bind_compares_parent_operation_id(self):
+        # Parent/sibling lookup: the generic JSON_EXISTS(col, '$' PASSING :N) rewrite matches no row.
+        from hindsight_api.engine.db.oracle import _rewrite_pg_to_oracle
+
+        query, _, _ = _rewrite_pg_to_oracle(
+            "SELECT 1 FROM async_operations child WHERE result_metadata::jsonb @> $1::jsonb "
+            "AND child.result_metadata::jsonb @> $2::jsonb"
+        )
+        assert "JSON_EXISTS" not in query
+        assert "JSON_VALUE(result_metadata, '$.parent_operation_id') = JSON_VALUE(:1, '$.parent_operation_id')" in query
+        assert (
+            "JSON_VALUE(child.result_metadata, '$.parent_operation_id') = JSON_VALUE(:2, '$.parent_operation_id')"
+            in query
+        )
 
     def test_connect_params_host_port_service(self):
         from hindsight_api.engine.db.oracle import _oracle_connect_params
@@ -1462,3 +1508,57 @@ class TestOracleSessionAndClobBinding:
         assert not _needs_clob_bind("")
         assert not _needs_clob_bind(None)
         assert not _needs_clob_bind(42)
+
+    def test_blob_bind_covers_bytes_past_raw_limit(self):
+        from hindsight_api.engine.db.oracle import _needs_blob_bind
+
+        assert _needs_blob_bind(b"x" * 2001)
+        assert _needs_blob_bind(bytearray(1_000_000))
+        assert not _needs_blob_bind(b"x" * 2000)
+        assert not _needs_blob_bind(bytes(16))  # a UUID bound as RAW(16)
+        assert not _needs_blob_bind("x" * 5000)
+        assert not _needs_blob_bind(None)
+
+    def test_clob_lob_covers_text_past_32k_bytes(self):
+        from hindsight_api.engine.db.oracle import _needs_clob_lob
+
+        assert _needs_clob_lob("x" * 32768)
+        assert _needs_clob_lob("é" * 16384)  # 32 768 bytes in UTF-8
+        assert not _needs_clob_lob("x" * 32767)
+        assert not _needs_clob_lob("é" * 8000)
+        assert not _needs_clob_lob(b"x" * 40000)
+        assert not _needs_clob_lob(None)
+
+    @pytest.mark.asyncio
+    async def test_large_bytes_and_text_bind_as_temporary_lobs(self):
+        # A file past 2000 bytes binds as RAW, and text past 32 767 bytes as LONG even with
+        # a CLOB input size (documents.original_text in MERGE ... USING (SELECT :N ... FROM DUAL));
+        # both fail with ORA-01461 unless bound as a real LOB.
+        import oracledb
+
+        from hindsight_api.engine.db.oracle import OracleConnection
+
+        class FakeLob:
+            def __init__(self, lob_type):
+                self.lob_type = lob_type
+                self.data = None
+
+            async def write(self, data):
+                self.data = data
+
+        class FakeConn:
+            async def createlob(self, lob_type):
+                return FakeLob(lob_type)
+
+        conn = OracleConnection.__new__(OracleConnection)
+        conn._conn = FakeConn()
+        payload = bytes(range(256)) * 20  # 5120 bytes
+        text = "laudo pericial " * 4000  # 60 000 bytes
+        params = {"1": "doc-id", "2": payload, "3": bytes(16), "4": text, "5": "x" * 5000}
+
+        await conn._bind_large_values_as_lobs(params)
+
+        assert params["2"].lob_type == oracledb.DB_TYPE_BLOB and params["2"].data == payload
+        assert params["4"].lob_type == oracledb.DB_TYPE_CLOB and params["4"].data == text
+        assert params["1"] == "doc-id" and params["3"] == bytes(16)  # a UUID stays RAW(16)
+        assert params["5"] == "x" * 5000  # 4 000-32 767 bytes stay a string with a CLOB input size

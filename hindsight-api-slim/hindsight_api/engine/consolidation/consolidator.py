@@ -39,7 +39,7 @@ from ...metrics import get_metrics_collector
 from ...worker.stage import set_stage
 from ..db import DatabaseBackend
 from ..db_utils import acquire_with_retry
-from ..llm_interface import OutputTooLongError, ProviderRateLimitResetError
+from ..llm_interface import OutputTooLongError, PromptCachePrefix, ProviderRateLimitResetError
 from ..llm_trace import (
     record_created_memory_ids,
     record_source_memory_ids,
@@ -1152,6 +1152,7 @@ def _config_for_scope(config: Any, fact_tags: list[str]) -> Any:
 def _build_response_model(
     max_creates: int | None = None,
     *,
+    fact_ids: list[str] | None = None,
     supports_max_items: bool = True,
 ) -> type[_ConsolidationBatchResponse]:
     """Build a response model, optionally constraining creates via JSON schema.
@@ -1160,16 +1161,33 @@ def _build_response_model(
     Schema ``maxItems`` keyword emitted by Pydantic's list ``max_length``. Operators
     can disable the schema hint for those backends; the prompt capacity note and
     post-response truncation still enforce the observation cap.
+
+    ``fact_ids`` pins ``source_fact_ids`` to the batch's fact ids (``enum``, plus
+    ``minItems: 1`` where array-length keywords are accepted). Small models miscopy
+    UUIDs — truncating them or pasting an observation id — and an action citing no
+    batch fact is discarded, so a grammar-constrained provider must not be able to
+    emit one (#5273). Schema only: validation stays ``list[str]``, so a provider that
+    ignores the hint cannot fail the batch.
     """
-    if not supports_max_items or max_creates is None or max_creates < 0:
+    cap = max(max_creates, 0) if supports_max_items and max_creates is not None and max_creates >= 0 else None
+    if cap is None and not fact_ids:
         return _ConsolidationBatchResponse
 
-    from pydantic import Field as PydanticField
+    ids_schema: dict[str, Any] = {}
+    if fact_ids:
+        ids_schema["items"] = {"type": "string", "enum": list(fact_ids)}
+        if supports_max_items:
+            ids_schema["minItems"] = 1
 
-    clamped = max(max_creates, 0)
+    class _Create(_CreateAction):
+        source_fact_ids: list[str] = Field(json_schema_extra=ids_schema)
+
+    class _Update(_UpdateAction):
+        source_fact_ids: list[str] = Field(json_schema_extra=ids_schema)
 
     class _ConstrainedConsolidationBatchResponse(_ConsolidationBatchResponse):
-        creates: list[_CreateAction] = PydanticField(default=[], max_length=clamped)
+        creates: list[_Create] = Field(default=[], max_length=cap)
+        updates: list[_Update] = []
 
     return _ConstrainedConsolidationBatchResponse
 
@@ -1187,6 +1205,7 @@ class ConsolidationPerfLog:
         self.total_obs_in_context: int = 0
         self.total_prompt_chars: int = 0
         self.llm_batch_failures: int = 0
+        self.unresolved_actions: int = 0
 
     def log(self, message: str) -> None:
         """Add a log line."""
@@ -1232,6 +1251,7 @@ class ConsolidationPerfLog:
         self.total_obs_in_context += other.total_obs_in_context
         self.total_prompt_chars += other.total_prompt_chars
         self.llm_batch_failures += other.llm_batch_failures
+        self.unresolved_actions += other.unresolved_actions
 
     def flush(self) -> None:
         """Flush all log lines to the logger."""
@@ -1241,6 +1261,24 @@ class ConsolidationPerfLog:
 
         log_output = header + "\n" + "\n".join(self.lines) + "\n" + footer
         logger.info(log_output)
+
+
+def _log_unresolved_action(kind: str, source_fact_ids: list[str], text: str, perf: ConsolidationPerfLog | None) -> None:
+    """Report a create/update the model wrote but whose ``source_fact_ids`` match no batch fact.
+
+    The action cannot be applied — there is no fact to attach it to — but it is not the
+    model declining the facts either, so it must not vanish into ``no_durable_knowledge``
+    (#5273). The schema's ``enum`` prevents this on grammar-constrained providers; this is
+    what is left for the ones that ignore it.
+    """
+    logger.warning(
+        "[CONSOLIDATION] discarded observation %s: none of its source_fact_ids %s is a fact in this batch; text=%r",
+        kind.upper(),
+        source_fact_ids,
+        text[:200],
+    )
+    if perf:
+        perf.unresolved_actions += 1
 
 
 def _as_dt(v: "datetime | str | None") -> "datetime | None":
@@ -1574,6 +1612,9 @@ async def _run_consolidation_job(
         # a run that discarded every response it got (#4151, #4152). One batch call can
         # contribute several attempts, so this is not bounded by the batch count.
         "llm_batch_failures": 0,
+        # Creates/updates the model wrote whose source_fact_ids matched no fact in their
+        # batch, so they were discarded unapplied (#5273).
+        "unresolved_actions": 0,
     }
 
     # Track all unique tags from consolidated memories for mental model refresh filtering
@@ -2098,6 +2139,12 @@ async def _run_consolidation_job(
             f"reflected in failed_consolidation; see hindsight.consolidation.batch_failures for the "
             f"per-class breakdown."
         )
+    stats["unresolved_actions"] = perf.unresolved_actions
+    if perf.unresolved_actions:
+        perf.log(
+            f"[6] WARNING: {perf.unresolved_actions} observation create/update action(s) cited no fact id from "
+            f"their batch and were discarded; their facts are counted as skipped."
+        )
 
     # Trigger mental-model refreshes once, when the chain has fully drained. On a
     # round-limited round we skip and carry the affected tags forward (above); the
@@ -2442,6 +2489,7 @@ async def _process_memory_batch(
     for update in llm_result.updates:
         source_mems = [mem_by_id[fid] for fid in update.source_fact_ids if fid in mem_by_id]
         if not source_mems:
+            _log_unresolved_action("update", update.source_fact_ids, update.text, perf)
             continue
         # Security: the observation must have been recalled for at least one of the source facts
         if not any(update.observation_id in per_fact_obs_ids.get(str(m["id"]), set()) for m in source_mems):
@@ -2508,6 +2556,7 @@ async def _process_memory_batch(
     for create in llm_result.creates:
         source_mems = [mem_by_id[fid] for fid in create.source_fact_ids if fid in mem_by_id]
         if not source_mems:
+            _log_unresolved_action("create", create.source_fact_ids, create.text, perf)
             continue
         agg = _aggregate_source_fields(source_mems, tags=fact_tags)
         create_source_ids = [m["id"] for m in source_mems]
@@ -2793,9 +2842,19 @@ async def _apply_update_action(
         return None
     live_ids = live_source_memory_ids
 
+    # Recall predates the LLM/embedding work, so the snapshot's tags may be stale (#4831):
+    # merging them would drop tags added since and bring back tags removed since. Merge
+    # into the observation's current tags, held until the caller commits.
+    current_tags = await store.lock_observation_tags(
+        conn=conn, fq_table=fq_table, bank_id=bank_id, observation_id=observation_id
+    )
+    if current_tags is None:
+        logger.debug(f"Update skipped: observation {observation_id} no longer exists")
+        return None
+
     history_entry = _ObservationHistorySnapshot(
         previous_text=model.text,
-        previous_tags=list(model.tags or []),
+        previous_tags=current_tags,
         previous_occurred_start=model.occurred_start,
         previous_occurred_end=model.occurred_end,
         previous_mentioned_at=model.mentioned_at,
@@ -2807,7 +2866,7 @@ async def _apply_update_action(
     source_ids = [uuid.UUID(s) for s in merged]
 
     # SECURITY: Merge source fact's tags into existing observation tags so all contributors can see it
-    existing_tags = set(model.tags or [])
+    existing_tags = set(current_tags)
     source_tags = set(source_fact_tags or [])
     merged_tags = list(existing_tags | source_tags)
 
@@ -3235,24 +3294,15 @@ async def _consolidate_batch_with_llm(
         observation_capacity_note=observation_capacity_note,
     )
 
-    # Opt into context caching of the stable system prefix when the provider
-    # supports it (gemini/vertexai with the flag on). response_schema is NOT
-    # passed to the fingerprint: it varies per batch (max_creates) but is not
-    # part of the cached prefix, so keying on it would needlessly bust the cache.
-    cached_prefix_name: str | None = None
-    provider_impl = getattr(llm_config, "_provider_impl", None)
-    if provider_impl is not None and provider_impl.supports_prompt_caching():
-        try:
-            cached_prefix_name = await provider_impl.get_or_create_cached_prefix(
-                system_instruction=system_prompt,
-            )
-        except Exception:
-            logger.exception("Consolidation cache prefix lookup failed; falling back to uncached call")
-            cached_prefix_name = None
+    # Opt into context caching of the stable system prefix. response_schema is
+    # NOT part of the cache key: it varies per batch (max_creates) but is not part
+    # of the cached prefix, so keying on it would needlessly bust the cache.
+    prompt_cache = PromptCachePrefix(system_instruction=system_prompt)
 
-    # Use a constrained response model when observation limit is active
+    # Constrain the schema: the observation cap on creates, and source_fact_ids to this batch's ids
     response_model = _build_response_model(
         max_creates=remaining_observation_slots,
+        fact_ids=[str(m["id"]) for m in memories],
         supports_max_items=config.llm_supports_max_items,
     )
 
@@ -3287,6 +3337,7 @@ async def _consolidate_batch_with_llm(
                 # structured output -- which narrows the raw-JSON failure mode behind #2668 --
                 # without forcing strict schema on operations whose model can't satisfy it.
                 "strict_schema": config.llm_strict_schema_consolidation,
+                "prompt_cache": prompt_cache,
             }
             # Only request an explicit output budget when configured. Left unset by default the key is
             # omitted, so each provider keeps its implicit default (backwards compatible). Operators on
@@ -3296,8 +3347,6 @@ async def _consolidate_batch_with_llm(
                 call_kwargs["max_completion_tokens"] = config.consolidation_max_completion_tokens
             if inner_max_retries is not None:
                 call_kwargs["max_retries"] = inner_max_retries
-            if cached_prefix_name is not None:
-                call_kwargs["cached_prefix"] = cached_prefix_name
             batch_call = await llm_config.call(**call_kwargs)
             response: _ConsolidationBatchResponse = batch_call.content
             # Defensive truncation: some LLM providers may not enforce JSON schema max_length
@@ -3404,7 +3453,9 @@ async def _apply_create_observation(
     if not live_source_memory_ids:
         logger.debug(f"Create skipped: all {len(source_memory_ids)} source memories were deleted concurrently")
         return {"action": "skipped", "reason": "sources_deleted"}
-    source_memory_ids = live_source_memory_ids
+    # Each source once: the store stores len() of this list as proof_count. It used to
+    # write a literal 1, so a multi-source observation was undercounted until updated (#4955).
+    source_memory_ids = list(dict.fromkeys(live_source_memory_ids))
 
     t0 = time.time()
     created_id = await store.insert_observation(

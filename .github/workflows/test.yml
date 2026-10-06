@@ -302,6 +302,7 @@ jobs:
             - 'hindsight-integrations/roo-code/**'
           dev:
             - 'hindsight-dev/**'
+            - 'scripts/dev/**'
           ci:
             - '.github/**'
 

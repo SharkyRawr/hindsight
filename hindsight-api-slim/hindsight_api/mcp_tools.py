@@ -152,11 +152,17 @@ class MentalModelTriggerInput(BaseModel):
             "Unset means 'all_strict' for a tagged model and 'any' for an untagged one."
         ),
     )
-    tag_groups: list[TagGroup] | None = Field(
+    # Plain JSON objects, not list[TagGroup]: TagGroup nests itself (and/or/not hold
+    # more groups), so its JSON schema is recursive. Some LLM providers reject a
+    # recursive tool schema and fail the whole request, not just this tool (#5013).
+    # validate_tag_groups below still checks the shape, same as recall does.
+    tag_groups: list[dict[str, Any]] | None = Field(
         default=None,
         description=(
-            "Compound boolean tag expressions (nested and/or/not) used during refresh INSTEAD of the model's "
-            "flat tags. When set, the model's own tags are not used for filtering."
+            "Compound boolean tag expressions used during refresh INSTEAD of the model's flat tags. When set, "
+            "the model's own tags are not used for filtering. Each group is a leaf "
+            "{'tags': [...], 'match': 'any'|'all'|'any_strict'|'all_strict'|'exact'} or a compound "
+            "{'and': [groups]}, {'or': [groups]}, {'not': group}, nested to any depth."
         ),
     )
     include_chunks: bool | None = Field(
@@ -225,6 +231,16 @@ class MentalModelTriggerInput(BaseModel):
         if not croniter.is_valid(value):
             raise ValueError(f"refresh_cron is not a valid cron expression: {value!r}")
         return value
+
+    @field_validator("tag_groups")
+    @classmethod
+    def validate_tag_groups(cls, value: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+        if value is None:
+            return None
+        # Round-trip through TagGroup so the engine gets the same canonical dicts the
+        # typed field used to dump (e.g. a 'filters' key comes out as 'and'/'or').
+        groups = _TAG_GROUP_LIST_ADAPTER.validate_python(value)
+        return _TAG_GROUP_LIST_ADAPTER.dump_python(groups, by_alias=True, exclude_unset=True)
 
     @field_validator("fact_types")
     @classmethod
@@ -1257,7 +1273,9 @@ def _register_recall(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
             """
             Args:
                 query: Natural language search query (e.g., "user's food preferences", "what projects is user working on")
-                max_tokens: Maximum tokens to return in results (default: 4096)
+                max_tokens: Token budget for the facts' text (default: 4096). Only each result's
+                    'text' counts; the id, tags, scores and dates sent with every result do not,
+                    so the response is several times larger than this.
                 budget: Search budget - 'low', 'mid', or 'high' (default: 'high'). Higher budgets search more thoroughly.
                 types: Fact types to include (e.g., ['world', 'experience']). Default: all types.
                 prefer_observations: When recalling raw facts together with 'observation', drop any raw fact
@@ -1326,7 +1344,10 @@ def _register_recall(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
 
                 recall_result = await memory.recall_async(**recall_kwargs)
 
-                return recall_result.model_dump_json(indent=2)
+                # Compact, as FastMCP already sends the session-bank copy's dict. This
+                # used indent=2, which was about a fifth of a recall response that
+                # lands whole in the calling agent's context.
+                return recall_result.model_dump_json()
             except OperationValidationError as e:
                 logger.warning(f"Recall rejected: {e}")
                 return json.dumps({"error": str(e), "results": []})
@@ -1355,7 +1376,9 @@ def _register_recall(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig)
             """
             Args:
                 query: Natural language search query (e.g., "user's food preferences", "what projects is user working on")
-                max_tokens: Maximum tokens to return in results (default: 4096)
+                max_tokens: Token budget for the facts' text (default: 4096). Only each result's
+                    'text' counts; the id, tags, scores and dates sent with every result do not,
+                    so the response is several times larger than this.
                 budget: Search budget - 'low', 'mid', or 'high' (default: 'high'). Higher budgets search more thoroughly.
                 types: Fact types to include (e.g., ['world', 'experience']). Default: all types.
                 prefer_observations: When recalling raw facts together with 'observation', drop any raw fact
