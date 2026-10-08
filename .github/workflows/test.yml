@@ -22,7 +22,7 @@ jobs:
       clients-rust: ${{ steps.filter.outputs.clients-rust }}
       clients-go: ${{ steps.filter.outputs.clients-go }}
       control-plane: ${{ steps.filter.outputs.control-plane }}
-      interfig: ${{ steps.filter.outputs.interfig }}
+      figures: ${{ steps.filter.outputs.figures }}
       cli: ${{ steps.filter.outputs.cli }}
       docker: ${{ steps.filter.outputs.docker }}
       helm: ${{ steps.filter.outputs.helm }}
@@ -140,9 +140,11 @@ jobs:
             # Same reason as clients-rust above: the CLI compiles against the
             # progenitor-generated client, so an OpenAPI change alone can break it.
             - 'hindsight-docs/static/openapi.json'
-          interfig:
-            - 'hindsight-interfig/**'
+          figures:
+            - 'hindsight-docs/figures/**'
             - 'scripts/docs_skill_figures.py'
+            # The Giotto pin lives here: a new Giotto can stop a figure from drawing.
+            - 'hindsight-docs/package.json'
           docker:
             - 'docker/**'
           helm:
@@ -1549,9 +1551,9 @@ jobs:
           exit 1
         fi
 
-  test-interfig:
+  test-figures:
     needs: [detect-changes]
-    if: needs.detect-changes.outputs.interfig == 'true'
+    if: needs.detect-changes.outputs.figures == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -1560,25 +1562,20 @@ jobs:
       with:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
-    # Node 22 runs the .ts tests directly (type stripping); the docs build compiles the figures themselves.
     - name: Set up Node.js
       uses: actions/setup-node@v6
       with:
         node-version: '22'
-        cache: 'npm'
-        cache-dependency-path: package-lock.json
 
-    - name: Install dependencies
-      run: npm ci --workspace=@vectorize-io/interfig
-
-    - name: Typecheck (library and figures)
-      run: npm run typecheck --workspace=@vectorize-io/interfig
-
-    - name: Check formatting
-      run: npm run format:check --workspace=@vectorize-io/interfig
-
-    - name: Test
-      run: npm test --workspace=@vectorize-io/interfig
+    # The docs figures are Giotto diagrams; export each one with the Giotto the docs pin, so a
+    # figure that no longer draws fails here instead of in the browser.
+    - name: Export every figure
+      run: |
+        PIN=$(node -p "require('./hindsight-docs/package.json').dependencies.giotto")
+        for f in hindsight-docs/figures/*.json; do
+          echo "$f"
+          npx --yes --package "$PIN" giotto export "$f" /tmp/figure.svg
+        done
 
     # The docs skill turns each figure into its narration by reading the figure files.
     - name: Check every figure renders as text for the docs skill
@@ -2024,6 +2021,31 @@ jobs:
       # pytest-split filters at collection (before xdist takes over), so it
       # composes cleanly with the `-n 8 --dist loadgroup` baked into addopts.
       run: uv run --with pytest-split pytest tests -v -m "not hs_llm_mat and not hs_llm_core" --splits 3 --group ${{ matrix.shard }}
+
+    # The eight workers share one embedded Postgres, so this job's two recurring
+    # red shapes are both lock contention: `deadlock detected`, whose own message
+    # ends "See server log for query details", and a pile of unrelated tests all
+    # failing `Timeout (>300.0s)` in the same second behind one AccessExclusiveLock.
+    # Neither is diagnosable from the pytest output alone, and the server log used
+    # to die with the runner — which is why this class has been re-diagnosed by
+    # inference in #3406, #3543, #4407 and #4414. Keep the log instead.
+    # Copied into the workspace first: `upload-artifact` globs but does not expand
+    # `~`, so pointing it at the pg0 instance dir uploads nothing.
+    - name: Collect Postgres server log
+      if: failure()
+      run: |
+        mkdir -p pg-server-log
+        cp -r ~/.pg0/instances/*/data/log/. pg-server-log/ 2>/dev/null || true
+        ls -la pg-server-log/ || true
+
+    - name: Upload Postgres server log on failure
+      if: failure()
+      uses: actions/upload-artifact@v7
+      with:
+        name: pg-server-log-shard-${{ matrix.shard }}
+        path: pg-server-log/
+        if-no-files-found: warn
+        retention-days: 7
 
   test-api-llm-core:
     needs: [detect-changes]
@@ -5804,7 +5826,7 @@ jobs:
       - test-google-adk-integration
       - test-roo-code-integration
       - build-control-plane
-      - test-interfig
+      - test-figures
       - build-docs
       - test-rust-cli
       - lint-helm-chart
