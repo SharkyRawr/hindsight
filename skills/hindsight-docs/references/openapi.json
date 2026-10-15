@@ -10,7 +10,7 @@
       "name": "Apache 2.0",
       "url": "https://www.apache.org/licenses/LICENSE-2.0.html"
     },
-    "version": "0.10.3"
+    "version": "1.0.0"
   },
   "paths": {
     "/health": {
@@ -19547,6 +19547,17 @@
           "id": {
             "type": "string",
             "title": "Id"
+          },
+          "event_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Event Id"
           },
           "webhook_id": {
             "anyOf": [
