@@ -1016,12 +1016,17 @@ impl ApiClient {
         &self,
         bank_id: &str,
         mental_model_id: &str,
+        full: bool,
         _verbose: bool,
     ) -> Result<types::AsyncOperationSubmitResponse> {
+        // `full` forces a one-off full refresh; the model's stored mode is untouched.
+        let body = types::RefreshMentalModelRequest {
+            mode: full.then(|| "full".to_string()),
+        };
         self.runtime.block_on(async {
             let response = self
                 .client
-                .refresh_mental_model(bank_id, mental_model_id, None)
+                .refresh_mental_model(bank_id, mental_model_id, None, &body)
                 .humanized()
                 .await?;
             Ok(response.into_inner())
@@ -1599,10 +1604,16 @@ impl ApiClient {
         bank_id: &str,
         document_id: &str,
         tags: Option<Vec<String>>,
+        observation_scopes: Option<serde_json::Value>,
         _verbose: bool,
     ) -> Result<types::UpdateDocumentResponse> {
         self.runtime.block_on(async {
-            let request = types::UpdateDocumentRequest { tags };
+            // Through serde so the CLI does not depend on the generated union's variant names.
+            let request: types::UpdateDocumentRequest =
+                serde_json::from_value(serde_json::json!({
+                    "tags": tags,
+                    "observation_scopes": observation_scopes,
+                }))?;
             let response = self
                 .client
                 .update_document(bank_id, document_id, None, &request)

@@ -51,6 +51,7 @@ jobs:
       integrations-copilot-cli: ${{ steps.filter.outputs.integrations-copilot-cli }}
       extensions-supabase-tenant: ${{ steps.filter.outputs.extensions-supabase-tenant }}
       extensions-static-keys-tenant: ${{ steps.filter.outputs.extensions-static-keys-tenant }}
+      extensions-bank-llm-routing: ${{ steps.filter.outputs.extensions-bank-llm-routing }}
       integrations-crewai: ${{ steps.filter.outputs.integrations-crewai }}
       integrations-litellm: ${{ steps.filter.outputs.integrations-litellm }}
       integrations-pydantic-ai: ${{ steps.filter.outputs.integrations-pydantic-ai }}
@@ -217,6 +218,8 @@ jobs:
             - 'hindsight-extensions/supabase-tenant/**'
           extensions-static-keys-tenant:
             - 'hindsight-extensions/static-keys-tenant/**'
+          extensions-bank-llm-routing:
+            - 'hindsight-extensions/bank-llm-routing/**'
           integrations-crewai:
             - 'hindsight-integrations/crewai/**'
           integrations-litellm:
@@ -1757,6 +1760,35 @@ jobs:
 
     - name: Lint Helm chart
       run: helm lint helm/hindsight
+
+    # Default values leave extraObjects empty, so render both entry forms
+    # (map and templated string) to prove they reach the output.
+    - name: Render extraObjects
+      run: |
+        out=$(helm template rel helm/hindsight -s templates/extra-objects.yaml --set-json 'extraObjects=[
+          {"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"{{ include \"hindsight.fullname\" . }}-map"}},
+          "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {{ include \"hindsight.fullname\" . }}-str\ndata:\n  port: \"{{ .Values.api.service.port }}\""
+        ]')
+        echo "$out"
+        grep -q "name: 'rel-hindsight-map'" <<<"$out"
+        grep -q "name: rel-hindsight-str" <<<"$out"
+        grep -q 'port: "8888"' <<<"$out"
+
+    - name: Render revisionHistoryLimit and Gateway API
+      run: |
+        # Unset by default: Kubernetes keeps its own default.
+        if helm template rel helm/hindsight | grep -q revisionHistoryLimit; then exit 1; fi
+        # The component value (0 included) wins over the global one.
+        out=$(helm template rel helm/hindsight --set revisionHistoryLimit=5 --set api.revisionHistoryLimit=0 -s templates/api-deployment.yaml -s templates/controlplane-deployment.yaml)
+        grep -q 'revisionHistoryLimit: 0' <<<"$out"
+        grep -q 'revisionHistoryLimit: 5' <<<"$out"
+        out=$(helm template rel helm/hindsight -s templates/httproute.yaml --set gatewayApi.enabled=true --set-json 'gatewayApi.parentRefs=[{"name":"gw","namespace":"gwapi"}]')
+        echo "$out"
+        grep -q 'kind: HTTPRoute' <<<"$out"
+        grep -q 'name: rel-hindsight-api' <<<"$out"
+        grep -q 'name: rel-hindsight-control-plane' <<<"$out"
+        # Enabled without a Gateway to attach to is a render error.
+        if helm template rel helm/hindsight --set gatewayApi.enabled=true >/dev/null 2>&1; then exit 1; fi
 
   test-standalone-start-script:
     needs: [detect-changes]
@@ -3583,6 +3615,7 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.system-tests == 'true' ||
+      needs.detect-changes.outputs.extensions-bank-llm-routing == 'true' ||
       needs.detect-changes.outputs.ci == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -4127,6 +4160,47 @@ jobs:
           -f hindsight-extensions/static-keys-tenant/Dockerfile \
           --build-arg HINDSIGHT_IMAGE=ghcr.io/vectorize-io/hindsight:latest-slim \
           -t hindsight-with-static-keys .
+
+  test-extension-bank-llm-routing:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.extensions-bank-llm-routing == 'true' ||
+      needs.detect-changes.outputs.core == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+      with:
+        enable-cache: true
+        prune-cache: false
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version-file: ".python-version"
+
+    # No --frozen: the lock is not checked in, because tool.uv.sources resolves
+    # hindsight-api-slim from the local checkout and its dependency tree moves
+    # with core.
+    - name: Install dependencies
+      working-directory: ./hindsight-extensions/bank-llm-routing
+      run: uv sync
+
+    - name: Run tests
+      working-directory: ./hindsight-extensions/bank-llm-routing
+      run: uv run pytest tests -v
+
+    # No image build yet: the Dockerfile builds on the published image, which predates
+    # the LLM_REQUEST slot, so its import check cannot pass until the next release.
+    # ponytail: add the `docker build` step from test-extension-static-keys-tenant once a release ships the slot.
 
   test-crewai-integration:
     needs: [detect-changes]
@@ -5813,6 +5887,7 @@ jobs:
       - test-agent-framework-integration
       - test-extension-supabase-tenant
       - test-extension-static-keys-tenant
+      - test-extension-bank-llm-routing
       - test-crewai-integration
       - test-langgraph-integration
       - test-superagent-integration

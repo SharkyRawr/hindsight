@@ -6,6 +6,7 @@ the FastAPI application with all API endpoints.
 """
 
 import asyncio
+import gc
 import json
 import logging
 import os
@@ -62,7 +63,16 @@ if TYPE_CHECKING:
     from opentelemetry.trace import Span
 
 from fastapi.routing import APIRoute
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from hindsight_api import MemoryEngine
 from hindsight_api.config import RETAIN_EXTRACTION_MODES
@@ -261,24 +271,31 @@ _TAG_GROUPS_QUERY_DESCRIPTION = (
 )
 
 
-def _parse_tag_groups_query(raw: str | None, tags: list[str] | None) -> list[TagGroup] | None:
-    """Parse a ``tag_groups`` query parameter.
+def _decode_tag_groups_query(raw: str | None) -> list[TagGroup] | None:
+    """Decode a ``tag_groups`` query parameter — the one parser every GET route uses.
 
     A GET cannot carry a body, so the tree that recall takes as JSON arrives as a
-    JSON-encoded string. Invalid JSON or an invalid tree is a 400, and so is sending it
-    alongside ``tags`` — the same rule recall enforces on its body.
+    JSON-encoded string. Absent or blank is no filter; invalid JSON or an invalid tree
+    is a 400.
     """
-    if raw is None:
+    if raw is None or not raw.strip():
         return None
-    if tags:
-        raise HTTPException(
-            status_code=400,
-            detail="'tags' and 'tag_groups' are mutually exclusive. Use 'tag_groups' for compound filtering.",
-        )
     try:
         return _TAG_GROUPS_ADAPTER.validate_json(raw)
     except ValidationError as e:
         raise HTTPException(status_code=400, detail=f"Invalid tag_groups: {e.errors(include_url=False)}")
+
+
+def _parse_tag_groups_query(raw: str | None, tags: list[str] | None) -> list[TagGroup] | None:
+    """:func:`_decode_tag_groups_query`, refusing ``tags`` alongside it (400) — the same
+    rule recall enforces on its body."""
+    groups = _decode_tag_groups_query(raw)
+    if groups is not None and tags:
+        raise HTTPException(
+            status_code=400,
+            detail="'tags' and 'tag_groups' are mutually exclusive. Use 'tag_groups' for compound filtering.",
+        )
+    return groups
 
 
 from hindsight_api.engine.structured_output import validate_response_schema
@@ -299,6 +316,10 @@ logger = logging.getLogger(__name__)
 def _internal_error(exc: Exception, where: str) -> HTTPException:
     """Log an unhandled handler exception with its traceback, and map it to a 500.
 
+    Two exceptions keep their own status instead: a validator rejection (the
+    validator's code — routes that forgot to catch it used to answer 500, #5448)
+    and a store that shed the request (503).
+
     Every route's catch-all used to do this inline — 72 byte-identical copies of
     the same four lines, plus seven near-copies that logged the traceback without
     the message. The duplication is why the policy had already drifted: what gets
@@ -313,6 +334,8 @@ def _internal_error(exc: Exception, where: str) -> HTTPException:
     ``raise _internal_error(e, ...)`` and keep the ``raise`` visible at the
     handler instead of hidden behind a call.
     """
+    if isinstance(exc, OperationValidationError):
+        return HTTPException(status_code=exc.status_code, detail=exc.reason)
     unavailable = _store_unavailable(exc)
     if unavailable is not None:
         logger.warning(f"Store unavailable in {where}, answering 503: {exc}")
@@ -413,10 +436,19 @@ async def run_cancellable_on_disconnect(
     lives in ``ClientDisconnectCancellationMiddleware`` (a pure-ASGI middleware
     installed outside the ``BaseHTTPMiddleware`` layer), which attaches a
     :class:`CancellationToken` to the ASGI scope and trips it on
-    ``http.disconnect``. Here we simply hand that token to the engine via
-    ``RequestContext`` — the engine checks it at stage/iteration boundaries — and
-    translate the resulting ``OperationCancelledError`` into 499 so abandoned
-    work stops instead of running to completion (issue #2122).
+    ``http.disconnect`` (issue #2122).
+
+    The token stops the work two ways, because each covers what the other cannot:
+
+    - It is handed to the engine via ``RequestContext``, which checks it at
+      stage/iteration boundaries. That stops work running in worker threads
+      (recall's graph expansion and reranking), which task cancellation cannot
+      interrupt.
+    - The coroutine runs as a task that is cancelled outright when the token
+      fires. That stops work parked on a single await, which never reaches a
+      checkpoint: an abandoned reflect sat in its closing ``done`` call and the
+      provider's retries, then the standalone fallback and its retries, for ~270s
+      until the wall timeout (issue #5128).
 
     Note: ``Request.is_disconnected()`` is deliberately NOT used — it silently
     never fires behind ``BaseHTTPMiddleware``, which is why the original #2127
@@ -426,7 +458,7 @@ async def run_cancellable_on_disconnect(
     if token is not None:
         request_context.cancellation = token
     try:
-        return await coro
+        return await run_task_cancellable_on_disconnect(http_request, coro, operation=operation, bank_id=bank_id)
     except OperationCancelledError as e:
         logger.info(f"[{operation.upper()} CANCELLED] bank={bank_id} reason={e.reason}")
         raise HTTPException(status_code=_CLIENT_CLOSED_REQUEST_STATUS_CODE, detail=e.reason) from e
@@ -441,9 +473,8 @@ async def run_task_cancellable_on_disconnect(
 ) -> _T:
     """Run a coroutine as a task and cancel it outright if the client disconnects.
 
-    The cooperative variant above is the right shape for recall and reflect, whose
-    expensive stages run in worker threads that task cancellation cannot interrupt.
-    A synchronous retain is the opposite shape: almost all of its wall time is spent
+    Used directly by sync retain, and under the cooperative variant above by recall
+    and reflect. A synchronous retain is the clearest case: almost all of its wall time is spent
     *awaiting* — queued on the LLM concurrency semaphore, then on the provider's
     response — so a checkpoint between stages never gets a turn, and only real task
     cancellation unblocks it. An abandoned sync retain measured 1880s, holding an LLM
@@ -545,14 +576,14 @@ class RecallRequest(BaseModel):
         default=None,
         description="List of fact types to recall: 'world', 'experience', 'observation'. Defaults to all fact types if not specified.",
     )
-    prefer_observations: bool = Field(
-        default=False,
+    prefer_observations: bool | None = Field(
+        default=None,
         description=(
             "When recalling raw facts ('world'/'experience') together with 'observation', drop any raw "
             "fact that an observation in the results was consolidated from, so the observation supersedes "
             "it and you don't get duplicate content. The freed slots are backfilled with the next results, "
-            "keeping the result count at the requested budget. Disabled by default; set to true to enable. "
-            "No effect unless 'observation' and at least one raw type are both requested."
+            "keeping the result count at the requested budget. When omitted, uses the bank/global "
+            "recall_prefer_observations config (false unless configured). No effect unless 'observation' and at least one raw type are both requested."
         ),
     )
     budget: Budget = Budget.MID
@@ -1844,7 +1875,7 @@ class CreateBankAliasRequest(BaseModel):
     alias: str = Field(
         description=(
             "The extra bank id. Same rules as a bank id (non-empty, at most 192 bytes of UTF-8, no "
-            "control characters), and it must not already name a bank or another alias."
+            "control characters, no leading underscore), and it must not already name a bank or another alias."
         )
     )
     primary: bool = Field(
@@ -2636,6 +2667,10 @@ class DocumentListItem(OpenRowModel):
     retain_params: dict[str, Any] | None = Field(default=None, description="Parameters used during retain")
     document_metadata: dict[str, Any] | None = Field(default=None, description="Document metadata")
     tags: list[str] = FieldWithDefault(list, description="Tags associated with this document")
+    matched_fields: list[Literal["id", "original_text"]] = FieldWithDefault(
+        list,
+        description="Which fields matched the `q` search: 'id', 'original_text', or both. Empty when no `q` is given.",
+    )
 
 
 class ListDocumentsResponse(BaseModel):
@@ -2667,6 +2702,13 @@ class ListDocumentsResponse(BaseModel):
     total: int
     limit: int
     offset: int
+    total_is_estimate: bool = Field(
+        default=False,
+        description=(
+            "True when a `q` search stopped at its match cap, so `total` is a lower bound rather than an "
+            "exact count. Always false without `q`."
+        ),
+    )
 
 
 class TagItem(BaseModel):
@@ -2765,6 +2807,15 @@ class UpdateDocumentRequest(BaseModel):
         description="The complete new set of tags for the document and its memory units — this "
         "REPLACES the existing tags rather than adding to them, so omitting a tag drops it and "
         "`[]` clears them all. Triggers observation invalidation and re-consolidation.",
+    )
+    observation_scopes: Literal["per_tag", "combined", "all_combinations", "shared"] | list[list[str]] | None = Field(
+        default=None,
+        title="UpdateDocumentObservationScopes",
+        description="New observation scoping for the document's memories, with the same values retain "
+        "accepts (send 'combined' to return to the default). Use it to move memories retained under one "
+        "scoping to another — e.g. per-session documents to 'shared' — without re-extracting them. "
+        "Memories whose resolved scopes change lose their observations and are re-consolidated; the rest "
+        "keep theirs. Also becomes the scoping a later reprocess of the document uses.",
     )
 
 
@@ -3243,6 +3294,19 @@ class MentalModelTrigger(BaseModel):
             "wasted LLM call. null = no schedule."
         ),
     )
+    full_refresh_cron: str | None = Field(
+        default=None,
+        description=(
+            "Cron expression (UTC, standard 5-field syntax, e.g. '0 3 * * 0' for Sundays at 03:00 UTC) "
+            "for a scheduled full refresh: on this schedule the model is refreshed in 'full' mode "
+            "whatever its `mode` says, regenerating the content from scratch to clear the drift many "
+            "delta edits accumulate. Independent of `refresh_cron` and `refresh_after_consolidation` — "
+            "a delta model can refresh after consolidation and still get a weekly full refresh — and it "
+            "does not change `mode`. A tick is skipped when no refresh has run since the last full one "
+            "(there is nothing to correct). Like `refresh_cron`, it honours "
+            "`min_refresh_interval_seconds` and pauses while the last refresh failed. null = no schedule."
+        ),
+    )
     min_refresh_interval_seconds: int | None = Field(
         default=None,
         ge=0,
@@ -3250,8 +3314,8 @@ class MentalModelTrigger(BaseModel):
             "Minimum seconds between two automatic refreshes of this mental model. A triggered "
             "refresh that arrives sooner is not dropped: it is queued and parked until the window "
             "expires, and every further trigger in the meantime folds into that one queued refresh, "
-            "so a burst of retains costs one refresh instead of one per retain. Applies to both "
-            "refresh_after_consolidation and refresh_cron. Explicit refreshes (API, MCP, control "
+            "so a burst of retains costs one refresh instead of one per retain. Applies to every "
+            "automatic trigger: refresh_after_consolidation, refresh_cron and full_refresh_cron. Explicit refreshes (API, MCP, control "
             "plane) ignore it and run immediately. 0 disables the floor for this model; null falls "
             "back to the bank/global mental_model_min_refresh_interval_seconds setting (itself 0 by "
             "default, i.e. no floor)."
@@ -3380,9 +3444,9 @@ class MentalModelTrigger(BaseModel):
             validate_response_schema(v)
         return v
 
-    @field_validator("refresh_cron")
+    @field_validator("refresh_cron", "full_refresh_cron")
     @classmethod
-    def validate_refresh_cron(cls, v: str | None) -> str | None:
+    def validate_refresh_cron(cls, v: str | None, info: ValidationInfo) -> str | None:
         if v is None:
             return v
         v = v.strip()
@@ -3391,7 +3455,7 @@ class MentalModelTrigger(BaseModel):
         from croniter import croniter
 
         if not croniter.is_valid(v):
-            raise ValueError(f"refresh_cron is not a valid cron expression: {v!r}")
+            raise ValueError(f"{info.field_name} is not a valid cron expression: {v!r}")
         return v
 
     @model_validator(mode="after")
@@ -3404,6 +3468,18 @@ class MentalModelTrigger(BaseModel):
                 "a mental model refreshes either after consolidation or on a cron schedule, not both."
             )
         return self
+
+
+class RefreshMentalModelRequest(BaseModel):
+    """Optional body of POST /mental-models/{id}/refresh."""
+
+    mode: Literal["full"] | None = Field(
+        default=None,
+        description=(
+            "'full' regenerates the content from scratch for this refresh only, whatever "
+            "`trigger.mode` says; the stored trigger is not changed. null runs the model's own mode."
+        ),
+    )
 
 
 class MentalModelResponse(BaseModel):
@@ -3445,9 +3521,19 @@ class MentalModelResponse(BaseModel):
         description=(
             "When this model's most recent refresh failed, in ISO format, or null when the last one "
             "succeeded. While this is set the automatic triggers (`refresh_after_consolidation`, "
-            "`refresh_cron`) skip the model — a refresh that cannot succeed is not retried on every "
+            "`refresh_cron`, `full_refresh_cron`) skip the model — a refresh that cannot succeed is not retried on every "
             "tick. An explicit refresh still runs, and a successful one clears this. The failure "
             "itself, with its reason, is in the model's history."
+        ),
+    )
+    last_full_refreshed_at: str | None = Field(
+        default=None,
+        description=(
+            "When a refresh last ran in full mode for this model, in ISO format — requested "
+            "(`mode: 'full'`, a `full_refresh_cron` tick, a full-mode model) or fallen back to by "
+            "a delta refresh. `trigger.full_refresh_cron` comes due against this, not "
+            "`last_refreshed_at`, which every delta refresh moves. Null when no full refresh has "
+            "completed since this was first tracked."
         ),
     )
     created_at: str | None = None
@@ -3515,7 +3601,8 @@ class KnowledgeNode(BaseModel):
     trigger: MentalModelTrigger | None = Field(
         default=None,
         description="Pages only: the page's refresh settings — when it rebuilds itself "
-        "(`refresh_after_consolidation` or `refresh_cron`), in which mode, and over which facts. "
+        "(`refresh_after_consolidation` or `refresh_cron`, plus any `full_refresh_cron`), in which mode, "
+        "and over which facts. "
         "This is the EFFECTIVE policy: a setting the page never stored is reported at its default, "
         "so compare the fields you care about rather than the whole object against a patch you "
         "sent. Absent on folders, which have no backing mental model, and on a page with no "
@@ -3707,15 +3794,10 @@ def _knowledge_tag_filter(
         "Top-level groups are AND-ed, and AND-ed with `tags`.",
     ),
 ) -> KnowledgeTagFilter:
-    """Query-string tag filter shared by the knowledge-base tree and search."""
-    try:
-        groups = _TAG_GROUPS_ADAPTER.validate_json(tag_groups) if tag_groups else None
-    except ValidationError as e:
-        raise HTTPException(status_code=422, detail=f"Invalid tag_groups: {e}")
+    """Query-string tag filter shared by the knowledge-base tree and search. Unlike the
+    entity routes, ``tags`` and ``tag_groups`` may be combined here (AND-ed)."""
+    groups = _decode_tag_groups_query(tag_groups)
     return KnowledgeTagFilter(tags=tags or None, tags_match=tags_match, tag_groups=groups)
-
-
-_TAG_GROUPS_ADAPTER: TypeAdapter[list[TagGroup]] = TypeAdapter(list[TagGroup])
 
 
 def _build_knowledge_tree(nodes: list[dict[str, Any]]) -> list[KnowledgeNode]:
@@ -3866,6 +3948,13 @@ class BankTemplateConfig(BaseModel):
         default=None, description="Toggle the entity/link graph arm during recall"
     )
     enable_reranking: bool | None = Field(default=None, description="Toggle cross-encoder reranking during recall")
+    reflect_use_decision_model: bool | None = Field(
+        default=None,
+        description="When the server has a decision model, reflect lets it prune evidence and decide when to stop",
+    )
+    mental_model_refresh_use_decision_model: bool | None = Field(
+        default=None, description="The same, for knowledge-page refreshes"
+    )
     disposition_skepticism: int | None = Field(default=None, ge=1, le=5, description="Skepticism trait (1-5)")
     disposition_literalism: int | None = Field(default=None, ge=1, le=5, description="Literalism trait (1-5)")
     disposition_empathy: int | None = Field(default=None, ge=1, le=5, description="Empathy trait (1-5)")
@@ -3999,6 +4088,11 @@ class BankTemplateConfig(BaseModel):
     enable_auto_consolidation: bool | None = Field(
         default=None, description="Automatically consolidate observations after retain"
     )
+    consolidation_use_decision_model: bool | None = Field(
+        default=None,
+        description="When the server has a decision model, consolidation lets it settle restatements, new "
+        "facets and chatter before the LLM call",
+    )
     consolidation_max_memories_per_round: int | None = Field(
         default=None, description="Max memory units fed into a single consolidation round"
     )
@@ -4006,6 +4100,9 @@ class BankTemplateConfig(BaseModel):
         default=None, description="Number of consolidation LLM batches processed concurrently"
     )
     recall_include_chunks: bool | None = Field(default=None, description="Include raw chunks in recall results")
+    recall_prefer_observations: bool | None = Field(
+        default=None, description="Default for recall prefer_observations when the request omits it"
+    )
     recall_max_tokens: int | None = Field(default=None, description="Max tokens of results returned by recall")
     recall_chunks_max_tokens: int | None = Field(
         default=None, description="Max tokens of raw chunks returned by recall (when recall_include_chunks is set)"
@@ -5163,6 +5260,12 @@ def create_app(
         if initialize_memory:
             await memory.initialize()
             logging.info("Memory system initialized")
+            # Startup leaves ~800k long-lived objects (models, config, pools). Left
+            # tracked, every full GC pass walks them all, which turns a request that
+            # allocates heavily (a 1000-memory graph read) into 2-3x its real cost.
+            # Freezing moves them out of the collector's view; they live forever anyway.
+            gc.collect()
+            gc.freeze()
 
             # Set up DB pool metrics after memory initialization
             metrics_collector = get_metrics_collector()
@@ -5475,7 +5578,7 @@ def _register_routes(app: FastAPI):
         operator opts in.
         """
         # Dependency-resolution start, read by api_recall to split `http_to_handler`.
-        request.scope.setdefault("hs_deps_t0", time.time())
+        request.scope.setdefault("hs_deps_t0", time.perf_counter())
         api_key = None
         if authorization:
             if authorization.lower().startswith("bearer "):
@@ -5593,9 +5696,9 @@ def _register_routes(app: FastAPI):
                 return
             from hindsight_api.extensions import PrecheckContext
 
-            _t0_dep_auth = time.time()
+            _t0_dep_auth = time.perf_counter()
             await app.state.memory._authenticate_tenant(request_context)
-            get_metrics_collector().record_recall_phase("dep_auth", time.time() - _t0_dep_auth)
+            get_metrics_collector().record_recall_phase("dep_auth", time.perf_counter() - _t0_dep_auth)
             cl_header = request.headers.get("content-length")
             content_length: int | None = None
             if cl_header is not None:
@@ -5611,16 +5714,16 @@ def _register_routes(app: FastAPI):
                 request_context=request_context,
                 content_length=content_length,
             )
-            _t0_dep_precheck = time.time()
+            _t0_dep_precheck = time.perf_counter()
             result = await validator.precheck(ctx)
-            get_metrics_collector().record_recall_phase("dep_precheck", time.time() - _t0_dep_precheck)
+            get_metrics_collector().record_recall_phase("dep_precheck", time.perf_counter() - _t0_dep_precheck)
             if not result.allowed:
                 raise HTTPException(
                     status_code=result.status_code,
                     detail=result.reason or "Operation not allowed",
                 )
 
-            request.scope["hs_deps_done"] = time.time()
+            request.scope["hs_deps_done"] = time.perf_counter()
 
         return _precheck_dep
 
@@ -5783,29 +5886,42 @@ def _register_routes(app: FastAPI):
         responses=_BANK_NOT_FOUND_RESPONSES,
     )
     async def api_graph(
+        http_request: Request,
         bank_id: str,
         type: str | None = None,
         limit: int = Query(default=1000, ge=0),
         q: str | None = None,
         tags: list[str] | None = Query(None),
-        tags_match: str = "all_strict",
+        tags_match: TagsMatch = "all_strict",
         document_id: str | None = None,
         chunk_id: str | None = None,
         request_context: RequestContext = Depends(get_request_context),
     ):
         """Get graph data from database, filtered by bank_id and optionally by type."""
         try:
-            data = await app.state.memory.get_graph_data(
-                bank_id,
-                type,
-                limit=limit,
-                q=q,
-                tags=tags,
-                tags_match=tags_match,
-                document_id=document_id,
-                chunk_id=chunk_id,
-                request_context=request_context,
+            # The control plane cancels this read whenever the user switches tab; on a
+            # big bank it is seconds of work and a multi-MB answer, and left running it
+            # competes with the read the user switched to.
+            data = await run_task_cancellable_on_disconnect(
+                http_request,
+                app.state.memory.get_graph_data(
+                    bank_id,
+                    type,
+                    limit=limit,
+                    q=q,
+                    tags=tags,
+                    tags_match=tags_match,
+                    document_id=document_id,
+                    chunk_id=chunk_id,
+                    request_context=request_context,
+                ),
+                operation="graph",
+                bank_id=bank_id,
             )
+            # Built, but the client left while it was: skip serializing it.
+            token = get_scope_cancellation_token(http_request.scope)
+            if token is not None and token.cancelled:
+                raise HTTPException(status_code=_CLIENT_CLOSED_REQUEST_STATUS_CODE, detail=token.reason)
             return data
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
@@ -6189,26 +6305,26 @@ def _register_routes(app: FastAPI):
         """Run a recall and return results with trace."""
         import time
 
-        handler_start = time.time()
+        handler_start = time.perf_counter()
         metrics = get_metrics_collector()
         # Everything before this line — routing, body parsing, dependency resolution (auth among
         # them) — is outside every timer the endpoint sets, so `pre=` cannot see it and a cost
         # there reads as unattributed request time.
         _asgi_t0 = http_request.scope.get("hs_asgi_t0")
-        if _asgi_t0:
-            metrics.record_recall_phase("http_to_handler", max(0.0, handler_start - _asgi_t0))
+        if _asgi_t0 is not None:
+            metrics.record_recall_phase("http_to_handler", handler_start - _asgi_t0)
             # Split it: middleware+routing, dependency resolution, then body read + validation.
             # `http_to_handler` was a third of a recall with only its auth call timed, so the rest
             # of it — Starlette routing, the two dependencies, and reading the request body off the
             # socket — was a single opaque block.
             _deps_t0 = http_request.scope.get("hs_deps_t0")
             _deps_done = http_request.scope.get("hs_deps_done")
-            if _deps_t0:
-                metrics.record_recall_phase("mw_and_routing", max(0.0, _deps_t0 - _asgi_t0))
-            if _deps_t0 and _deps_done:
-                metrics.record_recall_phase("deps_total", max(0.0, _deps_done - _deps_t0))
-            if _deps_done:
-                metrics.record_recall_phase("body_parse", max(0.0, handler_start - _deps_done))
+            if _deps_t0 is not None:
+                metrics.record_recall_phase("mw_and_routing", _deps_t0 - _asgi_t0)
+            if _deps_t0 is not None and _deps_done is not None:
+                metrics.record_recall_phase("deps_total", _deps_done - _deps_t0)
+            if _deps_done is not None:
+                metrics.record_recall_phase("body_parse", handler_start - _deps_done)
 
         try:
             # Default to all fact types if not specified
@@ -6240,12 +6356,12 @@ def _register_routes(app: FastAPI):
                 request.include.source_facts.max_tokens_per_observation if include_source_facts else -1
             )
 
-            pre_recall = time.time() - handler_start
+            pre_recall = time.perf_counter() - handler_start
             # Run recall with tracing (record metrics)
             with metrics.record_operation(
                 "recall", bank_id=bank_id, source="api", budget=request.budget.value, max_tokens=request.max_tokens
             ):
-                recall_start = time.time()
+                recall_start = time.perf_counter()
                 # Cancel the recall if the client disconnects: the engine checks
                 # request_context at each stage boundary and aborts abandoned
                 # work rather than running it to completion (issue #2122).
@@ -6278,7 +6394,7 @@ def _register_routes(app: FastAPI):
                     operation="recall",
                     bank_id=bank_id,
                 )
-                engine_done = time.time()
+                engine_done = time.perf_counter()
                 metrics.record_recall_phase("engine_call", engine_done - recall_start, diagnostic=True)
 
             # Convert core MemoryFact objects to API RecallResult objects (excluding internal metrics)
@@ -6366,12 +6482,12 @@ def _register_routes(app: FastAPI):
                 source_facts_truncated=core_result.source_facts_truncated,
             )
 
-            handler_duration = time.time() - handler_start
+            handler_duration = time.perf_counter() - handler_start
             # END OF THE ENGINE CALL, not end of handler. Measured at the end, this window also
             # covered response building, and `post_recall` — computed as the remainder — was then
             # ~0 by construction. That made a slow response-assembly path unreadable: the line
             # said pre=0 post=0 and put every millisecond into `recall`, whatever spent it.
-            metrics.record_recall_phase("post_engine", max(0.0, time.time() - engine_done))
+            metrics.record_recall_phase("post_engine", max(0.0, time.perf_counter() - engine_done))
             recall_duration = engine_done - recall_start
             post_recall = handler_duration - pre_recall - recall_duration
             if handler_duration > 1.0:
@@ -6389,7 +6505,7 @@ def _register_routes(app: FastAPI):
         except (AuthenticationError, HTTPException):
             raise
         except (asyncio.TimeoutError, TimeoutError):
-            handler_duration = time.time() - handler_start
+            handler_duration = time.perf_counter() - handler_start
             logger.error(
                 f"[RECALL TIMEOUT] bank={bank_id} handler_duration={handler_duration:.3f}s - database query timed out"
             )
@@ -6402,7 +6518,7 @@ def _register_routes(app: FastAPI):
                 raise unavailable
             import traceback
 
-            handler_duration = time.time() - handler_start
+            handler_duration = time.perf_counter() - handler_start
             error_detail = f"{str(e)}\n\nTraceback:\n{traceback.format_exc()}"
             logger.error(
                 f"[RECALL ERROR] bank={bank_id} handler_duration={handler_duration:.3f}s error={str(e)}\n{error_detail}"
@@ -6442,10 +6558,10 @@ def _register_routes(app: FastAPI):
 
             # Use the memory system's reflect_async method (record metrics)
             with metrics.record_operation("reflect", bank_id=bank_id, source="api", budget=request.budget.value):
-                # Cancel the reflect if the client disconnects: the agent loop
-                # checks request_context between iterations and the nested recall
-                # checks at its stage boundaries, so abandoned work stops instead
-                # of running to completion (issue #2122).
+                # Cancel the reflect if the client disconnects: the task is
+                # cancelled outright, so a closing call stuck in provider retries
+                # stops too (#5128), and the nested recall still checks at its
+                # stage boundaries for work in threads (#2122).
                 core_result = await run_cancellable_on_disconnect(
                     http_request,
                     request_context,
@@ -7102,7 +7218,13 @@ def _register_routes(app: FastAPI):
         "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}/refresh",
         response_model=AsyncOperationSubmitResponse,
         summary="Refresh mental model",
-        description="Submit an async task to re-run the source query through reflect and update the content.",
+        description=(
+            "Submit an async task to re-run the source query through reflect and update the content. "
+            'With no body the refresh runs in the model\'s own `trigger.mode`. Send `{"mode": "full"}` '
+            "for a full refresh: the content is regenerated from scratch this once (to clear the drift "
+            "delta edits accumulate) while the stored trigger keeps its mode. Unlike clearing the model "
+            "first, a full refresh that fails leaves the previous content in place."
+        ),
         operation_id="refresh_mental_model",
         tags=["Mental Models"],
     )
@@ -7110,6 +7232,7 @@ def _register_routes(app: FastAPI):
     async def api_refresh_mental_model(
         bank_id: str,
         mental_model_id: str,
+        request: RefreshMentalModelRequest | None = None,
         request_context: RequestContext = Depends(get_request_context),
         _precheck: None = Depends(precheck_for(PrecheckOperation.MENTAL_MODEL_REFRESH)),
     ):
@@ -7118,6 +7241,7 @@ def _register_routes(app: FastAPI):
             result = await app.state.memory.submit_async_refresh_mental_model(
                 bank_id=bank_id,
                 mental_model_id=mental_model_id,
+                mode=request.mode if request else None,
                 request_context=request_context,
             )
             return AsyncOperationSubmitResponse(operation_id=result["operation_id"], status="queued")
@@ -7816,11 +7940,18 @@ def _register_routes(app: FastAPI):
     async def api_list_documents(
         bank_id: str,
         q: str | None = Query(
-            None, description="Case-insensitive substring filter on document ID (e.g. 'report' matches 'report-2024')"
+            None,
+            description=(
+                "Case-insensitive substring filter on document ID or document text (e.g. 'report' matches "
+                "'report-2024' or any document containing 'report'). Meant for browsing and inspection, not "
+                "for high-volume or latency-sensitive workloads — use recall for that. Matches are capped: "
+                "past the cap, `total` is a lower bound and `total_is_estimate` is true. A store-owned backend "
+                "may match approximately; each item's `matched_fields` says what matched."
+            ),
         ),
         tags: list[str] | None = Query(None, description="Filter documents by tags"),
-        tags_match: str = Query(
-            "any_strict", description="How to match tags: 'any', 'all', 'any_strict', 'all_strict'"
+        tags_match: TagsMatch = Query(
+            "any_strict", description="How to match tags: 'any', 'all', 'any_strict', 'all_strict', 'exact'"
         ),
         time_field: DocumentTimeField | None = Query(
             default=None,
@@ -7840,9 +7971,9 @@ def _register_routes(app: FastAPI):
 
         Args:
             bank_id: Memory Bank ID (from path)
-            q: Case-insensitive substring filter on document ID
+            q: Case-insensitive substring filter on document ID or text (unindexed, for browsing)
             tags: Filter documents by tags
-            tags_match: How to match tags (any, all, any_strict, all_strict)
+            tags_match: How to match tags (any, all, any_strict, all_strict, exact)
             time_field: Time axis to filter and order by (created_at, updated_at)
             start_date: Inclusive lower bound on time_field (ISO-8601)
             end_date: Exclusive upper bound on time_field (ISO-8601)
@@ -8123,11 +8254,16 @@ def _register_routes(app: FastAPI):
         "send the complete set you want the document to end up with, and any tag you leave out is "
         "dropped. An empty array (`[]`) therefore clears every tag; only omitting the field "
         "entirely is rejected (422).\n\n"
-        "The new tags are propagated to all associated memory units. Observations derived from "
-        "those units are invalidated and queued for re-consolidation under the new tags. "
-        "Co-source memories from other documents that shared those observations are also reset. "
-        "Tags are compared as a set, so re-sending the tags a document already has (in any order) "
-        "changes nothing and queues no re-consolidation.\n\n"
+        "The new tags are propagated to all associated memory units.\n\n"
+        "**Observation scopes** (`observation_scopes`): Replaces how the document's memories are "
+        "scoped during consolidation, with the same values retain accepts. Use it to move a bank "
+        "whose documents were retained under per-session tags to `shared` without re-extracting "
+        "anything. It is also what a later reprocess of the document retains with.\n\n"
+        "A memory is re-consolidated only when the change moves the observation scopes it resolves "
+        "to: its observations are deleted and it is queued again, along with co-source memories from "
+        "other documents that shared those observations. A change that resolves to the same scopes "
+        "(a tag change under `shared`, `combined` over one tag vs `[[that tag]]`, re-sending the "
+        "current values) keeps every observation and queues nothing.\n\n"
         "At least one field must be provided.",
         operation_id="update_document",
         tags=["Documents"],
@@ -8145,15 +8281,18 @@ def _register_routes(app: FastAPI):
         Args:
             bank_id: Memory Bank ID (from path)
             document_id: Document ID (from path)
-            body: Fields to update (tags, metadata, context)
+            body: Fields to update (tags, observation_scopes)
         """
-        if body.tags is None:
-            raise HTTPException(status_code=422, detail="At least one field (tags) must be provided")
+        if body.tags is None and body.observation_scopes is None:
+            raise HTTPException(
+                status_code=422, detail="At least one field (tags, observation_scopes) must be provided"
+            )
         try:
             result = await app.state.memory.update_document(
                 document_id,
                 bank_id,
                 tags=body.tags,
+                observation_scopes=body.observation_scopes,
                 request_context=request_context,
             )
             if not result:
@@ -9023,10 +9162,10 @@ def _register_routes(app: FastAPI):
                 raise HTTPException(
                     status_code=400, detail=f"Invalid on_conflict '{on_conflict}' (expected skip|replace|new-id)"
                 )
-            archive_bytes = await file.read()
             try:
+                # The upload's spooled file, not its bytes: the archive is read entry by entry.
                 submission = await app.state.memory.import_documents_async(
-                    bank_id, archive_bytes, request_context, on_conflict
+                    bank_id, file.file, request_context, on_conflict
                 )
             except ValueError as e:
                 # Invalid archive / unsupported schema version — fail fast.
@@ -9203,7 +9342,8 @@ def _register_routes(app: FastAPI):
                     status_code=400,
                     detail=f"Invalid document_conflict '{document_conflict}' (expected skip|replace|new-id)",
                 )
-            archive_bytes = await file.read()
+            # The upload's spooled file, not its bytes: the archive is read entry by entry.
+            archive = file.file
 
             from hindsight_api.engine.transfer import TransferScope
 
@@ -9225,12 +9365,12 @@ def _register_routes(app: FastAPI):
                             "a merge imports the archive's documents only",
                         )
                     submission = await app.state.memory.import_documents_async(
-                        bank_id, archive_bytes, request_context, document_conflict
+                        bank_id, archive, request_context, document_conflict
                     )
                 else:
                     submission = await app.state.memory.submit_bank_import_async(
                         bank_id,
-                        archive_bytes,
+                        archive,
                         request_context,
                         target_bank_id=target_bank_id,
                         scope=TransferScope(
@@ -10248,7 +10388,7 @@ def _register_routes(app: FastAPI):
 
                 # Synchronous processing: one batch per strategy group, aggregate results
                 total_items_count = 0
-                total_usage = TokenUsage(input_tokens=0, output_tokens=0, total_tokens=0)
+                total_usage = TokenUsage()
 
                 # A coroutine rather than an inline loop so the whole thing can be run
                 # as one cancellable task below; the totals stay in the enclosing scope
@@ -10272,11 +10412,7 @@ def _register_routes(app: FastAPI):
                         )
                         total_items_count += len(contents)
                         if usage:
-                            total_usage = TokenUsage(
-                                input_tokens=total_usage.input_tokens + usage.input_tokens,
-                                output_tokens=total_usage.output_tokens + usage.output_tokens,
-                                total_tokens=total_usage.total_tokens + usage.total_tokens,
-                            )
+                            total_usage = total_usage + usage
 
                 with metrics.record_operation("retain", bank_id=bank_id, source="api"):
                     # A sync retain has no operation row and no ack, so nothing else can

@@ -35,6 +35,7 @@ _DOCUMENT_ROW = {
     "retain_params": {"context": "Team meeting notes"},
     "document_metadata": {"source": "slack"},
     "tags": ["user_a", "session_123"],
+    "matched_fields": [],
 }
 
 # The exact row `memories/pg/curation.list_memory_units` builds.
@@ -145,7 +146,7 @@ class TestRowsAreTypedWithoutChangingTheWire:
     """Each engine payload validates, and serializes back byte-for-key identical."""
 
     def test_document_rows_round_trip_unchanged(self):
-        payload = {"items": [_DOCUMENT_ROW], "total": 1, "limit": 100, "offset": 0}
+        payload = {"items": [_DOCUMENT_ROW], "total": 1, "limit": 100, "offset": 0, "total_is_estimate": False}
         assert _dump(ListDocumentsResponse.model_validate(payload)) == payload
 
     def test_memory_rows_round_trip_unchanged(self):

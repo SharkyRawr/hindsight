@@ -3,6 +3,9 @@
 import builtins
 import json
 import pathlib
+import re
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -10,7 +13,9 @@ import pytest
 
 from hindsight_embed.profile_manager import (
     ProfileManager,
+    parse_env_file,
     resolve_active_profile,
+    set_cli_profile_override,
     validate_profile_exists,
 )
 
@@ -23,8 +28,6 @@ def temp_hindsight_dir(tmp_path, monkeypatch):
     This works with the dynamic path resolution in ProfileManager.
     """
     # Clear any CLI profile override for test isolation
-    from hindsight_embed.cli import set_cli_profile_override
-
     set_cli_profile_override(None)
 
     # Clear HINDSIGHT_EMBED_PROFILE env var
@@ -430,10 +433,7 @@ class TestResolveActiveProfile:
         profile_manager.create_profile("from-file", {"KEY": "value"})
         profile_manager.set_active_profile("from-file")
 
-        # Import cli to set override
-        from hindsight_embed import cli
-
-        cli.set_cli_profile_override("from-flag")
+        set_cli_profile_override("from-flag")
 
         # Env var should win
         assert resolve_active_profile() == "from-env"
@@ -446,10 +446,7 @@ class TestResolveActiveProfile:
         profile_manager.create_profile("from-file", {"KEY": "value"})
         profile_manager.set_active_profile("from-file")
 
-        # Import cli to set override
-        from hindsight_embed import cli
-
-        cli.set_cli_profile_override("from-flag")
+        set_cli_profile_override("from-flag")
 
         # CLI flag should win
         assert resolve_active_profile() == "from-flag"
@@ -459,9 +456,7 @@ class TestResolveActiveProfile:
         # No env var or CLI flag
         monkeypatch.delenv("HINDSIGHT_EMBED_PROFILE", raising=False)
 
-        from hindsight_embed import cli
-
-        cli.set_cli_profile_override(None)
+        set_cli_profile_override(None)
 
         profile_manager.create_profile("from-file", {"KEY": "value"})
         profile_manager.set_active_profile("from-file")
@@ -474,12 +469,30 @@ class TestResolveActiveProfile:
         # No env var, CLI flag, or active file
         monkeypatch.delenv("HINDSIGHT_EMBED_PROFILE", raising=False)
 
-        from hindsight_embed import cli
-
-        cli.set_cli_profile_override(None)
+        set_cli_profile_override(None)
 
         # Default should be used
         assert resolve_active_profile() == ""
+
+    def test_cli_flag_applies_under_python_m(self, profile_manager):
+        """`python -m hindsight_embed.cli --profile X` must resolve X (#5543).
+
+        That form loads cli.py twice (as __main__ and as hindsight_embed.cli), so
+        this has to run in a real subprocess to catch the bug.
+        """
+        profile_manager.create_profile("demo", 9177, {"KEY": "value"})
+
+        result = subprocess.run(
+            [sys.executable, "-m", "hindsight_embed.cli", "--profile", "demo", "profile", "show"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+        assert result.returncode == 0, result.stderr
+        out = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+        assert "Active profile: demo" in out
+        assert "Port: 9177" in out
 
 
 class TestValidateProfileExists:
@@ -506,3 +519,25 @@ class TestValidateProfileExists:
         captured = capsys.readouterr()
         assert "Profile 'nonexistent' not found" in captured.err
         assert "hindsight-embed configure --profile nonexistent" in captured.err
+
+
+def test_parse_env_file_strips_dotenv_quotes(tmp_path):
+    """A hand-written KEY="value" must not forward its quotes (#5301)."""
+    env_file = tmp_path / "p.env"
+    env_file.write_text(
+        'HINDSIGHT_API_LLM_API_KEY="test-key"\n'
+        "export HINDSIGHT_API_LLM_MODEL='gpt-4.1-mini'\n"
+        'HINDSIGHT_API_PORT="9100"\n'
+        "# comment\n"
+        'MISMATCHED="value\n'
+        "PLAIN=a=b\n",
+        encoding="utf-8",
+    )
+    assert parse_env_file(env_file) == {
+        "HINDSIGHT_API_LLM_API_KEY": "test-key",
+        "HINDSIGHT_API_LLM_MODEL": "gpt-4.1-mini",
+        "HINDSIGHT_API_PORT": "9100",
+        "MISMATCHED": '"value',
+        "PLAIN": "a=b",
+    }
+    assert parse_env_file(tmp_path / "missing.env") == {}

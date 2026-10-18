@@ -12,6 +12,7 @@ import re
 from collections.abc import Collection, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal, cast, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, create_model, field_validator
@@ -2010,23 +2011,6 @@ def _coerce_fact_response(response: Any) -> dict[str, Any] | None:
     return None
 
 
-# A reply that says, in words, there is nothing to extract ("No extractable facts
-# were found in the provided chunk."). Deliberately narrow: it must name facts or
-# extraction, so an unrelated prose reply still fails loudly (#5443).
-_NO_FACTS_PROSE_RE = re.compile(
-    r"\b(no|zero|not any|none of the)\b[^.]{0,60}\bfacts?\b|\bnothing\b[^.]{0,40}\bextract",
-    re.IGNORECASE,
-)
-
-
-def _is_no_facts_prose(text: str) -> bool:
-    """True when ``text`` holds no JSON at all and clearly says there are no facts."""
-    stripped = text.strip()
-    if not stripped or len(stripped) > 500 or "{" in stripped or "[" in stripped:
-        return False
-    return _NO_FACTS_PROSE_RE.search(stripped) is not None
-
-
 async def _extract_facts_from_chunk(
     chunk: str,
     chunk_index: int,
@@ -2476,20 +2460,6 @@ async def _extract_facts_from_chunk(
                 )
 
             return chunk_facts, usage
-
-        except json.JSONDecodeError as e:
-            # The provider already spent its own retry budget on this reply. A reply
-            # with no JSON at all that plainly says there is nothing to extract is the
-            # model answering "no facts" in prose (providers that don't enforce the
-            # schema, #5443) — count it as zero facts instead of failing the retain.
-            # Anything else is still a real failure and propagates as before.
-            if _is_no_facts_prose(e.doc):
-                logger.warning(
-                    f"LLM answered in prose instead of JSON for chunk {chunk_index + 1}/{total_chunks}; "
-                    f"treating as no facts: {e.doc[:200]!r}"
-                )
-                return [], usage
-            raise
 
         except BadRequestError as e:
             last_error = e
@@ -3064,12 +3034,12 @@ async def extract_facts_from_contents_batch_api(
     # Step 3: Poll until complete
     import time
 
-    start_time = time.time()
+    start_time = time.perf_counter()
     while True:
         status_info = await batch_impl.get_batch_status(batch_id)
         status = status_info["status"]
 
-        elapsed = time.time() - start_time
+        elapsed = time.perf_counter() - start_time
         logger.info(
             f"Batch {batch_id}: status={status}, "
             f"completed={status_info['request_counts']['completed']}/{status_info['request_counts']['total']}, "
@@ -3377,11 +3347,14 @@ async def extract_facts_from_contents_batch_api(
         # Track token usage
         usage_data = response_body.get("usage", {})
         if usage_data:
-            total_usage = total_usage + TokenUsage(
-                input_tokens=usage_data.get("prompt_tokens", 0),
-                output_tokens=usage_data.get("completion_tokens", 0),
-                total_tokens=usage_data.get("total_tokens", 0),
-            )
+            # Same OpenAI usage block a live call returns, so it is read the same
+            # way: cached prompt tokens and reasoning tokens included.
+            # Imported here: that module loads the openai SDK, which a process
+            # must not pay for at startup unless it actually reads batch results.
+            from ..providers.openai_compatible_llm import visible_token_usage
+
+            usage_obj = json.loads(json.dumps(usage_data), object_hook=lambda d: SimpleNamespace(**d))
+            total_usage = total_usage + visible_token_usage(SimpleNamespace(usage=usage_obj))
 
     # Step 6: Convert to ExtractedFact objects with proper chunk mapping
     # Group facts by chunk

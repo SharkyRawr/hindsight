@@ -589,6 +589,18 @@ export type BankTemplateConfig = {
    */
   enable_reranking?: boolean | null;
   /**
+   * Reflect Use Decision Model
+   *
+   * When the server has a decision model, reflect lets it prune evidence and decide when to stop
+   */
+  reflect_use_decision_model?: boolean | null;
+  /**
+   * Mental Model Refresh Use Decision Model
+   *
+   * The same, for knowledge-page refreshes
+   */
+  mental_model_refresh_use_decision_model?: boolean | null;
+  /**
    * Disposition Skepticism
    *
    * Skepticism trait (1-5)
@@ -795,6 +807,12 @@ export type BankTemplateConfig = {
    */
   enable_auto_consolidation?: boolean | null;
   /**
+   * Consolidation Use Decision Model
+   *
+   * When the server has a decision model, consolidation lets it settle restatements, new facets and chatter before the LLM call
+   */
+  consolidation_use_decision_model?: boolean | null;
+  /**
    * Consolidation Max Memories Per Round
    *
    * Max memory units fed into a single consolidation round
@@ -812,6 +830,12 @@ export type BankTemplateConfig = {
    * Include raw chunks in recall results
    */
   recall_include_chunks?: boolean | null;
+  /**
+   * Recall Prefer Observations
+   *
+   * Default for recall prefer_observations when the request omits it
+   */
+  recall_prefer_observations?: boolean | null;
   /**
    * Recall Max Tokens
    *
@@ -1467,7 +1491,7 @@ export type CreateBankAliasRequest = {
   /**
    * Alias
    *
-   * The extra bank id. Same rules as a bank id (non-empty, at most 192 bytes of UTF-8, no control characters), and it must not already name a bank or another alias.
+   * The extra bank id. Same rules as a bank id (non-empty, at most 192 bytes of UTF-8, no control characters, no leading underscore), and it must not already name a bank or another alias.
    */
   alias: string;
   /**
@@ -2105,6 +2129,12 @@ export type DocumentListItem = {
    * Tags associated with this document
    */
   tags?: Array<string>;
+  /**
+   * Matched Fields
+   *
+   * Which fields matched the `q` search: 'id', 'original_text', or both. Empty when no `q` is given.
+   */
+  matched_fields?: Array<"id" | "original_text">;
 };
 
 /**
@@ -2946,7 +2976,7 @@ export type KnowledgeNode = {
    */
   last_refresh_failed_at?: string | null;
   /**
-   * Pages only: the page's refresh settings — when it rebuilds itself (`refresh_after_consolidation` or `refresh_cron`), in which mode, and over which facts. This is the EFFECTIVE policy: a setting the page never stored is reported at its default, so compare the fields you care about rather than the whole object against a patch you sent. Absent on folders, which have no backing mental model, and on a page with no trigger stored.
+   * Pages only: the page's refresh settings — when it rebuilds itself (`refresh_after_consolidation` or `refresh_cron`, plus any `full_refresh_cron`), in which mode, and over which facts. This is the EFFECTIVE policy: a setting the page never stored is reported at its default, so compare the fields you care about rather than the whole object against a patch you sent. Absent on folders, which have no backing mental model, and on a page with no trigger stored.
    */
   trigger?: MentalModelTriggerOutput | null;
   /**
@@ -3472,6 +3502,12 @@ export type ListDocumentsResponse = {
    * Offset
    */
   offset: number;
+  /**
+   * Total Is Estimate
+   *
+   * True when a `q` search stopped at its match cap, so `total` is a lower bound rather than an exact count. Always false without `q`.
+   */
+  total_is_estimate?: boolean;
 };
 
 /**
@@ -4583,9 +4619,15 @@ export type MentalModelResponse = {
   /**
    * Last Refresh Failed At
    *
-   * When this model's most recent refresh failed, in ISO format, or null when the last one succeeded. While this is set the automatic triggers (`refresh_after_consolidation`, `refresh_cron`) skip the model — a refresh that cannot succeed is not retried on every tick. An explicit refresh still runs, and a successful one clears this. The failure itself, with its reason, is in the model's history.
+   * When this model's most recent refresh failed, in ISO format, or null when the last one succeeded. While this is set the automatic triggers (`refresh_after_consolidation`, `refresh_cron`, `full_refresh_cron`) skip the model — a refresh that cannot succeed is not retried on every tick. An explicit refresh still runs, and a successful one clears this. The failure itself, with its reason, is in the model's history.
    */
   last_refresh_failed_at?: string | null;
+  /**
+   * Last Full Refreshed At
+   *
+   * When a refresh last ran in full mode for this model, in ISO format — requested (`mode: 'full'`, a `full_refresh_cron` tick, a full-mode model) or fallen back to by a delta refresh. `trigger.full_refresh_cron` comes due against this, not `last_refreshed_at`, which every delta refresh moves. Null when no full refresh has completed since this was first tracked.
+   */
+  last_full_refreshed_at?: string | null;
   /**
    * Created At
    */
@@ -4745,9 +4787,15 @@ export type MentalModelTriggerInput = {
    */
   refresh_cron?: string | null;
   /**
+   * Full Refresh Cron
+   *
+   * Cron expression (UTC, standard 5-field syntax, e.g. '0 3 * * 0' for Sundays at 03:00 UTC) for a scheduled full refresh: on this schedule the model is refreshed in 'full' mode whatever its `mode` says, regenerating the content from scratch to clear the drift many delta edits accumulate. Independent of `refresh_cron` and `refresh_after_consolidation` — a delta model can refresh after consolidation and still get a weekly full refresh — and it does not change `mode`. A tick is skipped when no refresh has run since the last full one (there is nothing to correct). Like `refresh_cron`, it honours `min_refresh_interval_seconds` and pauses while the last refresh failed. null = no schedule.
+   */
+  full_refresh_cron?: string | null;
+  /**
    * Min Refresh Interval Seconds
    *
-   * Minimum seconds between two automatic refreshes of this mental model. A triggered refresh that arrives sooner is not dropped: it is queued and parked until the window expires, and every further trigger in the meantime folds into that one queued refresh, so a burst of retains costs one refresh instead of one per retain. Applies to both refresh_after_consolidation and refresh_cron. Explicit refreshes (API, MCP, control plane) ignore it and run immediately. 0 disables the floor for this model; null falls back to the bank/global mental_model_min_refresh_interval_seconds setting (itself 0 by default, i.e. no floor).
+   * Minimum seconds between two automatic refreshes of this mental model. A triggered refresh that arrives sooner is not dropped: it is queued and parked until the window expires, and every further trigger in the meantime folds into that one queued refresh, so a burst of retains costs one refresh instead of one per retain. Applies to every automatic trigger: refresh_after_consolidation, refresh_cron and full_refresh_cron. Explicit refreshes (API, MCP, control plane) ignore it and run immediately. 0 disables the floor for this model; null falls back to the bank/global mental_model_min_refresh_interval_seconds setting (itself 0 by default, i.e. no floor).
    */
   min_refresh_interval_seconds?: number | null;
   /**
@@ -4862,9 +4910,15 @@ export type MentalModelTriggerOutput = {
    */
   refresh_cron?: string | null;
   /**
+   * Full Refresh Cron
+   *
+   * Cron expression (UTC, standard 5-field syntax, e.g. '0 3 * * 0' for Sundays at 03:00 UTC) for a scheduled full refresh: on this schedule the model is refreshed in 'full' mode whatever its `mode` says, regenerating the content from scratch to clear the drift many delta edits accumulate. Independent of `refresh_cron` and `refresh_after_consolidation` — a delta model can refresh after consolidation and still get a weekly full refresh — and it does not change `mode`. A tick is skipped when no refresh has run since the last full one (there is nothing to correct). Like `refresh_cron`, it honours `min_refresh_interval_seconds` and pauses while the last refresh failed. null = no schedule.
+   */
+  full_refresh_cron?: string | null;
+  /**
    * Min Refresh Interval Seconds
    *
-   * Minimum seconds between two automatic refreshes of this mental model. A triggered refresh that arrives sooner is not dropped: it is queued and parked until the window expires, and every further trigger in the meantime folds into that one queued refresh, so a burst of retains costs one refresh instead of one per retain. Applies to both refresh_after_consolidation and refresh_cron. Explicit refreshes (API, MCP, control plane) ignore it and run immediately. 0 disables the floor for this model; null falls back to the bank/global mental_model_min_refresh_interval_seconds setting (itself 0 by default, i.e. no floor).
+   * Minimum seconds between two automatic refreshes of this mental model. A triggered refresh that arrives sooner is not dropped: it is queued and parked until the window expires, and every further trigger in the meantime folds into that one queued refresh, so a burst of retains costs one refresh instead of one per retain. Applies to every automatic trigger: refresh_after_consolidation, refresh_cron and full_refresh_cron. Explicit refreshes (API, MCP, control plane) ignore it and run immediately. 0 disables the floor for this model; null falls back to the bank/global mental_model_min_refresh_interval_seconds setting (itself 0 by default, i.e. no floor).
    */
   min_refresh_interval_seconds?: number | null;
   /**
@@ -5505,9 +5559,9 @@ export type RecallRequest = {
   /**
    * Prefer Observations
    *
-   * When recalling raw facts ('world'/'experience') together with 'observation', drop any raw fact that an observation in the results was consolidated from, so the observation supersedes it and you don't get duplicate content. The freed slots are backfilled with the next results, keeping the result count at the requested budget. Disabled by default; set to true to enable. No effect unless 'observation' and at least one raw type are both requested.
+   * When recalling raw facts ('world'/'experience') together with 'observation', drop any raw fact that an observation in the results was consolidated from, so the observation supersedes it and you don't get duplicate content. The freed slots are backfilled with the next results, keeping the result count at the requested budget. When omitted, uses the bank/global recall_prefer_observations config (false unless configured). No effect unless 'observation' and at least one raw type are both requested.
    */
-  prefer_observations?: boolean;
+  prefer_observations?: boolean | null;
   budget?: Budget;
   /**
    * Max Tokens
@@ -6146,6 +6200,20 @@ export type RefreshMentalModelOperationDetails = {
 };
 
 /**
+ * RefreshMentalModelRequest
+ *
+ * Optional body of POST /mental-models/{id}/refresh.
+ */
+export type RefreshMentalModelRequest = {
+  /**
+   * Mode
+   *
+   * 'full' regenerates the content from scratch for this refresh only, whatever `trigger.mode` says; the stored trigger is not changed. null runs the model's own mode.
+   */
+  mode?: "full" | null;
+};
+
+/**
  * ReprocessDocumentResponse
  *
  * Response model for reprocess document endpoint.
@@ -6687,6 +6755,18 @@ export type UpdateDocumentRequest = {
    * The complete new set of tags for the document and its memory units — this REPLACES the existing tags rather than adding to them, so omitting a tag drops it and `[]` clears them all. Triggers observation invalidation and re-consolidation.
    */
   tags?: Array<string> | null;
+  /**
+   * UpdateDocumentObservationScopes
+   *
+   * New observation scoping for the document's memories, with the same values retain accepts (send 'combined' to return to the default). Use it to move memories retained under one scoping to another — e.g. per-session documents to 'shared' — without re-extracting them. Memories whose resolved scopes change lose their observations and are re-consolidated; the rest keep theirs. Also becomes the scoping a later reprocess of the document uses.
+   */
+  observation_scopes?:
+    | "per_tag"
+    | "combined"
+    | "all_combinations"
+    | "shared"
+    | Array<Array<string>>
+    | null;
 };
 
 /**
@@ -7218,7 +7298,7 @@ export type GetGraphData = {
     /**
      * Tags Match
      */
-    tags_match?: string;
+    tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
     /**
      * Document Id
      */
@@ -8318,7 +8398,10 @@ export type GetMentalModelHistoryResponses = {
 };
 
 export type RefreshMentalModelData = {
-  body?: never;
+  /**
+   * Request
+   */
+  body?: RefreshMentalModelRequest | null;
   headers?: {
     /**
      * Authorization
@@ -9047,7 +9130,7 @@ export type ListDocumentsData = {
     /**
      * Q
      *
-     * Case-insensitive substring filter on document ID (e.g. 'report' matches 'report-2024')
+     * Case-insensitive substring filter on document ID or document text (e.g. 'report' matches 'report-2024' or any document containing 'report'). Meant for browsing and inspection, not for high-volume or latency-sensitive workloads — use recall for that. Matches are capped: past the cap, `total` is a lower bound and `total_is_estimate` is true. A store-owned backend may match approximately; each item's `matched_fields` says what matched.
      */
     q?: string | null;
     /**
@@ -9059,9 +9142,9 @@ export type ListDocumentsData = {
     /**
      * Tags Match
      *
-     * How to match tags: 'any', 'all', 'any_strict', 'all_strict'
+     * How to match tags: 'any', 'all', 'any_strict', 'all_strict', 'exact'
      */
-    tags_match?: string;
+    tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
     /**
      * Time Field
      *

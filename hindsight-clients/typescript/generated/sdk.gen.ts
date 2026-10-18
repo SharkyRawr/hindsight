@@ -747,7 +747,7 @@ export const getMentalModelHistory = <ThrowOnError extends boolean = false>(
 /**
  * Refresh mental model
  *
- * Submit an async task to re-run the source query through reflect and update the content.
+ * Submit an async task to re-run the source query through reflect and update the content. With no body the refresh runs in the model's own `trigger.mode`. Send `{"mode": "full"}` for a full refresh: the content is regenerated from scratch this once (to clear the drift delta edits accumulate) while the stored trigger keeps its mode. Unlike clearing the model first, a full refresh that fails leaves the previous content in place.
  */
 export const refreshMentalModel = <ThrowOnError extends boolean = false>(
   options: Options<RefreshMentalModelData, ThrowOnError>
@@ -756,7 +756,14 @@ export const refreshMentalModel = <ThrowOnError extends boolean = false>(
     RefreshMentalModelResponses,
     RefreshMentalModelErrors,
     ThrowOnError
-  >({ url: "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}/refresh", ...options });
+  >({
+    url: "/v1/default/banks/{bank_id}/mental-models/{mental_model_id}/refresh",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
 
 /**
  * Dry-run mental model refresh (preview, no persistence)
@@ -1078,7 +1085,11 @@ export const getDocument = <ThrowOnError extends boolean = false>(
  *
  * **Tags** (`tags`): The array REPLACES the document's tags, it is not merged into them — send the complete set you want the document to end up with, and any tag you leave out is dropped. An empty array (`[]`) therefore clears every tag; only omitting the field entirely is rejected (422).
  *
- * The new tags are propagated to all associated memory units. Observations derived from those units are invalidated and queued for re-consolidation under the new tags. Co-source memories from other documents that shared those observations are also reset. Tags are compared as a set, so re-sending the tags a document already has (in any order) changes nothing and queues no re-consolidation.
+ * The new tags are propagated to all associated memory units.
+ *
+ * **Observation scopes** (`observation_scopes`): Replaces how the document's memories are scoped during consolidation, with the same values retain accepts. Use it to move a bank whose documents were retained under per-session tags to `shared` without re-extracting anything. It is also what a later reprocess of the document retains with.
+ *
+ * A memory is re-consolidated only when the change moves the observation scopes it resolves to: its observations are deleted and it is queued again, along with co-source memories from other documents that shared those observations. A change that resolves to the same scopes (a tag change under `shared`, `combined` over one tag vs `[[that tag]]`, re-sending the current values) keeps every observation and queues nothing.
  *
  * At least one field must be provided.
  */

@@ -62,6 +62,7 @@ from hindsight_api.engine.llm_transport import (
 from hindsight_api.engine.llm_wrapper import parse_llm_json
 from hindsight_api.engine.providers.llm_debug import dump_request_on_4xx
 from hindsight_api.engine.providers.openai_compatible_headers import with_openai_compatible_user_agent
+from hindsight_api.engine.remote_retry import jittered_backoff
 from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
 from hindsight_api.engine.structured_output import provider_json_schema, strict_json_schema
 from hindsight_api.metrics import get_metrics_collector
@@ -1226,7 +1227,7 @@ class OpenAICompatibleLLM(LLMInterface):
                 attempt_context=attempt_context,
             )
 
-        start_time = time.time()
+        start_time = time.perf_counter()
 
         # Build call parameters
         call_params: dict[str, Any] = {
@@ -1259,6 +1260,11 @@ class OpenAICompatibleLLM(LLMInterface):
         # Provider-specific parameters
         extra_body: dict[str, Any] = {**self._config_extra_body}
         self._apply_provider_extra_body_defaults(extra_body)
+        # OpenAI takes service_tier as a native top-level param; other servers on this
+        # class (lmstudio, ollama, ...) don't know it, and Groq sends its own tier via
+        # extra_body below. This path used to drop the tier entirely (#5439).
+        if self.provider == "openai" and self.openai_service_tier:
+            call_params["service_tier"] = self.openai_service_tier
         if self.provider == "groq":
             call_params["seed"] = DEFAULT_LLM_SEED
             # Add service_tier if configured
@@ -1342,7 +1348,7 @@ class OpenAICompatibleLLM(LLMInterface):
                         # on every byte, so an upstream trickling keep-alive whitespace never trips it
                         # and the call pins its worker slot forever (#4763).
                         response = await asyncio.wait_for(
-                            self._client.chat.completions.create(**call_params), timeout=self.timeout
+                            self._request_client().chat.completions.create(**call_params), timeout=self.timeout
                         )
                     # Stash usage before parse/validate, which may raise locally
                     # even though the provider charged for these tokens (#2387).
@@ -1424,7 +1430,7 @@ class OpenAICompatibleLLM(LLMInterface):
                     async with attempt_context() if attempt_context is not None else nullcontext():
                         set_stage(f"llm.{self.provider}.{scope}.attempt={attempt + 1}/{max_retries + 1}")
                         response = await asyncio.wait_for(
-                            self._client.chat.completions.create(**call_params), timeout=self.timeout
+                            self._request_client().chat.completions.create(**call_params), timeout=self.timeout
                         )
                     stash_response_usage(_usage_from_openai_response(response))
                     result, first_choice = _content_or_error(
@@ -1442,7 +1448,7 @@ class OpenAICompatibleLLM(LLMInterface):
                     result = _strip_reasoning_tags(result)
 
                 # Record token usage metrics
-                duration = time.time() - start_time
+                duration = time.perf_counter() - start_time
                 usage = response.usage
                 # ``output_tokens``/``total_tokens`` are visible-only past this
                 # point, with reasoning surfaced separately in
@@ -1559,7 +1565,7 @@ class OpenAICompatibleLLM(LLMInterface):
                                         result = response_format.model_validate(converted)
 
                                     # Record metrics
-                                    duration = time.time() - start_time
+                                    duration = time.perf_counter() - start_time
                                     metrics = get_metrics_collector()
                                     metrics.record_llm_call(
                                         provider=self.provider,
@@ -1602,10 +1608,7 @@ class OpenAICompatibleLLM(LLMInterface):
                         f"APIStatusError ({self.provider}/{self.model}, scope={scope}, "
                         f"attempt {attempt + 1}/{max_retries + 1}): {_summarize_status_error(e)}"
                     )
-                    backoff = min(initial_backoff * (2**attempt), max_backoff)
-                    jitter = backoff * 0.2 * (2 * (time.time() % 1) - 1)
-                    sleep_time = backoff + jitter
-                    await asyncio.sleep(sleep_time)
+                    await asyncio.sleep(jittered_backoff(attempt, initial_backoff, max_backoff))
                 else:
                     logger.error(
                         f"API error after {max_retries + 1} attempts ({self.provider}/{self.model}, "
@@ -1665,7 +1668,7 @@ class OpenAICompatibleLLM(LLMInterface):
         Returns:
             LLMToolCallResult with content and/or tool_calls.
         """
-        start_time = time.time()
+        start_time = time.perf_counter()
 
         request_tool_choice: str | None
         if tool_choice.mode is LLMToolChoiceMode.NAMED:
@@ -1756,6 +1759,8 @@ class OpenAICompatibleLLM(LLMInterface):
         # request and response shapes both ways, so it is deliberately not done.
         extra_body: dict[str, Any] = {**self._config_extra_body}
         self._apply_provider_extra_body_defaults(extra_body)
+        if self.provider == "openai" and self.openai_service_tier:
+            call_params["service_tier"] = self.openai_service_tier
         if self.provider == "groq":
             call_params["seed"] = DEFAULT_LLM_SEED
         if extra_body:
@@ -1781,7 +1786,7 @@ class OpenAICompatibleLLM(LLMInterface):
                 async with attempt_context() if attempt_context is not None else nullcontext():
                     set_stage(f"llm.{self.provider}.tools.attempt={attempt + 1}/{attempts_allowed}")
                     response = await asyncio.wait_for(
-                        self._client.chat.completions.create(**call_params), timeout=self.timeout
+                        self._request_client().chat.completions.create(**call_params), timeout=self.timeout
                     )
                     stash_response_usage(_usage_from_openai_response(response))
 
@@ -1801,7 +1806,7 @@ class OpenAICompatibleLLM(LLMInterface):
                 content = message.content
 
                 # Record metrics
-                duration = time.time() - start_time
+                duration = time.perf_counter() - start_time
                 # See ``visible_token_usage``: ``output_tokens`` is visible-only,
                 # with reasoning surfaced separately in ``thoughts_tokens``.
                 token_counts = visible_token_usage(response)
@@ -1960,7 +1965,7 @@ class OpenAICompatibleLLM(LLMInterface):
         message text, so free-form calls can reach the one endpoint that honours
         ``options.num_ctx``.
         """
-        start_time = time.time()
+        start_time = time.perf_counter()
 
         # Get the JSON schema from the Pydantic model
         schema = provider_json_schema(response_format) if hasattr(response_format, "model_json_schema") else None
@@ -2119,7 +2124,7 @@ class OpenAICompatibleLLM(LLMInterface):
                                 raise
 
                 # Extract token usage from Ollama response
-                duration = time.time() - start_time
+                duration = time.perf_counter() - start_time
                 input_tokens = result.get("prompt_eval_count", 0) or 0
                 output_tokens = result.get("eval_count", 0) or 0
                 total_tokens = input_tokens + output_tokens
@@ -2225,8 +2230,11 @@ class OpenAICompatibleLLM(LLMInterface):
             return config.llm_openai_compatible_json_mode
         if self.provider == "llamacpp":
             return not config.llamacpp_no_grammar
-        # These don't honour json_object reliably.
-        return self.provider not in ("lmstudio", "ollama", "volcano")
+        # These don't honour json_object reliably. z.ai is worse than unreliable:
+        # in json_object mode it deletes the literal token "json" from the
+        # generated text, so `fleet --json` is stored as `fleet --` and
+        # `latest.json` as `latest.` — still valid JSON, silently corrupted (#5175).
+        return self.provider not in ("lmstudio", "ollama", "volcano", "zai")
 
     def supports_vision(self) -> bool | None:
         """Known only for OpenAI itself; unknown for every other backend here.
@@ -2384,6 +2392,17 @@ class OpenAICompatibleLLM(LLMInterface):
             await self._client.close()
         if hasattr(self, "_ollama_http"):
             await self._ollama_http.close()
+
+    def supports_request_overrides(self) -> bool:
+        # Ollama's structured/num_ctx calls take a native HTTP path outside the SDK client.
+        return self.provider != "ollama"
+
+    def _request_client(self) -> Any:
+        """The SDK client for one call, with the credentials an LLM request extension chose."""
+        # Lazy: importing the extensions package here would be circular.
+        from hindsight_api.extensions.llm_request import request_client
+
+        return request_client(self._client)
 
     def supports_attempt_scoped_concurrency(self) -> bool:
         return True

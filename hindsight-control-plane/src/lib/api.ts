@@ -5,7 +5,9 @@
 
 import { toast } from "sonner";
 import { bankApi, bankStatsApi, chunkApi, documentApi, memoryApi } from "./bank-url";
+import { SESSION_REQUIRED_HEADER } from "./auth/session";
 import { stripBasePath, withBasePath } from "./base-path";
+import { appendTagFilter, type TagFilter, type TagsMatch } from "./tag-filter-params";
 
 /**
  * Reduce an API error `details` value to a string safe to render in a toast.
@@ -212,31 +214,17 @@ export interface OperationProgress {
   detail?: Record<string, number> | null;
 }
 
+export type { TagsMatch };
+
 /** Tag filter for the knowledge-base tree and search (recall's tags / tags_match). */
-export interface KnowledgeTagFilter {
-  tags?: string[];
-  tags_match?: TagsMatch;
-}
+export type KnowledgeTagFilter = TagFilter;
 
 /** `&tags=..&tags_match=..`, or "" when the filter is empty. */
 function knowledgeTagQuery(filter?: KnowledgeTagFilter): string {
   const params = new URLSearchParams();
-  filter?.tags?.forEach((tag) => params.append("tags", tag));
-  if (filter?.tags_match && (filter.tags?.length || filter.tags_match === "exact"))
-    params.set("tags_match", filter.tags_match);
+  if (filter) appendTagFilter(params, filter);
   const qs = params.toString();
   return qs ? `&${qs}` : "";
-}
-
-export type TagsMatch = "any" | "all" | "any_strict" | "all_strict" | "exact";
-
-/** Append a tag filter; `tags_match` only travels with tags, like the dataplane expects. */
-function appendTagFilter(
-  queryParams: URLSearchParams,
-  filter: { tags?: string[]; tags_match?: TagsMatch }
-) {
-  for (const tag of filter.tags ?? []) queryParams.append("tags", tag);
-  if (filter.tags?.length && filter.tags_match) queryParams.append("tags_match", filter.tags_match);
 }
 
 // Time axes the two list endpoints can filter and order by. The chosen axis does
@@ -270,6 +258,7 @@ export interface MentalModel {
     mode?: "full" | "delta";
     refresh_after_consolidation: boolean;
     refresh_cron?: string | null;
+    full_refresh_cron?: string | null;
     min_refresh_interval_seconds?: number | null;
     fact_types?: Array<"world" | "experience" | "observation">;
     exclude_mental_models?: boolean;
@@ -293,6 +282,8 @@ export interface MentalModel {
   is_stale?: boolean | null;
   /** When the last refresh failed. Set = automatic refreshes are paused for this model. */
   last_refresh_failed_at?: string | null;
+  /** When a refresh last ran in full mode. `trigger.full_refresh_cron` comes due against this. */
+  last_full_refreshed_at?: string | null;
 }
 
 /** How a refresh resolved full-vs-delta, and why it did not stay in delta. */
@@ -440,9 +431,14 @@ export class ControlPlaneClient {
 
       if (!response.ok) {
         const isClientError = response.status >= 400 && response.status < 500;
-        // Redirect to login on 401 (session expired or not authenticated)
+        // Redirect to login only when the UI session itself was refused. A 401 the
+        // dataplane returned is shown as an error: a new UI key can't fix it.
         const currentPath = stripBasePath(`${window.location.pathname}${window.location.search}`);
-        if (response.status === 401 && !currentPath.startsWith("/login")) {
+        if (
+          response.status === 401 &&
+          response.headers.get(SESSION_REQUIRED_HEADER) &&
+          !currentPath.startsWith("/login")
+        ) {
           window.location.href = withBasePath(`/login?returnTo=${encodeURIComponent(currentPath)}`);
           throw new Error("Unauthorized");
         }
@@ -509,8 +505,10 @@ export class ControlPlaneClient {
 
       return response.json();
     } catch (error) {
-      // If it's not a response error (network error, etc.), show toast
-      if (!(error as any).status && !suppressErrorToast) {
+      // If it's not a response error (network error, etc.), show toast. A request
+      // the caller cancelled is not an error worth telling anyone about.
+      const aborted = (error as any)?.name === "AbortError";
+      if (!(error as any).status && !suppressErrorToast && !aborted) {
         toast.error("Network Error", {
           description: error instanceof Error ? error.message : "Failed to connect to server",
           duration: 5000,
@@ -672,6 +670,7 @@ export class ControlPlaneClient {
       document_id?: string;
       metadata?: Record<string, string>;
       entities?: Array<{ text: string; type?: string }>;
+      resolve_entities?: boolean;
       tags?: string[];
       observation_scopes?: "per_tag" | "combined" | "all_combinations" | "shared" | string[][];
       strategy?: string;
@@ -720,16 +719,19 @@ export class ControlPlaneClient {
   /**
    * Get graph data
    */
-  async getGraph(params: {
-    bank_id: string;
-    type?: string;
-    limit?: number;
-    q?: string;
-    tags?: string[];
-    tags_match?: string;
-    document_id?: string;
-    chunk_id?: string;
-  }) {
+  async getGraph(
+    params: {
+      bank_id: string;
+      type?: string;
+      limit?: number;
+      q?: string;
+      tags?: string[];
+      tags_match?: string;
+      document_id?: string;
+      chunk_id?: string;
+    },
+    signal?: AbortSignal
+  ) {
     const queryParams = new URLSearchParams();
     queryParams.append("bank_id", params.bank_id);
     if (params.type) queryParams.append("type", params.type);
@@ -744,7 +746,7 @@ export class ControlPlaneClient {
     if (params.tags_match) queryParams.append("tags_match", params.tags_match);
     if (params.document_id) queryParams.append("document_id", params.document_id);
     if (params.chunk_id) queryParams.append("chunk_id", params.chunk_id);
-    return this.fetchApi(`/api/graph?${queryParams}`);
+    return this.fetchApi(`/api/graph?${queryParams}`, { signal });
   }
 
   /**
@@ -994,6 +996,7 @@ export class ControlPlaneClient {
         mode?: "full" | "delta";
         refresh_after_consolidation?: boolean;
         refresh_cron?: string | null;
+        full_refresh_cron?: string | null;
         min_refresh_interval_seconds?: number | null;
         fact_types?: Array<"world" | "experience" | "observation">;
         exclude_mental_models?: boolean;
@@ -1082,11 +1085,18 @@ export class ControlPlaneClient {
   /**
    * Update tags on a document and its associated memory units
    */
-  async updateDocument(documentId: string, bankId: string, tags: string[]) {
+  async updateDocument(
+    documentId: string,
+    bankId: string,
+    update: {
+      tags?: string[];
+      observation_scopes?: "per_tag" | "combined" | "all_combinations" | "shared" | string[][];
+    }
+  ) {
     return this.fetchApi<{ success: boolean }>(documentApi(documentId, bankId), {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tags }),
+      body: JSON.stringify(update),
     });
   }
 
@@ -1774,6 +1784,7 @@ export class ControlPlaneClient {
           mode?: "full" | "delta";
           refresh_after_consolidation: boolean;
           refresh_cron?: string | null;
+          full_refresh_cron?: string | null;
           min_refresh_interval_seconds?: number | null;
           fact_types?: Array<"world" | "experience" | "observation">;
           exclude_mental_models?: boolean;
@@ -1844,6 +1855,7 @@ export class ControlPlaneClient {
         mode?: "full" | "delta";
         refresh_after_consolidation: boolean;
         refresh_cron?: string | null;
+        full_refresh_cron?: string | null;
         min_refresh_interval_seconds?: number | null;
         fact_types?: Array<"world" | "experience" | "observation"> | null;
         exclude_mental_models?: boolean;
@@ -1893,6 +1905,7 @@ export class ControlPlaneClient {
         mode?: "full" | "delta";
         refresh_after_consolidation: boolean;
         refresh_cron?: string | null;
+        full_refresh_cron?: string | null;
         min_refresh_interval_seconds?: number | null;
         fact_types?: Array<"world" | "experience" | "observation"> | null;
         exclude_mental_models?: boolean;
@@ -1921,6 +1934,7 @@ export class ControlPlaneClient {
       trigger: {
         refresh_after_consolidation: boolean;
         refresh_cron?: string | null;
+        full_refresh_cron?: string | null;
         min_refresh_interval_seconds?: number | null;
         fact_types?: Array<"world" | "experience" | "observation">;
         exclude_mental_models?: boolean;
@@ -1961,11 +1975,13 @@ export class ControlPlaneClient {
   /**
    * Refresh a mental model (re-run source query) - async operation
    */
-  async refreshMentalModel(bankId: string, mentalModelId: string) {
+  async refreshMentalModel(bankId: string, mentalModelId: string, options?: { mode?: "full" }) {
     return this.fetchApi<{
       operation_id: string;
     }>(bankApi(bankId, `/mental-models/${encodeURIComponent(mentalModelId)}/refresh`), {
       method: "POST",
+      // "full" rewrites the document from scratch this once; the model keeps its mode.
+      ...(options?.mode ? { body: JSON.stringify({ mode: options.mode }) } : {}),
     });
   }
 

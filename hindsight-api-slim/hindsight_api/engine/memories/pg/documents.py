@@ -31,6 +31,7 @@ from ..base import (
     DocumentSourceUnits,
     DocumentTags,
     ObservationChunkIds,
+    RetagResult,
     StoredMemory,
 )
 from . import counts
@@ -371,9 +372,16 @@ async def documents_tags(
 
 
 async def update_document_tags(
-    *, conn, fq_table: Callable[[str], str], bank_id: str, document_id: str, tags: list[str] | None
+    *,
+    conn,
+    fq_table: Callable[[str], str],
+    bank_id: str,
+    document_id: str,
+    tags: list[str] | None,
+    observation_scopes: list | str | None = None,
 ) -> bool:
-    """Stamp the `documents` row (and set its tags when given). ``False`` when there is no row."""
+    """Stamp the `documents` row (and set its tags, and the observation scopes its retain params
+    carry, when given). ``False`` when there is no row."""
     set_parts: list[str] = ["updated_at = now()"]
     params: list[Any] = []
     p = 1
@@ -393,6 +401,22 @@ async def update_document_tags(
         """,
         *params,
     )
+    if doc_id_found and observation_scopes is not None:
+        # Reprocess re-retains from these params, so a scope left behind here would quietly
+        # come back the next time the document is reprocessed. The UPDATE above holds the row.
+        raw = await conn.fetchval(
+            f"SELECT retain_params FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2",
+            document_id,
+            bank_id,
+        )
+        retain_params = (conn.parse_json(raw) if raw else None) or {}
+        retain_params["observation_scopes"] = observation_scopes
+        await conn.execute(
+            f"UPDATE {fq_table('documents')} SET retain_params = $1 WHERE id = $2 AND bank_id = $3",
+            json.dumps(retain_params),
+            document_id,
+            bank_id,
+        )
     return bool(doc_id_found)
 
 
@@ -403,14 +427,19 @@ async def retag_document_memories(
     fq_table: Callable[[str], str],
     bank_id: str,
     document_id: str,
-    tags: list[str],
+    tags: list[str] | None,
     retagged: Callable[[list[str] | None], list[str]],
     rescoped: Callable[[Any], str | None],
-) -> int:
-    """Retag the document's units, then delete the observations built on them and requeue
-    their sources (the document's and every co-source) for re-consolidation.
+) -> RetagResult:
+    """Retag the document's units, then delete the observations built on the units whose
+    observation scopes that moves and requeue their sources (the document's and every co-source)
+    for re-consolidation. Units whose scopes stay put keep their observations (#5593).
 
-    Returns how many observations were deleted.
+    ``tags`` is ``None`` for a change of observation scopes alone (#5309): no unit's tags are
+    written, and only the units whose scopes move are stamped as edited.
+
+    Every unit that moved is requeued, whether or not it had an observation: it was consolidated
+    under scopes it no longer writes to (the same rule a re-retain follows).
     """
     invalidated_obs = 0
     # `tags` as well as `id`: the projection each unit must keep is read
@@ -434,14 +463,41 @@ async def retag_document_memories(
             bank_id,
             _ids,
         )
-    unit_ids = [str(row["id"]) for row in unit_rows if row["fact_type"] in ("experience", "world")]
+    from ...consolidation.consolidator import write_scopes_changed
 
-    await conn.execute(
-        f"UPDATE {fq_table('memory_units')} SET tags = $1, updated_at = now() WHERE document_id = $2 AND bank_id = $3",
-        tags,
-        document_id,
-        bank_id,
-    )
+    # Only the units whose observation scopes actually move: under `shared` or an explicit
+    # scope list a tag change leaves every observation where it was (#5593).
+    unit_ids: list[str] = []
+    for row in unit_rows:
+        if row["fact_type"] not in ("experience", "world"):
+            continue
+        new_scopes = rescoped(row["observation_scopes"])
+        if write_scopes_changed(
+            row["tags"],
+            row["observation_scopes"],
+            retagged(row["tags"]),
+            row["observation_scopes"] if new_scopes is None else new_scopes,
+        ):
+            unit_ids.append(str(row["id"]))
+
+    if tags is None:
+        # A scope change alone writes no tags, so nothing above stamped the units that moved.
+        # Stamp them: an in-flight consolidation that read them under the old scopes must see
+        # the edit and drop its result (#4831), or it rebuilds the observation just deleted.
+        # Only those: stamping a unit whose scopes did not move would discard a still-valid result.
+        if unit_ids:
+            await conn.execute(
+                f"UPDATE {fq_table('memory_units')} SET updated_at = now() WHERE bank_id = $1 AND id = ANY($2::uuid[])",
+                bank_id,
+                [uuid.UUID(uid) for uid in unit_ids],
+            )
+    else:
+        await conn.execute(
+            f"UPDATE {fq_table('memory_units')} SET tags = $1, updated_at = now() WHERE document_id = $2 AND bank_id = $3",
+            tags,
+            document_id,
+            bank_id,
+        )
 
     # Restore each unit's own label projection over that blanket write.
     # A follow-up rather than one combined statement so a unit created
@@ -453,10 +509,11 @@ async def retag_document_memories(
     # 'category:durable']`, since the two would be concatenated here
     # after `retagged` had already deduped them.
     _by_final: dict[tuple[str, ...], list] = {}
-    for _row in unit_rows:
-        _final = retagged(_row["tags"])
-        if _final != list(tags):
-            _by_final.setdefault(tuple(_final), []).append(_row["id"])
+    if tags is not None:
+        for _row in unit_rows:
+            _final = retagged(_row["tags"])
+            if _final != list(tags):
+                _by_final.setdefault(tuple(_final), []).append(_row["id"])
     for _final, _ids in _by_final.items():
         await conn.execute(
             f"UPDATE {fq_table('memory_units')} SET tags = $1, updated_at = now() "
@@ -514,18 +571,8 @@ async def retag_document_memories(
                 f"DELETE FROM {fq_table('memory_units')} WHERE id = ANY($1::uuid[])",
                 obs_ids,
             )
-            # Requeue the sources: bookkeeping only, so `updated_at`
-            # stays put (see META_UPDATED_AT). The tag change above is
-            # what stamped these rows.
-            await conn.execute(
-                f"""
-                UPDATE {fq_table("memory_units")}
-                SET consolidated_at = NULL
-                WHERE id = ANY($1::uuid[])
-                  AND fact_type IN ('experience', 'world')
-                """,
-                unit_uuids,
-            )
+            # Requeue the co-sources the deleted observations strand: bookkeeping only, so
+            # `updated_at` stays put (see META_UPDATED_AT).
             if other_source_uuids:
                 await conn.execute(
                     f"""
@@ -543,7 +590,23 @@ async def retag_document_memories(
                 f"{len(other_source_uuids)} co-source memories for re-consolidation "
                 f"after document update on '{document_id}' in bank {bank_id}"
             )
-    return invalidated_obs
+        # Requeue every unit that moved — bookkeeping only, so `updated_at` stays put (see
+        # META_UPDATED_AT); the write above is what stamped these rows.
+        await conn.execute(
+            f"""
+            UPDATE {fq_table("memory_units")}
+            SET consolidated_at = NULL
+            WHERE id = ANY($1::uuid[])
+              AND fact_type IN ('experience', 'world')
+            """,
+            unit_uuids,
+        )
+    return RetagResult(invalidated_observations=invalidated_obs, requeued_units=len(unit_ids))
+
+
+#: Matches a `q` search counts and serves. Without a cap the count is a full scan of the bank's text
+#: on every page; with one it stops at the cap's worth of rows, and only a rare term pays the scan.
+DOCUMENT_SEARCH_CAP = 1000
 
 
 async def list_documents(
@@ -561,7 +624,11 @@ async def list_documents(
     limit: int,
     offset: int,
 ) -> dict[str, Any]:
-    """A page of the bank's `documents` rows with their memory counts — ``{items, total, limit, offset}``."""
+    """A page of the bank's `documents` rows with their memory counts —
+    ``{items, total, limit, offset, total_is_estimate}``.
+
+    A `q` search is capped at `DOCUMENT_SEARCH_CAP` matches: past it, ``total`` is the cap,
+    ``total_is_estimate`` is true, and no page reaches beyond it."""
     async with acquire_with_retry(backend) as conn:
         # Build query conditions
         query_conditions = []
@@ -572,11 +639,23 @@ async def list_documents(
         query_conditions.append(f"bank_id = ${param_count}")
         query_params.append(bank_id)
 
+        # Which fields the search matched, per row (0/1 so the Oracle translation needs no booleans).
+        match_columns = "0 AS id_matched, 0 AS text_matched"
         if search_query:
-            # Search in document ID
+            # Search in document ID and content. No index on original_text: this is a
+            # sequential scan per bank, meant for browsing, not hot-path workloads.
+            # q is a literal substring: escape LIKE's wildcards so "%" or "_" match themselves
+            # (unescaped, q="%" matched every document). "!" rather than backslash as the escape
+            # character: it needs no quoting in either dialect, and Oracle has no default escape.
             param_count += 1
-            query_conditions.append(f"id ILIKE ${param_count}")
-            query_params.append(f"%{search_query}%")
+            like = f"ILIKE ${param_count} ESCAPE '!'"
+            query_conditions.append(f"(id {like} OR original_text {like})")
+            literal = search_query.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+            query_params.append(f"%{literal}%")
+            match_columns = (
+                f"CASE WHEN id {like} THEN 1 ELSE 0 END AS id_matched, "
+                f"CASE WHEN original_text {like} THEN 1 ELSE 0 END AS text_matched"
+            )
 
         built = build_tags_where_clause(tags, param_offset=param_count + 1, match=tags_match)
         tags_clause = built.sql
@@ -607,19 +686,32 @@ async def list_documents(
             # tags_clause starts with "AND", append after WHERE conditions
             where_clause = where_clause + " " + tags_clause if where_clause else "WHERE " + tags_clause[4:].lstrip()
 
-        # Get total count
-        count_query = f"""
-            SELECT COUNT(*) as total
-            FROM {fq_table("documents")}
-            {where_clause}
-        """
-        count_result = await conn.fetchrow(count_query, *query_params)
-        total = count_result["total"]
+        total_is_estimate = False
+        page_limit = limit
+        if search_query:
+            # One row past the cap is enough to know there are more; the LIMIT is what lets the
+            # scan stop early instead of reading every document's text in the bank.
+            count_query = f"""
+                SELECT COUNT(*) as total
+                FROM (SELECT 1 FROM {fq_table("documents")} {where_clause} LIMIT {DOCUMENT_SEARCH_CAP + 1}) matched
+            """
+            total = (await conn.fetchrow(count_query, *query_params))["total"]
+            total_is_estimate = total > DOCUMENT_SEARCH_CAP
+            total = min(total, DOCUMENT_SEARCH_CAP)
+            # The pages stop where the count does, so paging never serves a row `total` disowns.
+            page_limit = max(0, min(limit, DOCUMENT_SEARCH_CAP - offset))
+        else:
+            count_query = f"""
+                SELECT COUNT(*) as total
+                FROM {fq_table("documents")}
+                {where_clause}
+            """
+            total = (await conn.fetchrow(count_query, *query_params))["total"]
 
         # Get documents with limit and offset (without original_text for performance)
         param_count += 1
         limit_param = f"${param_count}"
-        query_params.append(limit)
+        query_params.append(page_limit)
 
         param_count += 1
         offset_param = f"${param_count}"
@@ -635,7 +727,8 @@ async def list_documents(
                 updated_at,
                 LENGTH(original_text) as text_length,
                 retain_params,
-                tags
+                tags,
+                {match_columns}
             FROM {fq_table("documents")}
             {where_clause}
             ORDER BY {window.order_by or "updated_at DESC, created_at DESC, id"}
@@ -677,10 +770,21 @@ async def list_documents(
                     "retain_params": retain_params_val or None,
                     "document_metadata": document_metadata or None,
                     "tags": row["tags"] if row["tags"] else [],
+                    "matched_fields": [
+                        field
+                        for field, matched in (("id", row["id_matched"]), ("original_text", row["text_matched"]))
+                        if matched
+                    ],
                 }
             )
 
-        return {"items": items, "total": total, "limit": limit, "offset": offset}
+        return {
+            "items": items,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "total_is_estimate": total_is_estimate,
+        }
 
 
 # ------------------------------------------------------------------ chunks

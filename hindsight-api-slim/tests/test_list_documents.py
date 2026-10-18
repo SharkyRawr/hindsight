@@ -200,3 +200,132 @@ async def test_list_documents_orders_by_last_write(memory, request_context):
 
     finally:
         await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_list_documents_search_query_matches_text(memory, request_context):
+    """q matches document text, not only the document ID (#5214)."""
+    bank_id = f"test_list_docs_q_text_{datetime.now(timezone.utc).timestamp()}"
+
+    try:
+        await _retain_doc(memory, bank_id, "doc-a", None, request_context)
+        await memory.retain_batch_async(
+            bank_id=bank_id,
+            contents=[{"content": "xyzabc123 !@# Onboarding-Zebra-Token $$$"}],
+            document_id="doc-b",
+            request_context=request_context,
+        )
+
+        result = await memory.list_documents(
+            bank_id=bank_id, search_query="onboarding-zebra", request_context=request_context
+        )
+        assert {d["id"] for d in result["items"]} == {"doc-b"}
+        assert result["total"] == 1
+
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_list_documents_reports_matched_fields(memory, request_context):
+    """Each row says which fields matched q: id, original_text, or both."""
+    bank_id = f"test_list_docs_matched_{datetime.now(timezone.utc).timestamp()}"
+
+    try:
+
+        async def retain(document_id: str, content: str) -> None:
+            await memory.retain_batch_async(
+                bank_id=bank_id,
+                contents=[{"content": f"xyzabc123 !@# {content} $$$"}],
+                document_id=document_id,
+                request_context=request_context,
+            )
+
+        await retain("kiwi-both", "kiwi-in-text")
+        await retain("kiwi-id-only", "nothing-here")
+        await retain("plain", "kiwi-in-text")
+        await retain("unrelated", "nothing-here")
+
+        result = await memory.list_documents(bank_id=bank_id, search_query="KIWI", request_context=request_context)
+        matched = {d["id"]: d["matched_fields"] for d in result["items"]}
+        assert matched == {
+            "kiwi-both": ["id", "original_text"],
+            "kiwi-id-only": ["id"],
+            "plain": ["original_text"],
+        }
+
+        no_q = await memory.list_documents(bank_id=bank_id, request_context=request_context)
+        assert all(d["matched_fields"] == [] for d in no_q["items"])
+
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_list_documents_search_query_is_literal(memory, request_context):
+    """LIKE wildcards in q match themselves: "%" is not "everything", "_" is not "any char"."""
+    bank_id = f"test_list_docs_q_literal_{datetime.now(timezone.utc).timestamp()}"
+
+    try:
+        for document_id, content in [
+            ("discount", "xyzabc123 !@# 50% off $$$"),
+            ("snake", "xyzabc123 !@# snake_case $$$"),
+            ("bang", "xyzabc123 !@# wow!! $$$"),
+            ("plain", "xyzabc123 !@# nothing special $$$"),
+        ]:
+            await memory.retain_batch_async(
+                bank_id=bank_id,
+                contents=[{"content": content}],
+                document_id=document_id,
+                request_context=request_context,
+            )
+
+        async def ids(q: str) -> set[str]:
+            result = await memory.list_documents(bank_id=bank_id, search_query=q, request_context=request_context)
+            return {d["id"] for d in result["items"]}
+
+        assert await ids("%") == {"discount"}
+        assert await ids("e_c") == {"snake"}
+        assert await ids("50%") == {"discount"}
+        assert await ids("!!") == {"bang"}
+        # "snake case" with "_" as a wildcard would match "snake_case"; literal it does not.
+        assert await ids("e c") == set()
+
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_list_documents_search_is_capped_and_says_so(memory, request_context, monkeypatch):
+    """A q search counts at most the cap: past it `total` is the cap, `total_is_estimate` is true,
+    and no page reaches beyond the cap. Under it the count is exact and the flag is false."""
+    from hindsight_api.engine.memories.pg import documents as pg_documents
+
+    monkeypatch.setattr(pg_documents, "DOCUMENT_SEARCH_CAP", 2)
+    bank_id = f"test_list_docs_q_cap_{datetime.now(timezone.utc).timestamp()}"
+
+    try:
+        for i in range(3):
+            await _retain_doc(memory, bank_id, f"capped-{i}", None, request_context)
+
+        capped = await memory.list_documents(bank_id=bank_id, search_query="capped", request_context=request_context)
+        assert capped["total"] == 2
+        assert capped["total_is_estimate"] is True
+        assert len(capped["items"]) == 2
+
+        past = await memory.list_documents(
+            bank_id=bank_id, search_query="capped", limit=10, offset=1, request_context=request_context
+        )
+        assert len(past["items"]) == 1
+        assert past["limit"] == 10
+
+        exact = await memory.list_documents(bank_id=bank_id, search_query="capped-1", request_context=request_context)
+        assert exact["total"] == 1
+        assert exact["total_is_estimate"] is False
+
+        unfiltered = await memory.list_documents(bank_id=bank_id, request_context=request_context)
+        assert unfiltered["total"] == 3
+        assert unfiltered["total_is_estimate"] is False
+
+    finally:
+        await memory.delete_bank(bank_id, request_context=request_context)

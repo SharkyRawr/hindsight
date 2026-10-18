@@ -182,6 +182,7 @@ hindsight_client_api/models/reflect_response.py
 hindsight_client_api/models/reflect_tool_call.py
 hindsight_client_api/models/reflect_trace.py
 hindsight_client_api/models/refresh_mental_model_operation_details.py
+hindsight_client_api/models/refresh_mental_model_request.py
 hindsight_client_api/models/reprocess_document_response.py
 hindsight_client_api/models/retain_request.py
 hindsight_client_api/models/retain_response.py
@@ -207,6 +208,7 @@ hindsight_client_api/models/token_usage.py
 hindsight_client_api/models/tool_calls_include_options.py
 hindsight_client_api/models/update_directive_request.py
 hindsight_client_api/models/update_disposition_request.py
+hindsight_client_api/models/update_document_observation_scopes.py
 hindsight_client_api/models/update_document_request.py
 hindsight_client_api/models/update_document_response.py
 hindsight_client_api/models/update_memory_request.py

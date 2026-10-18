@@ -30,6 +30,11 @@ STEP_ANCHORS: dict[str, str] = {
     # mission was set. This line is on every reflect turn regardless.
     "reflect": "CRITICAL: You MUST ONLY use information from retrieved tool results.",
     "reflect_answer": "You are a thoughtful assistant that synthesizes answers from retrieved memories.",
+    # The closing turn: when the loop stops without calling `done`, the server asks
+    # for it once more inside the same conversation before falling back to the
+    # standalone `reflect_answer` prompt. It carries the `reflect` preamble too, so
+    # a rule for it has to be registered before the generic `reflect` rules.
+    "reflect_closing": "Stop retrieving. Call the `done` tool",
     # Structured output is a *second* call after the answer: an extraction pass
     # that reshapes the prose into the caller's schema. Anchored separately
     # because a story about the schema is about this call, not the answer.
@@ -38,6 +43,9 @@ STEP_ANCHORS: dict[str, str] = {
     # caller's token budget. Anchored separately because a story about the budget
     # is about this call, not the one that wrote the answer.
     "reflect_trim": "Rewrite the user's text so it fits within the requested token budget.",
+    # A decision-orchestrated reflect's first call rewrites the request into one search query (or answers
+    # that there is nothing to search). Tool-less, so it never matches `reflect`.
+    "reflect_round_query": "You write search queries for a memory bank.",
     "connection_probe": "Say 'ok'",
 }
 
