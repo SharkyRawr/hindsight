@@ -357,6 +357,43 @@ def _resolve_operation_strict_schema(operation_env: str) -> bool:
     return raw.strip().lower() in ("true", "1")
 
 
+OBSERVATION_SCOPES_MODES = ("combined", "per_tag", "all_combinations", "shared")
+
+
+def validate_observation_scopes(value: object, name: str) -> None:
+    """Reject an ``observation_scopes`` value retain would not accept: a mode, or a list of tag lists.
+
+    Shared by the env parser (so a typo stops start-up instead of failing every consolidation
+    later) and the bank-config API.
+    """
+    if isinstance(value, str) and value in OBSERVATION_SCOPES_MODES:
+        return
+    if isinstance(value, list) and all(
+        isinstance(scope, list) and all(isinstance(tag, str) for tag in scope) for scope in value
+    ):
+        return
+    raise ValueError(
+        f"{name} must be one of {', '.join(OBSERVATION_SCOPES_MODES)} or a list of tag lists "
+        f'(e.g. [["topic:*"]]), got {value!r}'
+    )
+
+
+def _parse_observation_scopes_env(raw: str | None) -> str | list | None:
+    """A mode name (``combined``, ``shared`` ...) as-is, or a JSON scope list (``[["topic:*"]]``)."""
+    if not raw or not raw.strip():
+        return None
+    raw = raw.strip()
+    if raw.startswith("["):
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid {ENV_DEFAULT_OBSERVATION_SCOPES}: invalid JSON: {e}") from e
+    else:
+        value = raw
+    validate_observation_scopes(value, ENV_DEFAULT_OBSERVATION_SCOPES)
+    return value
+
+
 def _parse_boolean_env(env_name: str, default: bool) -> bool:
     """Parse a boolean environment variable, rejecting ambiguous values."""
     raw = os.getenv(env_name)
@@ -644,6 +681,7 @@ ENV_RERANKER_TEI_BATCH_SIZE = "HINDSIGHT_API_RERANKER_TEI_BATCH_SIZE"
 ENV_RERANKER_TEI_MAX_CONCURRENT = "HINDSIGHT_API_RERANKER_TEI_MAX_CONCURRENT"
 ENV_RERANKER_TEI_HTTP_TIMEOUT = "HINDSIGHT_API_RERANKER_TEI_HTTP_TIMEOUT"
 ENV_RERANKER_COHERE_TIMEOUT = "HINDSIGHT_API_RERANKER_COHERE_TIMEOUT"
+ENV_RERANKER_COHERE_MAX_CONCURRENT = "HINDSIGHT_API_RERANKER_COHERE_MAX_CONCURRENT"
 ENV_RERANKER_OPENROUTER_TIMEOUT = "HINDSIGHT_API_RERANKER_OPENROUTER_TIMEOUT"
 ENV_RERANKER_ZEROENTROPY_TIMEOUT = "HINDSIGHT_API_RERANKER_ZEROENTROPY_TIMEOUT"
 ENV_RERANKER_SILICONFLOW_TIMEOUT = "HINDSIGHT_API_RERANKER_SILICONFLOW_TIMEOUT"
@@ -924,6 +962,7 @@ ENV_CONSOLIDATION_USE_DECISION_MODEL = "HINDSIGHT_API_CONSOLIDATION_USE_DECISION
 ENV_OBSERVATIONS_MISSION = "HINDSIGHT_API_OBSERVATIONS_MISSION"
 ENV_MAX_OBSERVATIONS_PER_SCOPE = "HINDSIGHT_API_MAX_OBSERVATIONS_PER_SCOPE"
 ENV_OBSERVATION_SCOPE_LIMITS = "HINDSIGHT_API_OBSERVATION_SCOPE_LIMITS"
+ENV_DEFAULT_OBSERVATION_SCOPES = "HINDSIGHT_API_DEFAULT_OBSERVATION_SCOPES"
 ENV_CONSOLIDATION_STRATEGIES = "HINDSIGHT_API_CONSOLIDATION_STRATEGIES"
 ENV_ENABLE_OBSERVATION_HISTORY = "HINDSIGHT_API_ENABLE_OBSERVATION_HISTORY"
 ENV_OBSERVATION_HISTORY_MAX_ENTRIES = "HINDSIGHT_API_OBSERVATION_HISTORY_MAX_ENTRIES"
@@ -1067,6 +1106,7 @@ ENV_CONSOLIDATION_WALL_TIMEOUT = "HINDSIGHT_API_CONSOLIDATION_WALL_TIMEOUT"
 ENV_REFLECT_MAX_ITERATIONS = "HINDSIGHT_API_REFLECT_MAX_ITERATIONS"
 ENV_REFLECT_USE_DECISION_MODEL = "HINDSIGHT_API_REFLECT_USE_DECISION_MODEL"
 ENV_MENTAL_MODEL_REFRESH_USE_DECISION_MODEL = "HINDSIGHT_API_MENTAL_MODEL_REFRESH_USE_DECISION_MODEL"
+ENV_MENTAL_MODEL_DELTA_USE_DECISION_MODEL = "HINDSIGHT_API_MENTAL_MODEL_DELTA_USE_DECISION_MODEL"
 ENV_REFLECT_PROMPT_CACHE_ENABLED = "HINDSIGHT_API_REFLECT_PROMPT_CACHE_ENABLED"
 ENV_REFLECT_MAX_CONTEXT_TOKENS = "HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS"
 ENV_REFLECT_WALL_TIMEOUT = "HINDSIGHT_API_REFLECT_WALL_TIMEOUT"
@@ -1135,6 +1175,7 @@ ENV_FAIL_ON_EXTRACTION_ERRORS = "HINDSIGHT_API_FAIL_ON_EXTRACTION_ERRORS"
 # LLM request tracing settings
 ENV_LLM_TRACE_ENABLED = "HINDSIGHT_API_LLM_TRACE_ENABLED"
 ENV_LLM_TRACE_SCOPES = "HINDSIGHT_API_LLM_TRACE_SCOPES"
+ENV_LLM_TRACE_EXCLUDE_SCOPES = "HINDSIGHT_API_LLM_TRACE_EXCLUDE_SCOPES"
 ENV_LLM_TRACE_RETENTION_DAYS = "HINDSIGHT_API_LLM_TRACE_RETENTION_DAYS"
 ENV_LLM_TRACE_MAX_CHARS = "HINDSIGHT_API_LLM_TRACE_MAX_CHARS"
 
@@ -1365,6 +1406,9 @@ DEFAULT_RERANKER_TEI_HTTP_TIMEOUT = 30.0  # HTTP timeout for TEI reranker reques
 # HTTP timeout (seconds) for remote rerank providers. Defaults match the previous
 # hardcoded constructor defaults so unset envs keep current behavior.
 DEFAULT_RERANKER_COHERE_TIMEOUT = 60.0
+# In-flight rerank requests per process. Excess requests queue locally, so the request
+# timeout measures server time rather than time spent behind other recalls.
+DEFAULT_RERANKER_COHERE_MAX_CONCURRENT = 16
 DEFAULT_RERANKER_OPENROUTER_TIMEOUT = 60.0
 DEFAULT_RERANKER_ZEROENTROPY_TIMEOUT = 60.0
 DEFAULT_RERANKER_SILICONFLOW_TIMEOUT = 60.0
@@ -1469,6 +1513,15 @@ DEFAULT_RERANKER_FLASHRANK_CPU_MEM_ARENA = False  # Disable ONNX CPU memory aren
 # costs gigabytes and can OOM the container (issue #3355). Matches the local
 # reranker's default batch size.
 DEFAULT_RERANKER_FLASHRANK_BATCH_SIZE = 32
+# ONNX reranker. The model defaults to the local provider's, whose HF repo ships onnx/model.onnx.
+DEFAULT_RERANKER_ONNX_FILE = "onnx/model.onnx"
+DEFAULT_RERANKER_ONNX_MAX_TOKENS = 512
+DEFAULT_RERANKER_ONNX_BATCH_SIZE = 32  # Pairs per forward pass; bounds peak memory like FlashRank's
+DEFAULT_RERANKER_ONNX_THREADS = 0  # Threads per pass; 0 = the native thread cap (OMP_NUM_THREADS)
+# One pass at a time: a pass already spreads over every thread, so a second concurrent
+# one adds contention, not throughput, and the CPU ceiling stays `threads` cores.
+DEFAULT_RERANKER_ONNX_MAX_CONCURRENT = 1
+DEFAULT_RERANKER_ONNX_CPU_MEM_ARENA = False  # Arena never shrinks; off keeps RSS bounded
 
 DEFAULT_EMBEDDINGS_COHERE_MODEL = "embed-english-v3.0"
 DEFAULT_RERANKER_COHERE_MODEL = "rerank-english-v3.0"
@@ -1900,6 +1953,9 @@ DEFAULT_MAX_OBSERVATIONS_PER_SCOPE = -1  # Max observations per tag scope (-1 = 
 # Per-scope overrides of the cap above: list of {"scope": [tag-globs], "limit": int}.
 # First rule whose pattern exact-covers a scope's tags wins; else the default above.
 DEFAULT_OBSERVATION_SCOPE_LIMITS: list | None = None
+# observation_scopes applied to a retained item that declares none. None keeps the
+# historical behaviour (combined: each memory's own tag set).
+DEFAULT_DEFAULT_OBSERVATION_SCOPES: str | list | None = None
 # Per-scope consolidation settings: list of
 # {"scopes": [{"tags": [tag-globs], "tags_match": "all"|"exact"}, ...], "observations_mission": str, ...}
 # (each setting optional). A strategy claims a scope when ANY of its patterns
@@ -2032,6 +2088,8 @@ DEFAULT_REFLECT_MAX_ITERATIONS = 10  # Max tool call iterations before forcing r
 # On by default, so setting up a decision model is what turns it on; a bank can opt out.
 DEFAULT_REFLECT_USE_DECISION_MODEL = True
 DEFAULT_MENTAL_MODEL_REFRESH_USE_DECISION_MODEL = True
+# A delta refresh asks the decision model which new memories could change the page, in place of reflect.
+DEFAULT_MENTAL_MODEL_DELTA_USE_DECISION_MODEL = True
 # Step-by-step context caching for the reflect tool loop (Gemini). On by default;
 # requires the global prompt cache (HINDSIGHT_API_LLM_PROMPT_CACHE_ENABLED) to also
 # be on. Set false to force reflect to run uncached even when prompt caching is on.
@@ -2122,6 +2180,7 @@ DEFAULT_FAIL_ON_EXTRACTION_ERRORS = (
 # LLM request tracing defaults
 DEFAULT_LLM_TRACE_ENABLED = True  # Enabled by default
 DEFAULT_LLM_TRACE_SCOPES = ""  # Empty = trace all call scopes
+DEFAULT_LLM_TRACE_EXCLUDE_SCOPES = ""  # Empty = exclude nothing
 DEFAULT_LLM_TRACE_RETENTION_DAYS = 1  # Retain trace rows for 1 day by default
 DEFAULT_LLM_TRACE_MAX_CHARS = 50000  # Truncate stored input/output beyond this many chars
 
@@ -2664,7 +2723,9 @@ class LLMStrategyConfig(BaseModel):
     ``weights`` is round-robin only: positive integers, one per member (primary
     first), giving an unbalanced rotation; ``None`` means uniform. ``routes`` is
     metadata only: the first route matching an item wins, and an item matching
-    none uses the primary.
+    none uses the primary. ``cooldown_seconds`` moves a member that just failed
+    to the back of the order for that long, doubling if it fails again once
+    that is over (capped at an hour) and clearing on its next success; ``0`` turns it off.
     """
 
     model_config = ConfigDict(strict=True, extra="forbid")
@@ -2672,6 +2733,7 @@ class LLMStrategyConfig(BaseModel):
     mode: str
     weights: list[int] | None = None
     routes: list[LLMMetadataRoute] | None = None
+    cooldown_seconds: int = Field(default=60, ge=0)
 
     @field_validator("mode")
     @classmethod
@@ -2806,6 +2868,38 @@ def _parse_llm_members(prefix: str) -> list[LLMMemberConfig]:
 
 
 @dataclass
+class OnnxRerankerConfig:
+    """Settings of the ``onnx`` reranker provider, read from ``{prefix}ONNX_*``."""
+
+    model_id: str
+    model_path: str | None
+    tokenizer_name_or_path: str | None
+    file: str
+    max_tokens: int
+    batch_size: int
+    threads: int
+    max_concurrent: int
+    cpu_mem_arena: bool
+    timeout: float
+
+    @classmethod
+    def from_env(cls, base: str) -> "OnnxRerankerConfig":
+        """Read one member's settings; the primary and indexed members differ only in ``base``."""
+        return cls(
+            model_id=_member_str(base, "ONNX_MODEL_ID", DEFAULT_RERANKER_LOCAL_MODEL),
+            model_path=_member_opt_str(base, "ONNX_MODEL_PATH"),
+            tokenizer_name_or_path=_member_opt_str(base, "ONNX_TOKENIZER_NAME_OR_PATH"),
+            file=_member_str(base, "ONNX_FILE", DEFAULT_RERANKER_ONNX_FILE),
+            max_tokens=_member_int(base, "ONNX_MAX_TOKENS", DEFAULT_RERANKER_ONNX_MAX_TOKENS),
+            batch_size=_member_int(base, "ONNX_BATCH_SIZE", DEFAULT_RERANKER_ONNX_BATCH_SIZE),
+            threads=_member_int(base, "ONNX_THREADS", DEFAULT_RERANKER_ONNX_THREADS),
+            max_concurrent=_member_int(base, "ONNX_MAX_CONCURRENT", DEFAULT_RERANKER_ONNX_MAX_CONCURRENT),
+            cpu_mem_arena=_member_bool(base, "ONNX_CPU_MEM_ARENA", DEFAULT_RERANKER_ONNX_CPU_MEM_ARENA),
+            timeout=_member_float(base, "ONNX_TIMEOUT", DEFAULT_RERANKER_LOCAL_TIMEOUT),
+        )
+
+
+@dataclass
 class RerankerMemberConfig:
     """One reranker in the failover chain.
 
@@ -2845,6 +2939,7 @@ class RerankerMemberConfig:
     cohere_model: str
     cohere_base_url: str | None
     cohere_timeout: float
+    cohere_max_concurrent: int
     # openrouter
     openrouter_api_key: str | None
     openrouter_model: str
@@ -2855,6 +2950,7 @@ class RerankerMemberConfig:
     flashrank_cache_dir: str | None
     flashrank_cpu_mem_arena: bool
     flashrank_batch_size: int
+    onnx: OnnxRerankerConfig
     # litellm (proxy)
     litellm_api_base: str
     litellm_api_key: str | None
@@ -3011,6 +3107,9 @@ def _parse_reranker_members() -> list[RerankerMemberConfig]:
                 cohere_model=_member_str(base, "COHERE_MODEL", DEFAULT_RERANKER_COHERE_MODEL),
                 cohere_base_url=_member_opt_str(base, "COHERE_BASE_URL"),
                 cohere_timeout=_member_float(base, "COHERE_TIMEOUT", DEFAULT_RERANKER_COHERE_TIMEOUT),
+                cohere_max_concurrent=_member_int(
+                    base, "COHERE_MAX_CONCURRENT", DEFAULT_RERANKER_COHERE_MAX_CONCURRENT
+                ),
                 openrouter_api_key=_member_opt_str(base, "OPENROUTER_API_KEY"),
                 openrouter_model=_member_str(base, "OPENROUTER_MODEL", DEFAULT_RERANKER_OPENROUTER_MODEL),
                 openrouter_base_url=_member_str(base, "OPENROUTER_BASE_URL", DEFAULT_RERANKER_OPENROUTER_BASE_URL),
@@ -3021,6 +3120,7 @@ def _parse_reranker_members() -> list[RerankerMemberConfig]:
                     base, "FLASHRANK_CPU_MEM_ARENA", DEFAULT_RERANKER_FLASHRANK_CPU_MEM_ARENA
                 ),
                 flashrank_batch_size=_member_int(base, "FLASHRANK_BATCH_SIZE", DEFAULT_RERANKER_FLASHRANK_BATCH_SIZE),
+                onnx=OnnxRerankerConfig.from_env(base),
                 litellm_api_base=_member_str(base, "LITELLM_API_BASE", DEFAULT_LITELLM_API_BASE),
                 litellm_api_key=_member_opt_str(base, "LITELLM_API_KEY"),
                 litellm_model=_member_str(base, "LITELLM_MODEL", DEFAULT_RERANKER_LITELLM_MODEL),
@@ -3458,6 +3558,7 @@ class HindsightConfig:
     reranker_cohere_model: str
     reranker_cohere_base_url: str | None
     reranker_cohere_timeout: float
+    reranker_cohere_max_concurrent: int
     reranker_openrouter_api_key: str | None
     reranker_openrouter_model: str
     reranker_openrouter_base_url: str
@@ -3641,6 +3742,8 @@ class HindsightConfig:
     # DEPRECATED — superseded by consolidation_strategies below, which carries
     # the mission too. Still honoured, consulted after the strategies.
     observation_scope_limits: list | None
+    # observation_scopes for retained items that declare none (mode string, or list[list[str]] with optional globs)
+    default_observation_scopes: str | list | None
     # Per-scope consolidation settings (mission / observation cap).
     # Raw JSON shape: [{"scopes": [{"tags": ["company:*"]}], "observations_mission": "...",
     #                   "max_observations_per_scope": 20}, ...]
@@ -3741,6 +3844,7 @@ class HindsightConfig:
     reflect_max_iterations: int
     reflect_use_decision_model: bool
     mental_model_refresh_use_decision_model: bool
+    mental_model_delta_use_decision_model: bool
     reflect_max_context_tokens: int
     reflect_wall_timeout: int
     reflect_prompt_cache_enabled: bool
@@ -3781,6 +3885,7 @@ class HindsightConfig:
     # LLM request tracing configuration (static - server-level only)
     llm_trace_enabled: bool  # Master switch for per-bank LLM request tracing
     llm_trace_scopes: list[str]  # Allowlist of call scopes to trace (empty = all)
+    llm_trace_exclude_scopes: list[str]  # Call scopes never traced; wins over the allowlist
     llm_trace_retention_days: int  # -1 = keep forever, >0 = delete after N days
     llm_trace_max_chars: int  # Truncate stored input/output beyond this many chars
 
@@ -4037,6 +4142,7 @@ class HindsightConfig:
         "observations_mission",
         "max_observations_per_scope",
         "observation_scope_limits",
+        "default_observation_scopes",
         "consolidation_strategies",
         # Mental model settings
         "mental_model_min_refresh_interval_seconds",
@@ -4045,6 +4151,7 @@ class HindsightConfig:
         "reflect_mission",
         "reflect_use_decision_model",
         "mental_model_refresh_use_decision_model",
+        "mental_model_delta_use_decision_model",
         "reflect_source_facts_max_tokens",
         "reflect_default_options",
         # Recall settings (used by internal recall, e.g. mental model refresh)
@@ -4117,6 +4224,7 @@ class HindsightConfig:
             cohere_model=self.reranker_cohere_model,
             cohere_base_url=self.reranker_cohere_base_url,
             cohere_timeout=self.reranker_cohere_timeout,
+            cohere_max_concurrent=self.reranker_cohere_max_concurrent,
             openrouter_api_key=self.reranker_openrouter_api_key,
             openrouter_model=self.reranker_openrouter_model,
             openrouter_base_url=self.reranker_openrouter_base_url,
@@ -4133,6 +4241,8 @@ class HindsightConfig:
             flashrank_batch_size=int(
                 os.environ.get(ENV_RERANKER_FLASHRANK_BATCH_SIZE, "").strip() or DEFAULT_RERANKER_FLASHRANK_BATCH_SIZE
             ),
+            # onnx, like flashrank, has no HindsightConfig fields — read from the env directly
+            onnx=OnnxRerankerConfig.from_env("HINDSIGHT_API_RERANKER_"),
             litellm_api_base=self.reranker_litellm_api_base,
             litellm_api_key=self.reranker_litellm_api_key,
             litellm_model=self.reranker_litellm_model,
@@ -4967,6 +5077,9 @@ class HindsightConfig:
             reranker_cohere_model=os.getenv(ENV_RERANKER_COHERE_MODEL, DEFAULT_RERANKER_COHERE_MODEL),
             reranker_cohere_base_url=os.getenv(ENV_RERANKER_COHERE_BASE_URL) or None,
             reranker_cohere_timeout=float(os.getenv(ENV_RERANKER_COHERE_TIMEOUT, str(DEFAULT_RERANKER_COHERE_TIMEOUT))),
+            reranker_cohere_max_concurrent=int(
+                os.getenv(ENV_RERANKER_COHERE_MAX_CONCURRENT, str(DEFAULT_RERANKER_COHERE_MAX_CONCURRENT))
+            ),
             # OpenRouter reranker (with fallback to shared OpenRouter key, then LLM key)
             reranker_openrouter_api_key=os.getenv(ENV_RERANKER_OPENROUTER_API_KEY)
             or os.getenv(ENV_OPENROUTER_API_KEY)
@@ -5385,6 +5498,8 @@ class HindsightConfig:
             ),
             observation_scope_limits=json.loads(os.getenv(ENV_OBSERVATION_SCOPE_LIMITS, "null"))
             or DEFAULT_OBSERVATION_SCOPE_LIMITS,
+            default_observation_scopes=_parse_observation_scopes_env(os.getenv(ENV_DEFAULT_OBSERVATION_SCOPES))
+            or DEFAULT_DEFAULT_OBSERVATION_SCOPES,
             consolidation_strategies=json.loads(os.getenv(ENV_CONSOLIDATION_STRATEGIES, "null"))
             or DEFAULT_CONSOLIDATION_STRATEGIES,
             entity_labels=None,
@@ -5468,6 +5583,10 @@ class HindsightConfig:
             == "true",
             mental_model_refresh_use_decision_model=os.getenv(
                 ENV_MENTAL_MODEL_REFRESH_USE_DECISION_MODEL, str(DEFAULT_MENTAL_MODEL_REFRESH_USE_DECISION_MODEL)
+            ).lower()
+            == "true",
+            mental_model_delta_use_decision_model=os.getenv(
+                ENV_MENTAL_MODEL_DELTA_USE_DECISION_MODEL, str(DEFAULT_MENTAL_MODEL_DELTA_USE_DECISION_MODEL)
             ).lower()
             == "true",
             reflect_prompt_cache_enabled=os.getenv(
@@ -5572,6 +5691,11 @@ class HindsightConfig:
             llm_trace_enabled=os.getenv(ENV_LLM_TRACE_ENABLED, str(DEFAULT_LLM_TRACE_ENABLED)).lower() == "true",
             llm_trace_scopes=[
                 s.strip() for s in os.getenv(ENV_LLM_TRACE_SCOPES, DEFAULT_LLM_TRACE_SCOPES).split(",") if s.strip()
+            ],
+            llm_trace_exclude_scopes=[
+                s.strip()
+                for s in os.getenv(ENV_LLM_TRACE_EXCLUDE_SCOPES, DEFAULT_LLM_TRACE_EXCLUDE_SCOPES).split(",")
+                if s.strip()
             ],
             llm_trace_retention_days=int(
                 os.getenv(ENV_LLM_TRACE_RETENTION_DAYS, str(DEFAULT_LLM_TRACE_RETENTION_DAYS))
@@ -5795,6 +5919,9 @@ class HindsightConfig:
             logger.info("Reranker: replaced by the decision model in recall")
         else:
             logger.info(f"Reranker: provider={self.reranker_provider}")
+        from ._thread_limits import native_thread_summary
+
+        logger.info(native_thread_summary())
         for operation in DECISION_MODEL_OPERATIONS:
             if decision_model := self.decision_model_config(operation):
                 logger.info(

@@ -28,6 +28,7 @@ hindsight_client_api/models/audit_log_entry.py
 hindsight_client_api/models/audit_log_list_response.py
 hindsight_client_api/models/audit_log_stats_bucket.py
 hindsight_client_api/models/audit_log_stats_response.py
+hindsight_client_api/models/audit_log_summary.py
 hindsight_client_api/models/background_response.py
 hindsight_client_api/models/bank_alias_entry.py
 hindsight_client_api/models/bank_aliases_response.py
@@ -70,6 +71,7 @@ hindsight_client_api/models/create_mental_model_request.py
 hindsight_client_api/models/create_mental_model_response.py
 hindsight_client_api/models/create_page_request.py
 hindsight_client_api/models/create_webhook_request.py
+hindsight_client_api/models/default_observation_scopes.py
 hindsight_client_api/models/default_scopes_preview.py
 hindsight_client_api/models/delete_document_response.py
 hindsight_client_api/models/delete_operation_response.py
@@ -77,7 +79,10 @@ hindsight_client_api/models/delete_response.py
 hindsight_client_api/models/directive_list_response.py
 hindsight_client_api/models/directive_response.py
 hindsight_client_api/models/disposition_traits.py
+hindsight_client_api/models/document_event.py
+hindsight_client_api/models/document_event_kind.py
 hindsight_client_api/models/document_export_submit_response.py
+hindsight_client_api/models/document_history_response.py
 hindsight_client_api/models/document_import_submit_response.py
 hindsight_client_api/models/document_list_item.py
 hindsight_client_api/models/document_response.py
@@ -155,6 +160,7 @@ hindsight_client_api/models/mental_model_trigger_output.py
 hindsight_client_api/models/min_scores.py
 hindsight_client_api/models/model_not.py
 hindsight_client_api/models/not1.py
+hindsight_client_api/models/observation_id_sample.py
 hindsight_client_api/models/observation_scope.py
 hindsight_client_api/models/observation_scopes.py
 hindsight_client_api/models/observation_scopes_response.py

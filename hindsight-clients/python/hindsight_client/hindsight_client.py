@@ -47,6 +47,7 @@ DEFAULT_USER_AGENT = f"hindsight-client-python/{_CLIENT_VERSION}"
 #: refused with 422 rather than silently dropping the attachments.
 ContentBlock = dict[str, Any]
 from hindsight_client_api.api import (
+    audit_api,
     bank_transfer_api,
     banks_api,
     directives_api,
@@ -314,6 +315,7 @@ class Hindsight:
         self._operations_api = operations_api.OperationsApi(self._api_client)
         self._webhooks_api = webhooks_api.WebhooksApi(self._api_client)
         self._monitoring_api = monitoring_api.MonitoringApi(self._api_client)
+        self._audit_api = audit_api.AuditApi(self._api_client)
         self._document_transfer_api = document_transfer_api.DocumentTransferApi(self._api_client)
         self._bank_transfer_api = bank_transfer_api.BankTransferApi(self._api_client)
 
@@ -410,6 +412,11 @@ class Hindsight:
     def monitoring(self) -> monitoring_api.MonitoringApi:
         """Low-level Monitoring API — health check, version, metrics."""
         return self._monitoring_api
+
+    @property
+    def audit(self) -> audit_api.AuditApi:
+        """Low-level Audit API — list a bank's audit log, get one entry with its bodies."""
+        return self._audit_api
 
     def __enter__(self):
         """Context manager entry."""
@@ -1631,6 +1638,7 @@ class Hindsight:
         detail: Literal["metadata", "content", "full"] | None = None,
         limit: int | None = None,
         offset: int | None = None,
+        exclude_knowledge_pages: bool | None = None,
     ):
         """
         List all mental models in a bank (sync wrapper — prefer :meth:`alist_mental_models` in async code).
@@ -1645,6 +1653,7 @@ class Hindsight:
                 detail=detail,
                 limit=limit,
                 offset=offset,
+                exclude_knowledge_pages=exclude_knowledge_pages,
             )
         )
 
@@ -1656,6 +1665,7 @@ class Hindsight:
         detail: Literal["metadata", "content", "full"] | None = None,
         limit: int | None = None,
         offset: int | None = None,
+        exclude_knowledge_pages: bool | None = None,
     ):
         """
         List all mental models in a bank (async — preferred over :meth:`list_mental_models`).
@@ -1671,6 +1681,8 @@ class Hindsight:
                 text, or read a single model with get_mental_model.
             limit: Maximum number of mental models to return
             offset: Number of mental models to skip (for pagination)
+            exclude_knowledge_pages: Leave out the models that hold knowledge page
+                content, listing standalone mental models only (server default: false)
 
         Returns:
             ListMentalModelsResponse with items
@@ -1682,6 +1694,7 @@ class Hindsight:
             detail=detail,
             limit=limit,
             offset=offset,
+            exclude_knowledge_pages=exclude_knowledge_pages,
             _request_timeout=self._timeout,
         )
 
@@ -2902,6 +2915,7 @@ class Hindsight:
         max_observations_per_scope: int | None = None,
         observation_scope_limits: list[dict[str, Any]] | None = None,
         consolidation_strategies: list[dict[str, Any]] | None = None,
+        default_observation_scopes: str | list[list[str]] | None = None,
         enable_auto_consolidation: bool | None = None,
         consolidation_use_decision_model: bool | None = None,
         consolidation_llm_parallelism: int | None = None,
@@ -2911,6 +2925,7 @@ class Hindsight:
         reflect_default_options: dict[str, Any] | None = None,
         reflect_use_decision_model: bool | None = None,
         mental_model_refresh_use_decision_model: bool | None = None,
+        mental_model_delta_use_decision_model: bool | None = None,
         enable_text_search: bool | None = None,
         enable_temporal_retrieval: bool | None = None,
         enable_graph_retrieval: bool | None = None,
@@ -2971,6 +2986,7 @@ class Hindsight:
                 max_observations_per_scope=max_observations_per_scope,
                 observation_scope_limits=observation_scope_limits,
                 consolidation_strategies=consolidation_strategies,
+                default_observation_scopes=default_observation_scopes,
                 enable_auto_consolidation=enable_auto_consolidation,
                 consolidation_use_decision_model=consolidation_use_decision_model,
                 consolidation_llm_parallelism=consolidation_llm_parallelism,
@@ -2980,6 +2996,7 @@ class Hindsight:
                 reflect_default_options=reflect_default_options,
                 reflect_use_decision_model=reflect_use_decision_model,
                 mental_model_refresh_use_decision_model=mental_model_refresh_use_decision_model,
+                mental_model_delta_use_decision_model=mental_model_delta_use_decision_model,
                 enable_text_search=enable_text_search,
                 enable_temporal_retrieval=enable_temporal_retrieval,
                 enable_graph_retrieval=enable_graph_retrieval,
@@ -3037,6 +3054,7 @@ class Hindsight:
         max_observations_per_scope: int | None = None,
         observation_scope_limits: list[dict[str, Any]] | None = None,
         consolidation_strategies: list[dict[str, Any]] | None = None,
+        default_observation_scopes: str | list[list[str]] | None = None,
         enable_auto_consolidation: bool | None = None,
         consolidation_use_decision_model: bool | None = None,
         consolidation_llm_parallelism: int | None = None,
@@ -3046,6 +3064,7 @@ class Hindsight:
         reflect_default_options: dict[str, Any] | None = None,
         reflect_use_decision_model: bool | None = None,
         mental_model_refresh_use_decision_model: bool | None = None,
+        mental_model_delta_use_decision_model: bool | None = None,
         enable_text_search: bool | None = None,
         enable_temporal_retrieval: bool | None = None,
         enable_graph_retrieval: bool | None = None,
@@ -3113,6 +3132,8 @@ class Hindsight:
             max_observations_per_scope: Cap on observations retained per scope (-1 for unlimited).
             observation_scope_limits: Deprecated; use consolidation_strategies. Per-scope observation caps.
             consolidation_strategies: Per-scope consolidation settings (mission, observation cap).
+            default_observation_scopes: observation_scopes for retained items that send none
+                ("combined" when unset); e.g. ``[["topic:*"]]`` scopes by each memory's topic tags.
             enable_auto_consolidation: Consolidate automatically after retain() rather than on demand.
             consolidation_use_decision_model: When the server has a decision model, let it settle
                 restatements, new facts and chatter before the consolidation LLM call.
@@ -3126,6 +3147,9 @@ class Hindsight:
             reflect_use_decision_model: When the server has a decision model, reflect lets it
                 prune the evidence and decide when to stop (fewer LLM calls). False keeps agent turns.
             mental_model_refresh_use_decision_model: The same, for knowledge-page refreshes.
+            mental_model_delta_use_decision_model: When the server has a decision model, a delta
+                knowledge-page refresh asks it which new memories could change the page instead
+                of running reflect. False keeps reflect.
             knowledge_page_default_trigger: Trigger fields merged over the built-in default for new
                 knowledge pages, e.g. {"refresh_cron": "0 * * * *"}.
             enable_observations: Toggle automatic observation consolidation after retain().
@@ -3187,6 +3211,7 @@ class Hindsight:
                 "max_observations_per_scope": max_observations_per_scope,
                 "observation_scope_limits": observation_scope_limits,
                 "consolidation_strategies": consolidation_strategies,
+                "default_observation_scopes": default_observation_scopes,
                 "enable_auto_consolidation": enable_auto_consolidation,
                 "consolidation_use_decision_model": consolidation_use_decision_model,
                 "consolidation_llm_parallelism": consolidation_llm_parallelism,
@@ -3196,6 +3221,7 @@ class Hindsight:
                 "reflect_default_options": reflect_default_options,
                 "reflect_use_decision_model": reflect_use_decision_model,
                 "mental_model_refresh_use_decision_model": mental_model_refresh_use_decision_model,
+                "mental_model_delta_use_decision_model": mental_model_delta_use_decision_model,
                 "enable_text_search": enable_text_search,
                 "enable_temporal_retrieval": enable_temporal_retrieval,
                 "enable_graph_retrieval": enable_graph_retrieval,

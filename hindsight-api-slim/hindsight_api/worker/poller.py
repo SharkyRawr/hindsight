@@ -46,6 +46,7 @@ def _backpressure_defer_seconds() -> int:
     return get_config().backpressure_defer_seconds
 
 
+from .background import mark_background_task
 from .stage import StageHolder, bind_holder
 
 # How a lost append race backs off. An append that loses is told "the document moved, read it
@@ -224,6 +225,28 @@ PROGRESS_LOG_INTERVAL = 30
 TERMINAL_WRITE_DEADLINE_S = 300.0
 TERMINAL_WRITE_MAX_BACKOFF_S = 30.0
 
+# A terminal write that fails because the task's own operations table is gone
+# can never succeed: the schema was dropped (the tenant was deleted) while the
+# task ran, and the row went with it. Postgres reports a missing relation or
+# schema by SQLSTATE; Oracle by ORA code in the message.
+_MISSING_RELATION_SQLSTATES = frozenset({"42P01", "3F000"})  # undefined_table, invalid_schema_name
+_MISSING_RELATION_MARKERS = ("ORA-00942",)  # table or view does not exist
+
+
+def _is_missing_relation(exc: BaseException) -> bool:
+    """Does `exc`, or anything it wraps, say a table or schema does not exist?"""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if getattr(cur, "sqlstate", None) in _MISSING_RELATION_SQLSTATES:
+            return True
+        if any(marker in str(cur) for marker in _MISSING_RELATION_MARKERS):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
 # Stuck-task stack-dump thresholds (seconds). Each task gets one stack dump
 # per threshold its current stage crosses without making progress.
 STUCK_STACK_INITIAL_THRESHOLD_S = 300
@@ -340,7 +363,7 @@ class WorkerPoller:
         slot_reservations: dict[str, int] | None = None,
         consolidation_bank_priority: dict[str, int] | None = None,
         max_retries: int = 3,
-        on_wall_timeout: Callable[[dict[str, Any], str | None, str], Awaitable[None]] | None = None,
+        on_wall_timeout: Callable[[dict[str, Any], str | None, str, str], Awaitable[None]] | None = None,
     ):
         """
         Initialize the worker poller.
@@ -366,7 +389,7 @@ class WorkerPoller:
             max_retries: Maximum retry attempts before a task is marked failed.
                 Must be >= 0. Default 3 (matches DEFAULT_WORKER_MAX_RETRIES).
             on_wall_timeout: Optional async hook called with (task_dict, schema,
-                error_message) after a task is failed by its wall-clock ceiling.
+                error_message, stage) after a task is failed by its wall-clock ceiling.
                 The ceiling cancels the executor, so the engine's own failure
                 handling (which fires the consolidation failure webhook) never
                 runs for that outcome; this hook is how the engine still gets told.
@@ -401,6 +424,11 @@ class WorkerPoller:
 
         self._optional_routines = OptionalRoutines(self._backend)
         self._shutdown = asyncio.Event()
+        # Set when a task finishes: the idle poll wakes at once to fill the freed slot
+        # instead of sleeping out the rest of poll_interval_ms (#5650). A new submit
+        # deliberately does NOT wake it: the wait is what lets repeated refresh and
+        # consolidation submits fold into one still-pending operation (see #4335).
+        self._slot_freed = asyncio.Event()
         self._current_tasks: set[asyncio.Task] = set()
         self._in_flight_count = 0
         self._in_flight_lock = asyncio.Lock()
@@ -1170,6 +1198,7 @@ class WorkerPoller:
                     self._in_flight_by_type[operation_type] = count - 1
                     if self._in_flight_by_type[operation_type] == 0:
                         del self._in_flight_by_type[operation_type]
+                self._slot_freed.set()
 
     async def _run_executor(self, task: ClaimedTask, task_type: str, holder: StageHolder | None = None) -> None:
         """Run the task executor under its type's wall-clock ceiling, if it has one."""
@@ -1215,7 +1244,7 @@ class WorkerPoller:
                 raise _WallTimeoutExceeded(wall_timeout, ceiling) from e
             raise
 
-    async def _notify_wall_timeout(self, task: ClaimedTask, message: str) -> None:
+    async def _notify_wall_timeout(self, task: ClaimedTask, message: str, stage: str) -> None:
         """Tell the engine a task was failed by its ceiling. Never fatal.
 
         The whole point of the ceiling is that it cancels the executor, which means
@@ -1226,7 +1255,7 @@ class WorkerPoller:
         if self._on_wall_timeout is None:
             return
         try:
-            await self._on_wall_timeout(task.task_dict, task.schema, message)
+            await self._on_wall_timeout(task.task_dict, task.schema, message, stage)
         except Exception as e:
             logger.warning(f"Wall-timeout notification failed for task {task.operation_id}: {e}")
 
@@ -1259,6 +1288,10 @@ class WorkerPoller:
         # None = not a terminal outcome (deferred/retried) → no metric.
         terminal_success: bool | None = None
 
+        # Every task the worker runs is background work, whatever its holder. The LLM
+        # semaphore uses this to serve waiting live requests first.
+        mark_background_task()
+
         # Bind the stage holder in this task's own contextvar scope so engine
         # code running under us can update it via stage.set_stage(). If holder
         # is None (legacy / direct invocation), set_stage becomes a no-op.
@@ -1284,7 +1317,7 @@ class WorkerPoller:
             message = e.describe(task_type, stage)
             logger.error(f"Task {task.operation_id} timed out: {message}")
             await self._write_terminal(task, "failed", lambda: self._mark_all_failed(task, message))
-            await self._notify_wall_timeout(task, message)
+            await self._notify_wall_timeout(task, message, stage)
             terminal_success = False
         except DeferOperation as e:
             # Deferral is not a terminal outcome — do not record a completion.
@@ -1396,6 +1429,15 @@ class WorkerPoller:
                 await write()
                 return True
             except Exception as e:
+                if await self._operations_table_dropped(task, e):
+                    # Nothing to mark and nothing to recover: retrying would only
+                    # run out the deadline and take the worker (and every other
+                    # task on it) down with it.
+                    logger.warning(
+                        f"Not marking task {task.operation_id} {status}: schema {task.schema} no longer has "
+                        f"an operations table (dropped while the task ran); dropping the task"
+                    )
+                    return False
                 if time.monotonic() + delay > deadline:
                     logger.critical(
                         f"Could not mark task {task.operation_id} {status} for {TERMINAL_WRITE_DEADLINE_S:.0f}s "
@@ -1411,6 +1453,25 @@ class WorkerPoller:
                 )
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, TERMINAL_WRITE_MAX_BACKOFF_S)
+
+    async def _operations_table_dropped(self, task: ClaimedTask, error: BaseException) -> bool:
+        """Is the task's own operations table gone, not just this write failing?
+
+        A missing-relation error alone is not enough: the write may touch other
+        tables, and one missing there is a bug to surface, not a reason to drop
+        the status. So confirm by reading the operations table itself. A read
+        that fails for any other reason (the DB being unwell) means "not
+        proven", and the caller keeps retrying.
+        """
+        if task.schema is None or not _is_missing_relation(error):
+            return False
+        table = fq_table("async_operations", task.schema)
+        try:
+            async with self._backend.acquire() as conn:
+                await conn.fetchval(f"SELECT 1 FROM {table} WHERE 1 = 0")
+        except Exception as probe_error:
+            return _is_missing_relation(probe_error)
+        return False
 
     def _exit_process(self) -> None:
         """Ask the process to shut down, through the same path as `kill`."""
@@ -1851,6 +1912,8 @@ class WorkerPoller:
 
         while not self._shutdown.is_set():
             try:
+                # Cleared before the claim: a slot freed during it re-arms the wait below.
+                self._slot_freed.clear()
                 # Claim a batch of tasks (respecting slot limits)
                 tasks = await self.claim_batch()
                 self._last_poll_at = time.monotonic()
@@ -1884,15 +1947,16 @@ class WorkerPoller:
                     # Continue immediately to claim more tasks (if slots available)
                     continue
 
-                # No tasks claimed (either no pending tasks or slots full)
-                # Wait before polling again
+                # No tasks claimed (either no pending tasks or slots full).
+                # Wait for the poll interval, shutdown, or a task finishing.
+                waiters = [asyncio.ensure_future(self._shutdown.wait()), asyncio.ensure_future(self._slot_freed.wait())]
                 try:
-                    await asyncio.wait_for(
-                        self._shutdown.wait(),
-                        timeout=self._poll_interval_ms / 1000,
+                    await asyncio.wait(
+                        waiters, timeout=self._poll_interval_ms / 1000, return_when=asyncio.FIRST_COMPLETED
                     )
-                except asyncio.TimeoutError:
-                    pass  # Normal timeout, continue polling
+                finally:
+                    for w in waiters:
+                        w.cancel()
 
                 # Log progress stats periodically
                 await self._log_progress_if_due()

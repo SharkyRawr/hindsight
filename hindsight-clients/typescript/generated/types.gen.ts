@@ -43,7 +43,7 @@ export type AsyncOperationSubmitResponse = {
 /**
  * AuditLogEntry
  *
- * A single audit log entry.
+ * A single audit log entry with its full request/response bodies.
  */
 export type AuditLogEntry = {
   /**
@@ -77,6 +77,12 @@ export type AuditLogEntry = {
    */
   duration_ms?: number | null;
   /**
+   * Metadata
+   */
+  metadata: {
+    [key: string]: unknown;
+  };
+  /**
    * Request
    */
   request: {
@@ -88,12 +94,6 @@ export type AuditLogEntry = {
   response: {
     [key: string]: unknown;
   } | null;
-  /**
-   * Metadata
-   */
-  metadata: {
-    [key: string]: unknown;
-  };
 };
 
 /**
@@ -120,8 +120,10 @@ export type AuditLogListResponse = {
   offset: number;
   /**
    * Items
+   *
+   * Entries without request/response bodies; fetch one entry by id for its bodies.
    */
-  items: Array<AuditLogEntry>;
+  items: Array<AuditLogSummary>;
 };
 
 /**
@@ -172,6 +174,50 @@ export type AuditLogStatsResponse = {
    * Buckets
    */
   buckets: Array<AuditLogStatsBucket>;
+};
+
+/**
+ * AuditLogSummary
+ *
+ * An audit log entry without its request/response bodies, as the list returns it.
+ */
+export type AuditLogSummary = {
+  /**
+   * Id
+   */
+  id: string;
+  /**
+   * Action
+   */
+  action: string;
+  /**
+   * Transport
+   */
+  transport: string;
+  /**
+   * Bank Id
+   */
+  bank_id: string | null;
+  /**
+   * Started At
+   */
+  started_at: string | null;
+  /**
+   * Ended At
+   */
+  ended_at: string | null;
+  /**
+   * Duration Ms
+   *
+   * Server-computed duration in milliseconds (started_at → ended_at). Null if not yet completed.
+   */
+  duration_ms?: number | null;
+  /**
+   * Metadata
+   */
+  metadata: {
+    [key: string]: unknown;
+  };
 };
 
 /**
@@ -601,6 +647,12 @@ export type BankTemplateConfig = {
    */
   mental_model_refresh_use_decision_model?: boolean | null;
   /**
+   * Mental Model Delta Use Decision Model
+   *
+   * When the server has a decision model, a delta knowledge-page refresh asks it which new memories could change the page instead of running reflect
+   */
+  mental_model_delta_use_decision_model?: boolean | null;
+  /**
    * Disposition Skepticism
    *
    * Skepticism trait (1-5)
@@ -694,6 +746,18 @@ export type BankTemplateConfig = {
   observation_scope_limits?: Array<{
     [key: string]: unknown;
   }> | null;
+  /**
+   * Default Observation Scopes
+   *
+   * observation_scopes applied at retain to items that send none ('combined' when unset). A list of tag lists may use globs, e.g. [['topic:*']] scopes each memory by its own topic tags.
+   */
+  default_observation_scopes?:
+    | "per_tag"
+    | "combined"
+    | "all_combinations"
+    | "shared"
+    | Array<Array<string>>
+    | null;
   /**
    * Consolidation Strategies
    *
@@ -2016,6 +2080,64 @@ export type DispositionTraits = {
 };
 
 /**
+ * DocumentEvent
+ *
+ * One change to a document, and its effect on the facts and observations built from it.
+ */
+export type DocumentEvent = {
+  /**
+   * Document Id
+   */
+  document_id: string;
+  kind: DocumentEventKind;
+  /**
+   * Created At
+   */
+  created_at?: string;
+  /**
+   * Operation Id
+   *
+   * The operation this event was recorded on (filled in when read).
+   */
+  operation_id?: string | null;
+  /**
+   * Fact Id
+   *
+   * The fact a fact_* event changed.
+   */
+  fact_id?: string | null;
+  /**
+   * Facts Added
+   */
+  facts_added?: number;
+  /**
+   * Facts Removed
+   */
+  facts_removed?: number;
+  observations_created?: ObservationIdSample;
+  observations_updated?: ObservationIdSample;
+  observations_removed?: ObservationIdSample;
+};
+
+/**
+ * DocumentEventKind
+ *
+ * What a change was. A named enum, not a Literal: inline enums are named after their field by
+ * the generated Rust client, and ``kind`` already names the knowledge-base node enum there.
+ */
+export type DocumentEventKind =
+  | "retain"
+  | "append"
+  | "reprocess"
+  | "retag"
+  | "fact_edited"
+  | "fact_invalidated"
+  | "fact_restored"
+  | "fact_deleted"
+  | "observations_cleared"
+  | "consolidation";
+
+/**
  * DocumentExportSubmitResponse
  *
  * Response for the async document-export endpoint (202).
@@ -2034,6 +2156,35 @@ export type DocumentExportSubmitResponse = {
    * Status
    */
   status?: string;
+};
+
+/**
+ * DocumentHistoryResponse
+ *
+ * A document's change history, newest first. ``total``, ``limit`` and ``offset`` count operations:
+ * one operation can carry several events for the same document (an oversized retain in slices).
+ */
+export type DocumentHistoryResponse = {
+  /**
+   * Document Id
+   */
+  document_id: string;
+  /**
+   * Total
+   */
+  total: number;
+  /**
+   * Limit
+   */
+  limit: number;
+  /**
+   * Offset
+   */
+  offset: number;
+  /**
+   * Items
+   */
+  items: Array<DocumentEvent>;
 };
 
 /**
@@ -3983,7 +4134,7 @@ export type MemoryItem = {
   /**
    * ObservationScopes
    *
-   * How to scope observations during consolidation. 'per_tag' runs one consolidation pass per individual tag, creating separate observations for each tag. 'combined' (default) runs a single pass with all tags together. 'shared' runs a single pass over one global, untagged scope, so memories consolidate together regardless of their tags — useful for deduplicating across volatile per-call provenance tags (e.g. per-session ids) while keeping those tags on the source facts. A list of tag lists runs one pass per inner list, giving full control over which combinations to use.
+   * How to scope observations during consolidation. 'per_tag' runs one consolidation pass per individual tag, creating separate observations for each tag. 'combined' (default) runs a single pass with all tags together. 'shared' runs a single pass over one global, untagged scope, so memories consolidate together regardless of their tags — useful for deduplicating across volatile per-call provenance tags (e.g. per-session ids) while keeping those tags on the source facts. A list of tag lists runs one pass per inner list, giving full control over which combinations to use. An entry containing '*' is a glob matched against the memory's own tags — e.g. [['topic:*', 'user:*']] scopes by the memory's topic and user tags (including tags added by entity labels at retain) and ignores the rest; a scope whose globs match nothing is skipped. When omitted, the bank's default_observation_scopes applies ('combined' unless configured).
    */
   observation_scopes?:
     | "per_tag"
@@ -4633,6 +4784,12 @@ export type MentalModelResponse = {
    */
   created_at?: string | null;
   /**
+   * Is Knowledge Page
+   *
+   * True when this model holds a knowledge page's content rather than being a standalone mental model. Set by the list and get endpoints.
+   */
+  is_knowledge_page?: boolean | null;
+  /**
    * Reflect Response
    *
    * Full reflect API response payload including based_on facts and observations
@@ -5054,6 +5211,22 @@ export type MinScores = {
    * Post-query: minimum final ranking score. Applied to every returned result.
    */
   final?: number | null;
+};
+
+/**
+ * ObservationIdSample
+ *
+ * How many observations an event touched, and (up to ``MAX_IDS``) which.
+ */
+export type ObservationIdSample = {
+  /**
+   * Count
+   */
+  count?: number;
+  /**
+   * Ids
+   */
+  ids?: Array<string>;
 };
 
 /**
@@ -6758,7 +6931,7 @@ export type UpdateDocumentRequest = {
   /**
    * UpdateDocumentObservationScopes
    *
-   * New observation scoping for the document's memories, with the same values retain accepts (send 'combined' to return to the default). Use it to move memories retained under one scoping to another — e.g. per-session documents to 'shared' — without re-extracting them. Memories whose resolved scopes change lose their observations and are re-consolidated; the rest keep theirs. Also becomes the scoping a later reprocess of the document uses.
+   * New observation scoping for the document's memories, with the same values retain accepts (send 'combined' to scope by each memory's full tag set). Use it to move memories retained under one scoping to another — e.g. per-session documents to 'shared' — without re-extracting them. Memories whose resolved scopes change lose their observations and are re-consolidated; the rest keep theirs. Also becomes the scoping a later reprocess of the document uses.
    */
   observation_scopes?:
     | "per_tag"
@@ -6816,6 +6989,12 @@ export type UpdateMemoryRequest = {
    * New occurred-range end (ISO 8601). '' clears it; omit to leave unchanged.
    */
   occurred_end?: string | null;
+  /**
+   * Mentioned At
+   *
+   * New mention time — when the fact was said or written (ISO 8601). '' clears it; omit to leave unchanged.
+   */
+  mentioned_at?: string | null;
   /**
    * Fact Type
    *
@@ -7289,6 +7468,8 @@ export type GetGraphData = {
     limit?: number;
     /**
      * Q
+     *
+     * Case-insensitive substring filter on memory text and context. Not indexed: it scans the bank, so it slows as the bank grows. Meant for browsing and inspection, not for high-volume or latency-sensitive workloads — use recall for that.
      */
     q?: string | null;
     /**
@@ -7354,6 +7535,8 @@ export type ListMemoriesData = {
     type?: string | null;
     /**
      * Q
+     *
+     * Case-insensitive substring filter on memory text and context. Not indexed: it scans the bank, so it slows as the bank grows. Meant for browsing and inspection, not for high-volume or latency-sensitive workloads — use recall for that.
      */
     q?: string | null;
     /**
@@ -8169,6 +8352,12 @@ export type ListMentalModelsData = {
      * Offset
      */
     offset?: number;
+    /**
+     * Exclude Knowledge Pages
+     *
+     * Leave out the mental models that hold knowledge page content (list standalone models only).
+     */
+    exclude_knowledge_pages?: boolean;
   };
   url: "/v1/default/banks/{bank_id}/mental-models";
 };
@@ -9250,6 +9439,60 @@ export type ListDocumentChunksResponses = {
 
 export type ListDocumentChunksResponse =
   ListDocumentChunksResponses[keyof ListDocumentChunksResponses];
+
+export type GetDocumentHistoryData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Document Id
+     */
+    document_id: string;
+  };
+  query?: {
+    /**
+     * Limit
+     *
+     * Maximum number of operations to read
+     */
+    limit?: number;
+    /**
+     * Offset
+     *
+     * Offset for pagination, in operations
+     */
+    offset?: number;
+  };
+  url: "/v1/default/banks/{bank_id}/documents/{document_id}/history";
+};
+
+export type GetDocumentHistoryErrors = {
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type GetDocumentHistoryError = GetDocumentHistoryErrors[keyof GetDocumentHistoryErrors];
+
+export type GetDocumentHistoryResponses = {
+  /**
+   * Successful Response
+   */
+  200: DocumentHistoryResponse;
+};
+
+export type GetDocumentHistoryResponse =
+  GetDocumentHistoryResponses[keyof GetDocumentHistoryResponses];
 
 export type ReprocessDocumentData = {
   body?: never;
@@ -11481,6 +11724,50 @@ export type AuditLogStatsResponses = {
 
 export type AuditLogStatsResponse2 = AuditLogStatsResponses[keyof AuditLogStatsResponses];
 
+export type GetAuditLogData = {
+  body?: never;
+  headers?: {
+    /**
+     * Authorization
+     */
+    authorization?: string | null;
+  };
+  path: {
+    /**
+     * Bank Id
+     */
+    bank_id: string;
+    /**
+     * Log Id
+     */
+    log_id: string;
+  };
+  query?: never;
+  url: "/v1/default/banks/{bank_id}/audit-logs/{log_id}";
+};
+
+export type GetAuditLogErrors = {
+  /**
+   * Bank or audit log entry not found
+   */
+  404: unknown;
+  /**
+   * Validation Error
+   */
+  422: HttpValidationError;
+};
+
+export type GetAuditLogError = GetAuditLogErrors[keyof GetAuditLogErrors];
+
+export type GetAuditLogResponses = {
+  /**
+   * Successful Response
+   */
+  200: AuditLogEntry;
+};
+
+export type GetAuditLogResponse = GetAuditLogResponses[keyof GetAuditLogResponses];
+
 export type ListLlmRequestsData = {
   body?: never;
   headers?: {
@@ -11514,6 +11801,12 @@ export type ListLlmRequestsData = {
      * Filter by call scope
      */
     scope?: string | null;
+    /**
+     * Call Type
+     *
+     * Filter by kind of model call, told apart by scope: embedding (embedding_*), rerank, decision (decision_*), or llm (every other scope)
+     */
+    call_type?: "llm" | "embedding" | "rerank" | "decision" | null;
     /**
      * Provider
      *
@@ -11615,6 +11908,12 @@ export type LlmRequestStatsData = {
      * Filter by operation
      */
     operation?: string | null;
+    /**
+     * Call Type
+     *
+     * Filter by kind of model call: llm, embedding, rerank or decision
+     */
+    call_type?: "llm" | "embedding" | "rerank" | "decision" | null;
     /**
      * Period
      *

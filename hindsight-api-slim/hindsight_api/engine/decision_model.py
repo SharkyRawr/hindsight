@@ -24,13 +24,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
 from .._cross_loop import CrossLoopSemaphore
 from ..config import DecisionModelConfig
-from .aiohttp_session import LoopLocalSession, per_phase_timeout, raise_for_status
+from ..tracing import get_span_recorder
+from .aiohttp_session import LoopLocalSession, UpstreamHTTPError, per_phase_timeout, raise_for_status
 from .remote_retry import RetryPolicy, acall_with_retry
 from .token_encoding import count_tokens
 
@@ -80,6 +82,17 @@ class DecisionResponse(BaseModel):
     #: Keyed by the question ids the caller sent.
     answers: dict[str, DecisionAnswer]
     usage: DecisionUsage = Field(default_factory=DecisionUsage)
+
+
+def overflowed_window(exc: BaseException) -> bool:
+    """Whether System One refused a request as longer than its context window.
+
+    The window is counted in the model's own tokens, which no client can count: on
+    mixed-script text Jev's tokenizer runs twice ours (#5715), so a request sized to fit
+    can still come back ``400 {"detail": {"error_type": "max_tokens_exceeded"}}``. Not
+    retryable as sent; the caller has to send less.
+    """
+    return isinstance(exc, UpstreamHTTPError) and exc.status_code == 400 and "max_tokens_exceeded" in exc.body
 
 
 class DecisionRefusedError(Exception):
@@ -162,6 +175,35 @@ def _from_openai(response: _OpenAIResponse) -> DecisionResponse:
     return DecisionResponse(answers=answers, usage=response.usage)
 
 
+def record_decision_call(
+    *,
+    provider: str,
+    model: str,
+    scope: str,
+    request: dict[str, Any],
+    response: dict[str, Any] | None,
+    input_tokens: int,
+    started: float,
+    error: BaseException | None,
+) -> None:
+    """Trace one decision-model request next to the LLM calls, under a ``decision_*`` scope."""
+    get_span_recorder().record_llm_call(
+        provider=provider,
+        model=model,
+        scope=scope,
+        # No chat messages, as for embeddings: the request is not a chat, and turning it into
+        # one string here would cost a json.dumps on every call even with tracing off. The row
+        # stores it as a structure, serialized when the batch is written.
+        messages=[],
+        structured_input=request,
+        response_content=response,
+        input_tokens=input_tokens,
+        output_tokens=0,
+        duration=time.monotonic() - started,
+        error=error,
+    )
+
+
 class DecisionModel:
     # Most questions in one request. Measured on System One: roughly 750 single-candidate
     # questions go through and 775 come back max_tokens_exceeded, so this is kept clear of
@@ -206,39 +248,56 @@ class DecisionModel:
             max_request_tokens=config.max_request_tokens,
         )
 
-    async def ask(self, state: str | dict[str, Any], questions: dict[str, DecisionQuestion]) -> DecisionResponse:
+    async def ask(
+        self, state: str | dict[str, Any], questions: dict[str, DecisionQuestion], *, scope: str
+    ) -> DecisionResponse:
         """Ask ``questions`` (keyed by caller-chosen ids) about ``state`` in one request.
 
         Retried on its own when it fails transiently — a 429 above all, which a single
-        endpoint replica returns as soon as a few recalls overlap.
+        endpoint replica returns as soon as a few recalls overlap. A request the endpoint
+        finds longer than its window is asked again in two halves, until one question
+        alone is too long, which raises. Every attempt is traced under ``scope``, a
+        ``decision_*`` name for what the caller is deciding.
         """
-        return await acall_with_retry(
-            lambda: self._ask_once(state, questions),
-            policy=self.retry_policy,
-            budget=self.retry_policy.new_budget(),
-            provider=f"decision_model:{self.provider}",
+        try:
+            return await acall_with_retry(
+                lambda: self._ask_traced(state, questions, scope),
+                policy=self.retry_policy,
+                budget=self.retry_policy.new_budget(),
+                provider=f"decision_model:{self.provider}",
+            )
+        except Exception as e:
+            if not overflowed_window(e) or len(questions) < 2:
+                raise
+        items = list(questions.items())
+        half = len(items) // 2
+        logger.warning(f"Decision model: {len(items)} questions overflowed the window, asking them in two halves")
+        first, second = await asyncio.gather(
+            self.ask(state, dict(items[:half]), scope=scope), self.ask(state, dict(items[half:]), scope=scope)
+        )
+        return DecisionResponse(
+            answers={**first.answers, **second.answers},
+            usage=DecisionUsage(
+                input_tokens=first.usage.input_tokens + second.usage.input_tokens,
+                output_tokens=first.usage.output_tokens + second.usage.output_tokens,
+            ),
         )
 
     async def ask_all(
-        self, state: str | dict[str, Any], questions: dict[str, DecisionQuestion]
+        self, state: str | dict[str, Any], questions: dict[str, DecisionQuestion], *, scope: str
     ) -> dict[str, DecisionAnswer]:
         """Ask ``questions`` in as many requests as it takes for each to fit the window.
 
-        A request that still fails after its retries is logged and its answers are left
-        out, so the caller decides what an unanswered question means rather than losing
-        every answer to one failed request.
+        A request that still fails after its retries raises: an unanswered question is
+        not a "no", and leaving it out would pass one off as the other. It used to be
+        logged and left out, and recall's decision reranker then quietly ranked every
+        candidate of a request Jev found too long behind the rest (#5715).
         """
-
-        async def ask(part: dict[str, DecisionQuestion]) -> dict[str, DecisionAnswer]:
-            try:
-                return (await self.ask(state, part)).answers
-            except Exception as e:
-                logger.warning(f"Decision model: a request of {len(part)} questions failed: {e}")
-                return {}
-
         answers: dict[str, DecisionAnswer] = {}
-        for part in await asyncio.gather(*(ask(part) for part in self._split(state, questions))):
-            answers.update(part)
+        for part in await asyncio.gather(
+            *(self.ask(state, part, scope=scope) for part in self._split(state, questions))
+        ):
+            answers.update(part.answers)
         return answers
 
     def _split(
@@ -265,6 +324,32 @@ class DecisionModel:
         if current:
             parts.append(current)
         return parts
+
+    async def _ask_traced(
+        self, state: str | dict[str, Any], questions: dict[str, DecisionQuestion], scope: str
+    ) -> DecisionResponse:
+        started = time.monotonic()
+        answer: DecisionResponse | None = None
+        error: BaseException | None = None
+        try:
+            answer = await self._ask_once(state, questions)
+            return answer
+        except BaseException as e:
+            error = e
+            raise
+        finally:
+            record_decision_call(
+                provider=self.provider,
+                model=self.model,
+                scope=scope,
+                request={"state": state, "questions": {k: q.system_one() for k, q in questions.items()}},
+                # Defaults left out: an answer only fills the fields of its question's type. A
+                # structure, not a JSON string: the row stores it as an object, like rerank scores.
+                response=answer.model_dump(mode="json", exclude_defaults=True) if answer is not None else None,
+                input_tokens=answer.usage.input_tokens if answer is not None else 0,
+                started=started,
+                error=error,
+            )
 
     async def _ask_once(self, state: str | dict[str, Any], questions: dict[str, DecisionQuestion]) -> DecisionResponse:
         if self.provider == "openai":

@@ -183,6 +183,22 @@ uv run run-amb --api-url http://localhost:8888 --dataset sdebench --split bolton
 # then export bank sde-coding-<task> with export_bank into fixtures/coding-agent-banks/
 ```
 
+**`test_11` — a page takes the update.** `test_01` grades a page being built; this
+grades a page already written, then a wave that changes what it says. Six cases, one per
+way an update reaches a page: a memory only the page links to the topic ("Dana left the
+company", on a page naming Dana as on-call), an update naming a service by a new name the
+same wave introduces, a correction of an earlier figure, a list gaining one member and
+losing another, a new item the topic covers, and a wave with nothing for the page at all.
+The wave-1 page must state the old value first; the trap is the page still asserting it.
+Every wave also carries the hard corpus, so most of what arrives is unrelated.
+
+Behind it: with a decision model set up, a delta refresh asks it which new memories to
+read and keeps only the ones it judges could change the page, one memory at a time. A
+memory it drops is never read again, and on one cost run a decision model dropped all 20
+on-topic memories without a sign anywhere but the page. Run it with the gate on and off
+(`HINDSIGHT_EVAL_SET_MENTAL_MODEL_DELTA_USE_DECISION_MODEL=false`, same decision model);
+the gate is only worth its savings if this stays level.
+
 **`test_08` — ranked retrieval on BEIR.** The only suite graded against labels
 nobody here wrote, and the only one that makes **no model call**. It records a
 *baseline*: what this pipeline scores on a public IR benchmark, and on what.
@@ -305,7 +321,7 @@ shipped or a rule the consolidation prompt promises:
 
 - restatements update one observation, never grow siblings (#1566, #3249);
 - a newer fact supersedes the old belief everywhere it appears (#1151, #3248, #3475);
-- recency is when a fact was *stated*, not when it was retained (#2550);
+- recency is when a fact was *stated*, not when it was retained, even an hour apart on the same day (#2550, #5938);
 - a correction retires the false belief (#3509);
 - one facet per observation, matched by entity, no arithmetic (#814, the horse farm);
 - a member leaving a list updates the list too; a vague reference gets resolved;
@@ -340,7 +356,7 @@ HINDSIGHT_EVAL_SET_CONSOLIDATION_DECISION_MODEL_PROVIDER=typesafe HINDSIGHT_EVAL
   HINDSIGHT_EVAL_CONSOLIDATION_COST=/tmp/triage.jsonl uv run pytest evals/test_09_consolidation.py --full
 ```
 
-Triage requests are traced like LLM calls (scope `consolidation_triage`) and
+Triage requests are traced like LLM calls (scope `decision_consolidation_triage`) and
 reported apart from them, as `triage N calls, M in`. Speaker attribution is decided at
 retain and is out of scope; failure handling and scope mechanics are
 deterministic and live in `hindsight-system-tests`.
@@ -362,7 +378,7 @@ issue/PR history — and what grades it. "eval" = a `test_09` scenario (real mod
 - Significant events are history, never deleted (rule 7; #814) — eval `horse-farm`
 - No arithmetic or deduction on counts (rule 8) — eval `no-arithmetic`, `horse-farm`
 - Different people, entities and numbers stay apart, lookalike names included (rule 9; #5497, #1725) — eval `distinct-entities-stay-apart`, `noisy-service-catalogue`
-- Recency is `mentioned_at`, not arrival order; older news never overwrites (rule 10; #2550) — eval `recency-is-when-stated`
+- Recency is `mentioned_at`, not arrival order; older news never overwrites (rule 10; #2550) — eval `recency-is-when-stated`, `recency-same-day-amendment-arrives-first` (#5938)
 - Chatter is skipped under the default mission (rule 11) — eval `default-drops-chatter`
 - An update keeps everything the observation said (rule 12) — eval `noisy-service-catalogue` (neighbours, coverage)
 - Every durable fact lands in an observation (#5054) — eval coverage check on every wave

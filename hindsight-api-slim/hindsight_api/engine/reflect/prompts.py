@@ -209,6 +209,7 @@ def build_system_prompt_for_tools(
     budget: str | None = None,
     answer_as_document: bool = False,
     llm_output_language: str | None = None,
+    answer_ready: bool = False,
 ) -> str:
     """
     Build the system prompt for tool-calling reflect agent.
@@ -441,7 +442,12 @@ def build_system_prompt_for_tools(
                 # model has no tool for is how #1724 happened.
                 f"- Stop descending as soon as what you have answers the question — fresh {names[0]} often do.",
                 "- Go deeper when the level above is stale, thin, or silent on what was asked.",
-                "- Call `done` with the answer once you have the evidence. Do not write the answer as plain text.",
+                (
+                    "- Call `answer_ready` once you have the evidence; you are then asked for the answer. "
+                    "Do not write the answer before that."
+                    if answer_ready
+                    else "- Call `done` with the answer once you have the evidence. Do not write the answer as plain text."
+                ),
                 "",
             ]
         )
@@ -548,14 +554,14 @@ def build_system_prompt_for_tools(
     else:
         steps.append("Call recall() to gather raw facts")
     steps.append("Use expand() if you need more context on specific memories")
-    steps.append("When ready, call done() with your answer and supporting IDs")
+    steps.append(
+        "When ready, call answer_ready(); you are then asked for the answer through done()"
+        if answer_ready
+        else "When ready, call done() with your answer and supporting IDs"
+    )
     parts.extend(f"{idx}. {step}" for idx, step in enumerate(steps, 1))
 
-    common_output_rules = [
-        "- NEVER include memory IDs, UUIDs, or 'Memory references' in the answer text",
-        "- Put IDs ONLY in the memory_ids/mental_model_ids/observation_ids arrays, not in the answer",
-        "- CRITICAL: This is a NON-CONVERSATIONAL system. NEVER ask follow-up questions, offer further assistance, or suggest next steps. Your answer must be complete and self-contained. The user cannot reply.",
-    ]
+    non_conversational_rule = "- CRITICAL: This is a NON-CONVERSATIONAL system. NEVER ask follow-up questions, offer further assistance, or suggest next steps. Your answer must be complete and self-contained. The user cannot reply."
     if answer_as_document:
         # The document is stored as structure and the markdown is rendered from
         # it, so asking for "a markdown answer" here would be asking for the one
@@ -589,7 +595,8 @@ def build_system_prompt_for_tools(
                 "- The structure is how the answer is laid out, NOT a reason to say less: give each "
                 "block the same specifics, numbers, names and examples you would write in prose",
                 "- Prefer a section with several blocks over one block that summarises them away",
-                *common_output_rules,
+                f"- {NO_IDS_IN_TEXT_RULE}",
+                non_conversational_rule,
             ]
         )
     else:
@@ -601,7 +608,9 @@ def build_system_prompt_for_tools(
                 "- USE markdown formatting for structure (headers, lists, bold, italic, code blocks, tables, etc.)",
                 "- CRITICAL: Add blank lines before and after block elements (tables, code blocks, lists)",
                 "- Format for clarity and readability with proper spacing and hierarchy",
-                *common_output_rules,
+                "- NEVER include memory IDs, UUIDs, or 'Memory references' in the answer text",
+                "- Put IDs ONLY in the memory_ids/mental_model_ids/observation_ids arrays, not in the answer",
+                non_conversational_rule,
             ]
         )
 
@@ -677,6 +686,21 @@ _GROUNDING_BOUNDARY = (
     "value exact, reliable, deduced or confirmed; label any derivation an estimate. Qualitative "
     "inference is unaffected."
 )
+
+#: Keeps memory ids out of text a reader sees, in every path that writes it.
+#: Plain mode said this only in the ``answer`` field and its output rules, so
+#: document mode (which has no ``answer``) and forced synthesis said nothing,
+#: and the handles the model cites inline (``o3``) are resolved to real UUIDs
+#: (#4876), which filled mental-model pages with ids (#5833). The exception
+#: keeps reports that ask for ids, the #4876 use case, working. It names no
+#: field to put ids in: forced synthesis has none, and done's id arrays say so
+#: in their own descriptions.
+NO_IDS_IN_TEXT_RULE = (
+    "NEVER cite memory IDs, UUIDs or result handles (f3, o12) in the text a reader sees - the "
+    "supporting ids are tracked separately. Only include IDs in the text when the question "
+    "explicitly asks for them."
+)
+
 
 _FINAL_INSTRUCTIONS = (
     "Provide a thoughtful answer by synthesizing and reasoning from the retrieved data above. "
@@ -1100,6 +1124,8 @@ CRITICAL: Output ONLY the final synthesized answer. Do NOT include:
 - Descriptions of your approach
 Just provide the direct answer with proper markdown formatting.
 
+{no_ids_rule}
+
 CRITICAL: This is a NON-CONVERSATIONAL system. NEVER ask follow-up questions, offer to search again, suggest alternatives, or end with anything like "Would you like me to..." or "Let me know if...". The user cannot reply. Your answer must be complete and self-contained."""
 
 
@@ -1151,7 +1177,11 @@ def build_final_system_prompt(
     role_section = escape_for_prompt(mission.strip()) if mission else _DEFAULT_FINAL_ROLE
 
     parts = [build_directives_section(directives) if directives else ""]
-    parts.append(_FINAL_SYSTEM_PROMPT_BASE.format(role_section=role_section, grounding_boundary=_GROUNDING_BOUNDARY))
+    parts.append(
+        _FINAL_SYSTEM_PROMPT_BASE.format(
+            role_section=role_section, grounding_boundary=_GROUNDING_BOUNDARY, no_ids_rule=NO_IDS_IN_TEXT_RULE
+        )
+    )
     parts.append(default_language_section(_FINAL_LANGUAGE_RULE, llm_output_language))
     parts.append(build_directives_reminder(directives) if directives else "")
     # Volatile "now" reference last, so the static/per-bank instructions above
@@ -1216,6 +1246,11 @@ RULES
   batch, not the whole memory — the document was built from facts you cannot see.
   "The batch does not mention X" and "X did not happen" are different statements,
   and only the second would justify an edit.
+- **A fact about one thing never refutes a claim about another**: facts about
+  OTHER people, items, versions or events — even the ones just before and after
+  it in a sequence or on the calendar — say nothing about the one the document
+  names. Keep that claim exactly as written; never cast doubt on it ("may be
+  misrecorded", "however, records show…"). Add the new facts beside it.
 - **Refutation threshold for removal or overwrite**: you may only remove or
   overwrite existing text when a SUPPORTING FACT explicitly refutes or corrects
   that exact detail, OR is a later-DATED statement about the same facet (a

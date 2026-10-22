@@ -7,7 +7,6 @@ import json
 import logging
 import re
 import time
-import uuid
 from contextlib import AsyncExitStack, asynccontextmanager
 from typing import TYPE_CHECKING, Any, Union
 
@@ -166,11 +165,16 @@ async def _acquire_permits(stack: AsyncExitStack, scope: str) -> None:
     slow LLM call can be attributed to queueing rather than to the provider --
     the two are otherwise indistinguishable in the reported duration (#3881).
     """
+    from ..worker.background import in_background_task
     from .llm_trace import record_queue_wait
 
+    # Calls from a background worker task yield the next free permit to any waiting
+    # live request.
+    background = in_background_task()
     queue_start = time.monotonic()
     for sem in _semaphores_for_scope(scope):
-        await stack.enter_async_context(sem)
+        await sem.acquire(background=background)
+        stack.callback(sem.release)
     record_queue_wait(time.monotonic() - queue_start)
 
 
@@ -188,6 +192,8 @@ async def _attempt_permits(scope: str):
             # provider classifies the error and sleeps out its backoff. Suffix
             # the stage so `attempt=N` always means "permits held, request in
             # flight" (#3002); the next attempt re-stamps after re-acquiring.
+            # MemoryEngine.on_task_wall_timeout reads this suffix: a refresh cut off
+            # during a backoff does not pause automatic refresh (#5561).
             stage = get_stage()
             if stage is not None and not stage.endswith(".backoff"):
                 set_stage(f"{stage}.backoff")
@@ -1781,21 +1787,9 @@ class LLMProvider:
             A ``ConfiguredLLMProvider`` that delegates to this provider with
             the supplied config applied.
         """
-        trace_ctx = None
-        if bank_id is not None or operation is not None or metadata:
-            from .llm_trace import LLMTraceContext
+        from .llm_trace import operation_trace_context
 
-            # One trace + operation span per with_config() call — i.e. per
-            # operation invocation. Every LLM call made through this wrapper
-            # shares them, so a reflect/retain/consolidation run groups its
-            # calls as parent (operation) → children (LLM calls).
-            trace_ctx = LLMTraceContext(
-                bank_id=bank_id,
-                operation=operation,
-                metadata=dict(metadata or {}),
-                trace_id=str(uuid.uuid4()),
-                operation_span_id=str(uuid.uuid4()),
-            )
+        trace_ctx = operation_trace_context(bank_id, operation, metadata)
         return ConfiguredLLMProvider(self, config.llm_gemini_safety_settings, trace_ctx)
 
     async def cleanup(self) -> None:

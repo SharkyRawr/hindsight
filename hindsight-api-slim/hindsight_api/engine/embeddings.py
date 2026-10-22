@@ -19,6 +19,7 @@ import threading
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar, cast
 from urllib.parse import parse_qs, urlparse, urlunparse
 
@@ -26,6 +27,7 @@ import aiohttp
 import orjson
 from pydantic import BaseModel
 
+from .._thread_limits import bound_onnx_session
 from ..config import (
     DEFAULT_EMBEDDINGS_COHERE_MODEL,
     DEFAULT_EMBEDDINGS_GEMINI_MODEL,
@@ -62,6 +64,8 @@ from ..config import (
 )
 from .aiohttp_session import LoopLocal, LoopLocalSession, UpstreamHTTPError, per_phase_timeout, raise_for_status
 from .bank_attribution import apply_bank_attribution
+from .llm_interface import ProviderRateLimitResetError
+from .llm_trace import add_provider_input_tokens
 from .local_device import (
     LOCAL_MODEL_BUILD_LOCK,
     align_local_model_weights,
@@ -71,6 +75,7 @@ from .local_device import (
     resolve_model_device_type,
     select_local_device,
 )
+from .providers.openai_compatible_headers import with_openai_compatible_user_agent
 from .remote_retry import (
     RetryBudget,
     RetryPolicy,
@@ -629,10 +634,9 @@ class OnnxEmbeddings(Embeddings):
         # never returned to the OS, so RSS ratchets up to the largest batch ever run and
         # holds that plateau for the life of the process. The reranker disables it for
         # the same reason (see FlashRankCrossEncoder).
-        session_options = None
-        if not self.cpu_mem_arena:
-            session_options = ort.SessionOptions()
-            session_options.enable_cpu_mem_arena = False
+        session_options = ort.SessionOptions()
+        session_options.enable_cpu_mem_arena = self.cpu_mem_arena
+        bound_onnx_session(session_options)
         try:
             session = ort.InferenceSession(model_path, sess_options=session_options, providers=providers)
         except Exception as exc:
@@ -735,10 +739,10 @@ class OnnxEmbeddings(Embeddings):
             ort_inputs["token_type_ids"] = np.zeros_like(encoded["input_ids"])
 
         outputs = self._session.run([self.output_name] if self.output_name else None, ort_inputs)
-        token_embeddings = outputs[0]
+        token_embeddings = np.asarray(outputs[0])
 
         # Some exported models expose a pooled 2-D embedding as their first output.
-        if getattr(token_embeddings, "ndim", 0) == 2:
+        if token_embeddings.ndim == 2:
             embeddings = token_embeddings
         elif self.pooling == "cls":
             embeddings = token_embeddings[:, 0]
@@ -938,6 +942,11 @@ class RemoteTEIEmbeddings(Embeddings):
             raise RuntimeError(f"TEI embedding request failed: {e}")
 
 
+# OpenAI's insufficient_quota 429 carries no reset time, so a quota-exhausted
+# operation waits this long before it tries again.
+EMBEDDINGS_QUOTA_DEFER_SECONDS = 900
+
+
 class OpenAIEmbeddings(Embeddings):
     """
     OpenAI embeddings implementation using the OpenAI API.
@@ -965,6 +974,7 @@ class OpenAIEmbeddings(Embeddings):
         max_retries: int = 3,
         query_prefix: str = "",
         passage_prefix: str = "",
+        timeout: float = 60.0,
     ):
         """
         Initialize OpenAI embeddings client.
@@ -978,6 +988,7 @@ class OpenAIEmbeddings(Embeddings):
             max_retries: Maximum number of retries for failed requests (default: 3)
             query_prefix: Prefix prepended to recall/search queries (default: none)
             passage_prefix: Prefix prepended to retained document text (default: none)
+            timeout: Request timeout in seconds (default: 60.0)
         """
         self.api_key = api_key
         self.model = model
@@ -985,6 +996,7 @@ class OpenAIEmbeddings(Embeddings):
         self.batch_size = batch_size
         self.dimensions = dimensions
         self.max_retries = max_retries
+        self.timeout = timeout
         self.query_prefix = query_prefix
         self.passage_prefix = passage_prefix
         # OpenAI's own embedding models tokenize with cl100k_base, which counts slightly
@@ -1032,7 +1044,16 @@ class OpenAIEmbeddings(Embeddings):
         # Build client kwargs, only including base_url if set (for Azure or custom endpoints)
         # Parse query parameters from base_url (e.g. ?api-version=xxx for Azure OpenAI)
         # and pass them as default_query so they're included in every request.
-        client_kwargs: dict[str, Any] = {"api_key": self.api_key, "max_retries": self.max_retries}
+        # An explicit timeout: the SDK default (600s per attempt) lets one stalled request
+        # hold a retain for most of an hour (#5588).
+        client_kwargs: dict[str, Any] = {
+            "api_key": self.api_key,
+            "max_retries": self.max_retries,
+            "timeout": self.timeout,
+            # Same transport identity as the LLM calls, so a gateway can attribute
+            # embedding traffic to Hindsight (#5942).
+            "default_headers": with_openai_compatible_user_agent(None),
+        }
         if self.base_url:
             parsed = urlparse(self.base_url)
             if parsed.query:
@@ -1089,7 +1110,26 @@ class OpenAIEmbeddings(Embeddings):
             request["dimensions"] = self.dimensions
         apply_bank_attribution(request)
 
-        response = await self._loop_client().embeddings.create(**request)
+        from openai import RateLimitError
+
+        try:
+            response = await self._loop_client().embeddings.create(**request)
+        except RateLimitError as e:
+            # Out of credits is not a blip: retrying it a few times a minute apart only
+            # dead-letters the operation. Park it instead and try again later (#5588).
+            if e.code != "insufficient_quota":
+                raise
+            retry_at = datetime.now(UTC) + timedelta(seconds=EMBEDDINGS_QUOTA_DEFER_SECONDS)
+            raise ProviderRateLimitResetError(
+                retry_at=retry_at,
+                message=f"Embeddings quota exhausted ({self.provider_name}/{self.model}); retry at "
+                f"{retry_at.isoformat()}: {e}",
+            ) from e
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            # OpenAI-compatible gateways such as Voyage report only total_tokens (#5941);
+            # for an embedding that is the same number.
+            add_provider_input_tokens(usage.prompt_tokens or usage.total_tokens)
 
         # Sort by index to ensure correct order
         return [e.embedding for e in sorted(response.data, key=lambda x: x.index)]
@@ -1341,6 +1381,7 @@ class CohereEmbeddings(Embeddings):
                 budget=budget,
                 provider=self.provider_name,
             )
+            _add_cohere_billed_tokens(response)
             return response.embeddings.float_
         response = await acall_with_retry(
             lambda: client.embed(
@@ -1352,7 +1393,15 @@ class CohereEmbeddings(Embeddings):
             budget=budget,
             provider=self.provider_name,
         )
+        _add_cohere_billed_tokens(response)
         return response.embeddings
+
+
+def _add_cohere_billed_tokens(response: Any) -> None:
+    billed = getattr(getattr(response, "meta", None), "billed_units", None)
+    tokens = getattr(billed, "input_tokens", None)
+    if tokens:
+        add_provider_input_tokens(int(tokens))
 
 
 class ZeroEntropyEmbeddings(Embeddings):
@@ -2414,6 +2463,7 @@ def create_embeddings_from_env() -> Embeddings:
                 base_url=base_url,
                 batch_size=config.embeddings_openai_batch_size,
                 dimensions=config.embeddings_openai_dimensions,
+                max_retries=config.embeddings_max_retries,
                 query_prefix=query_prefix,
                 passage_prefix=passage_prefix,
             ),
@@ -2426,6 +2476,7 @@ def create_embeddings_from_env() -> Embeddings:
                 model=model,
                 batch_size=config.embeddings_openai_batch_size,
                 dimensions=config.embeddings_openai_dimensions,
+                max_retries=config.embeddings_max_retries,
                 query_prefix=query_prefix,
                 passage_prefix=passage_prefix,
             ),
@@ -2445,6 +2496,7 @@ def create_embeddings_from_env() -> Embeddings:
                 base_url="https://openrouter.ai/api/v1",
                 batch_size=config.embeddings_openai_batch_size,
                 dimensions=config.embeddings_openai_dimensions,
+                max_retries=config.embeddings_max_retries,
                 query_prefix=query_prefix,
                 passage_prefix=passage_prefix,
             ),
@@ -2464,6 +2516,7 @@ def create_embeddings_from_env() -> Embeddings:
                 base_url="https://router.requesty.ai/v1",
                 batch_size=config.embeddings_openai_batch_size,
                 dimensions=config.embeddings_openai_dimensions,
+                max_retries=config.embeddings_max_retries,
                 query_prefix=query_prefix,
                 passage_prefix=passage_prefix,
             ),

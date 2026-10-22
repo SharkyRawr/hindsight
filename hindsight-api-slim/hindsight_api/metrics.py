@@ -69,7 +69,10 @@ def _is_client_cancellation(exc: BaseException) -> bool:
 
     An abandoned recall/reflect raises OperationCancelledError (issue #2122);
     the HTTP layer re-raises it as ``HTTPException(499) from exc`` (see
-    api/http.py run_cancellable_on_disconnect). The exception itself, or any
+    api/http.py run_cancellable_on_disconnect). The hard-cancel path
+    (run_task_cancellable_on_disconnect) has no such error to re-raise, so it
+    chains a fresh one; before #5946 it raised a bare 499 and every hard
+    disconnect counted as a failure. The exception itself, or any
     link in its ``__cause__`` chain, being an OperationCancelledError marks it
     as a cancellation. Matching on the cause chain rather than a bare status
     code avoids misclassifying an unrelated 499 as a cancellation. Per the
@@ -1236,6 +1239,7 @@ class MetricsCollector(MetricsCollectorBase):
         per_bank = self._include_bank_id
         bank_sel = "bank_id, " if per_bank else ""
         from .engine.memories import get_memories
+        from .engine.memory_engine import _current_schema
 
         async with self._db_pool.acquire() as conn:
             # memory_units is the central per-tenant table; its presence marks a
@@ -1280,25 +1284,32 @@ class MetricsCollector(MetricsCollectorBase):
                     rows = await conn.fetch(f'SELECT bank_id FROM "{schema}".banks')
                     return [row["bank_id"] for row in rows]
 
+                # A store-owned backend derives where a bank's memories live from the request
+                # schema, so set it as a request would; left unset, every schema's banks resolve
+                # against the default schema and drop out of these gauges.
+                token = _current_schema.set(schema)
                 try:
-                    counts = await get_memories().count_consolidation_backlog(
-                        conn=conn, schema=schema, per_bank=per_bank, bank_ids=_schema_bank_ids
-                    )
-                    for bank, count in counts.items():
-                        key = _BacklogKey(schema, bank)
-                        backlog[key] = backlog.get(key, 0) + count
-                except Exception:
-                    logger.debug("Consolidation backlog query failed for schema %s", schema, exc_info=True)
+                    try:
+                        counts = await get_memories().count_consolidation_backlog(
+                            conn=conn, schema=schema, per_bank=per_bank, bank_ids=_schema_bank_ids
+                        )
+                        for bank, count in counts.items():
+                            key = _BacklogKey(schema, bank)
+                            backlog[key] = backlog.get(key, 0) + count
+                    except Exception:
+                        logger.debug("Consolidation backlog query failed for schema %s", schema, exc_info=True)
 
-                try:
-                    counts = await get_memories().count_consolidation_failed(
-                        conn=conn, schema=schema, per_bank=per_bank, bank_ids=_schema_bank_ids
-                    )
-                    for bank, count in counts.items():
-                        key = _BacklogKey(schema, bank)
-                        failed[key] = failed.get(key, 0) + count
-                except Exception:
-                    logger.debug("Consolidation failed query failed for schema %s", schema, exc_info=True)
+                    try:
+                        counts = await get_memories().count_consolidation_failed(
+                            conn=conn, schema=schema, per_bank=per_bank, bank_ids=_schema_bank_ids
+                        )
+                        for bank, count in counts.items():
+                            key = _BacklogKey(schema, bank)
+                            failed[key] = failed.get(key, 0) + count
+                    except Exception:
+                        logger.debug("Consolidation failed query failed for schema %s", schema, exc_info=True)
+                finally:
+                    _current_schema.reset(token)
 
         self._async_ops_counts = async_ops
         self._consolidation_backlog = backlog

@@ -1623,10 +1623,15 @@ class TestMemoryBrowsingTools:
     async def test_update_memory_edits_fields(self, mock_memory):
         mcp = _make_mcp_server(mock_memory, {"update_memory"}, include_bank_id=True)
         await _tools(mcp)["update_memory"].fn(
-            memory_id="mem-1", text="corrected", fact_type="experience", entities=["Alice"]
+            memory_id="mem-1",
+            text="corrected",
+            fact_type="experience",
+            entities=["Alice"],
+            mentioned_at="2019-05-01",
         )
         call_kwargs = mock_memory.update_memory_unit.call_args.kwargs
         assert call_kwargs["text"] == "corrected"
+        assert call_kwargs["mentioned_at"] == "2019-05-01"
         assert call_kwargs["new_fact_type"] == "experience"
         assert call_kwargs["entities"] == ["Alice"]
         # update_memory does not change state — that's invalidate_memory's job.
@@ -2828,3 +2833,48 @@ class TestRecallResponseSize:
         # An agent sizes its context from this line, so it must say what the budget covers.
         assert "'text' counts" in max_tokens_doc
         assert "several times larger" in max_tokens_doc
+
+
+@pytest.mark.asyncio
+class TestMcpCallLogging:
+    """#5960: every tool call names the tool, destructive ones log with audit off, writes are audited."""
+
+    @pytest.fixture
+    def mock_memory(self, mock_memory):
+        from hindsight_api.engine.audit import AuditLogger
+
+        mock_memory._config_resolver.get_bank_config = AsyncMock(return_value={})
+        mock_memory._operation_validator = None
+        mock_memory.audit_logger = AuditLogger(
+            pool_getter=lambda: None, schema_getter=lambda: "tenant_x", enabled=False, allowed_actions=[]
+        )
+        return mock_memory
+
+    async def test_delete_bank_logged_with_audit_disabled(self, mock_memory, caplog):
+        mcp = _make_mcp_server(mock_memory, {"delete_bank"}, include_bank_id=False)
+        with caplog.at_level("INFO"):
+            await mcp.call_tool("delete_bank", {})
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(
+            m.startswith("destructive_op action=delete_bank bank=test-bank transport=mcp")
+            and "schema=tenant_x" in m
+            and "status=ok" in m
+            for m in messages
+        ), messages
+        assert any(m.startswith("mcp tool=delete_bank bank=test-bank status=ok") for m in messages), messages
+
+    async def test_read_tool_named_but_not_destructive(self, mock_memory, caplog):
+        mcp = _make_mcp_server(mock_memory, {"list_tags"}, include_bank_id=False)
+        with caplog.at_level("INFO"):
+            await mcp.call_tool("list_tags", {})
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(m.startswith("mcp tool=list_tags bank=test-bank status=ok") for m in messages), messages
+        assert not any(m.startswith("destructive_op") for m in messages)
+
+    async def test_write_tool_missing_from_old_allowlist_is_audited(self, mock_memory):
+        mock_memory.audit_logger._enabled = True
+        mock_memory.audit_logger.log_fire_and_forget = MagicMock()
+        mcp = _make_mcp_server(mock_memory, {"sync_retain"}, include_bank_id=False)
+        await mcp.call_tool("sync_retain", {"content": "hello"})
+        entry = mock_memory.audit_logger.log_fire_and_forget.call_args.args[0]
+        assert (entry.action, entry.transport, entry.bank_id) == ("sync_retain", "mcp", "test-bank")

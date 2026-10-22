@@ -419,7 +419,8 @@ class LLMSpanRecorder:
         model: str,
         scope: str,
         messages: list[dict[str, str]],
-        response_content: Optional[str],
+        # Text for LLM calls; structured for rerank scores and decision answers.
+        response_content: str | dict[str, Any] | None,
         input_tokens: int,
         output_tokens: int,
         duration: float,
@@ -428,6 +429,7 @@ class LLMSpanRecorder:
         tool_calls: Optional[list[dict[str, Any]]] = None,
         cached_tokens: int = 0,
         thoughts_tokens: Optional[int] = None,
+        served_by: Optional[str] = None,
         **_extra: Any,
     ) -> None:
         """
@@ -442,7 +444,7 @@ class LLMSpanRecorder:
             model: Model name
             scope: Scope identifier (memory, reflect, consolidation, etc.)
             messages: Input messages (chat history)
-            response_content: Response text from LLM
+            response_content: Response text from LLM, or a structured result (rerank scores, decision answers)
             input_tokens: Input token count
             output_tokens: Output token count
             duration: Call duration in seconds
@@ -452,14 +454,21 @@ class LLMSpanRecorder:
             cached_tokens: Cached/cache-read prompt tokens, when reported by the provider.
             thoughts_tokens: Reasoning tokens, when reported by the provider. Not part of
                 ``output_tokens``, which is visible-only.
+            served_by: The upstream a gateway routed the call to. Taken from ``error``
+                when the failing call's exception carries it.
             _extra: Tolerated forward-compatible kwargs from other recorders.
         """
+        served_by = served_by or getattr(error, "served_by", None)
         try:
             # Map provider name to GenAI semantic convention
             genai_provider = PROVIDER_NAME_MAPPING.get(provider.lower(), provider.lower())
 
-            # Determine operation name based on scope/context
-            operation_name = "chat"  # Default for GenAI semantic conventions
+            # Read off the scope, like the call's kind in the request history: embedding
+            # and rerank calls are recorded here too, and must not pass as chat. Imported
+            # here because llm_trace imports this module.
+            from .engine.llm_trace import genai_operation_name
+
+            operation_name = genai_operation_name(scope)
 
             # Create span name: "hindsight.{scope}" for consistency with parent spans
             # Model info is available in span attributes (gen_ai.request.model)
@@ -497,6 +506,10 @@ class LLMSpanRecorder:
                 # Add custom attributes for Hindsight context
                 span.set_attribute("hindsight.scope", scope)
                 span.set_attribute("hindsight.provider.internal", provider)
+                # The upstream a gateway (OpenRouter) routed this call to: what lets a
+                # failure rate be attributed to one endpoint rather than the model (#5612).
+                if served_by:
+                    span.set_attribute("hindsight.provider.served_by", served_by)
 
                 # Add tool call information if present
                 if tool_calls:
@@ -581,7 +594,7 @@ class LLMSpanRecorder:
 
     def _format_output(
         self,
-        content: Optional[str],
+        content: str | dict[str, Any] | None,
         finish_reason: Optional[str],
     ) -> str:
         """Format output message into GenAI semantic convention format."""
@@ -589,9 +602,11 @@ class LLMSpanRecorder:
             if content is None:
                 return "[]"
 
-            # Truncate if needed
-            if isinstance(content, str):
-                content = _truncate_content(content)
+            # Truncate if needed. Structured output (rerank scores, decision answers) is
+            # serialized first so it is cut like text instead of exported whole.
+            if not isinstance(content, str):
+                content = json.dumps(content, ensure_ascii=False, default=str)
+            content = _truncate_content(content)
 
             return json.dumps(
                 [

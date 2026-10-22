@@ -60,7 +60,8 @@
       "copied": "已複製到剪貼簿",
       "viaAlias": "透過 {aliases}"
     },
-    "viewOnGitHub": "在 GitHub 上檢視"
+    "viewOnGitHub": "在 GitHub 上檢視",
+    "more": "更多"
   },
   "bank": {
     "bankConfiguration": "記憶庫設定",
@@ -82,7 +83,7 @@
     "webhooksDescription": "管理用於接收此記憶庫事件通知的 Webhook 端點。",
     "auditLogsDescription": "檢視此記憶庫所有操作的稽核記錄。",
     "llmRequests": "LLM 請求",
-    "llmRequestsDescription": "追蹤此記憶庫進行的每一次 LLM 呼叫，包括失敗的呼叫。",
+    "llmRequestsDescription": "追蹤此記憶庫的每一次模型呼叫（LLM、嵌入、重新排序與決策模型），包括失敗的呼叫。",
     "recallAnalyzer": "Recall 分析器",
     "recallAnalyzerDescription": "使用詳細追蹤資訊和檢索方法分析記憶 Recall。",
     "reflect": "Reflect",
@@ -146,7 +147,8 @@
       "collapseSidebar": "收起側邊欄",
       "collapse": "收起",
       "knowledge": "知識庫",
-      "home": "首頁"
+      "home": "首頁",
+      "openNavigation": "開啟導覽"
     },
     "overviewAndOperations": "檢視此記憶庫的概覽統計和背景作業。",
     "operations": "操作",
@@ -333,7 +335,22 @@
     "timeFieldMentionedShort": "提及時間",
     "timeFieldMentionedLong": "事實提及的時間（事件時間）",
     "timeFieldOccurredShort": "發生時間",
-    "timeFieldOccurredLong": "底層事件開始的時間"
+    "timeFieldOccurredLong": "底層事件開始的時間",
+    "knowledgePages": "知識頁面",
+    "noKnowledgePages": "尚無知識頁面",
+    "knowledgeSection": "知識",
+    "hintConsolidationDone": "整合已處理完的記憶。整合會把原始記憶變成觀察。",
+    "hintConsolidationPending": "等待下一次整合的記憶。",
+    "hintConsolidationFailed": "整合無法處理的記憶。點擊數字可查看並重試。",
+    "hintConsolidationLast": "上次整合的時間。",
+    "hintModelsInSync": "已讀完其範圍內所有新記憶的心智模型。",
+    "hintModelsStale": "自上次更新以來範圍內有新記憶的心智模型。下次更新時會補上。",
+    "hintModelsFailed": "上次更新失敗的心智模型。在手動更新之前，自動更新會一直暫停。",
+    "hintModelsLast": "所有心智模型中最近一次更新的時間。",
+    "hintPagesInSync": "已讀完其範圍內所有新記憶的知識頁面。",
+    "hintPagesStale": "自上次更新以來範圍內有新記憶的知識頁面。下次更新時會補上。",
+    "hintPagesFailed": "上次更新失敗的知識頁面。在手動更新之前，自動更新會一直暫停。",
+    "hintPagesLast": "所有知識頁面中最近一次更新的時間。"
   },
   "bankConfig": {
     "noBankSelected": "未選擇記憶庫",
@@ -500,6 +517,10 @@
     "defaultStrategyDescription": "當請求未指定策略時自動應用。",
     "llmBatchSizeLabel": "LLM 批次大小",
     "llmBatchSizeDescription": "單次整合呼叫傳送給 LLM 的事實數量。較大的值會減少 LLM 呼叫次數，但提示詞會更長。留空則使用伺服器預設值。",
+    "defaultObservationScopesLabel": "預設觀察範圍",
+    "defaultObservationScopesDescription": "用於未自行設定 observation_scopes 的保存項目的觀察範圍。僅適用於新的保存。",
+    "observationScopesCustom": "自訂範圍",
+    "observationScopesCustomPlaceholder": "每行一個範圍，標籤以逗號分隔 — 例如 topic:*, user:*",
     "sourceFactsMaxTokensLabel": "來源事實最大 Token 數",
     "sourceFactsMaxTokensDescription": "傳遞給合併提示詞的來源事實最大 Token 數。值越大，包含的脈絡越多，但每次呼叫成本越高。留空則使用伺服器預設值。",
     "sourceFactsMaxTokensPerObservationLabel": "每條觀察的來源事實最大 Token 數",
@@ -943,7 +964,8 @@
     "dateRangeCustom": "自訂範圍",
     "dateRangeFrom": "從",
     "dateRangeTo": "至",
-    "dateRangeReversed": "結束時間必須晚於開始時間"
+    "dateRangeReversed": "結束時間必須晚於開始時間",
+    "historyTab": "歷史"
   },
   "entitiesView": {
     "viewRelations": "關係",
@@ -1127,7 +1149,8 @@
     "actionOpenDetail": "查看詳細",
     "nextRefreshPaused": "重新整理失敗後暫停",
     "nextRefreshRetrying": "重試中，下次嘗試{time}",
-    "nextRefreshRunning": "正在重新整理"
+    "nextRefreshRunning": "正在重新整理",
+    "hideKnowledgePages": "隱藏知識頁面"
   },
   "cronPreview": {
     "invalid": "無效的 cron 運算式",
@@ -1413,6 +1436,44 @@
     "actionFileConvertRetain": "轉換檔案",
     "actionWebhookDelivery": "Webhook 投遞",
     "actionMemoryDefense": "記憶防護",
+    "actionSyncRetain": "同步保留",
+    "actionInvalidateMemory": "使記憶失效",
+    "actionCreateKnowledgeFolder": "建立知識資料夾",
+    "actionCreateKnowledgePage": "建立知識頁面",
+    "actionUpdateKnowledgeNode": "更新知識節點",
+    "actionDeleteKnowledgeNode": "刪除知識節點",
+    "actionFileRetain": "上傳檔案",
+    "actionUpdateMemory": "更新記憶",
+    "actionUpdateDocument": "更新文件",
+    "actionDeleteDocument": "刪除文件",
+    "actionReprocessDocument": "重新處理文件",
+    "actionImportDocuments": "匯入文件",
+    "actionExportDocuments": "匯出文件",
+    "actionRecoverConsolidation": "復原整合",
+    "actionClearObservations": "清除觀察",
+    "actionClearMemoryObservations": "清除記憶的觀察",
+    "actionUpdateMentalModel": "編輯心智模型",
+    "actionDryRunRefreshMentalModel": "試跑心智模型重新整理",
+    "actionClearMentalModel": "清空心智模型",
+    "actionUpdateDirective": "更新指令",
+    "actionUpdateBankConfig": "更新記憶庫設定",
+    "actionResetBankConfig": "重設記憶庫設定",
+    "actionCloneBank": "複製記憶庫",
+    "actionExportBank": "匯出記憶庫",
+    "actionImportBank": "匯入記憶庫",
+    "actionImportBankTemplate": "匯入記憶庫範本",
+    "actionImportBankTransfer": "匯入記憶庫轉移",
+    "actionCreateBankAlias": "建立記憶庫別名",
+    "actionSetBankAliasPrimary": "設定主要記憶庫別名",
+    "actionDeleteBankAlias": "刪除記憶庫別名",
+    "actionCreateWebhook": "建立 Webhook",
+    "actionUpdateWebhook": "更新 Webhook",
+    "actionDeleteWebhook": "刪除 Webhook",
+    "actionCancelOperation": "取消操作",
+    "actionRetryOperation": "重試操作",
+    "actionDeleteOperation": "刪除操作",
+    "actionGraphMaintenance": "圖維護",
+    "actionVectorIndexMaintenance": "向量索引維護",
     "transportAll": "所有傳輸",
     "transportHttp": "HTTP",
     "transportMcp": "MCP",
@@ -1466,9 +1527,18 @@
     "statusError": "錯誤",
     "operationAll": "所有操作",
     "operationRetain": "保留",
+    "operationRecall": "召回",
     "operationReflect": "反思",
     "operationConsolidation": "整合",
     "operationRefreshMentalModel": "重新整理心智模型",
+    "operationMentalModelWrite": "編輯心智模型",
+    "callTypeAll": "所有模型呼叫",
+    "callTypeLlm": "LLM",
+    "callTypeEmbedding": "嵌入",
+    "callTypeRerank": "重新排序",
+    "callTypeDecision": "決策模型",
+    "inputCountTexts": "文字",
+    "inputCountDocuments": "文件",
     "periodToday": "今天",
     "periodLast7Days": "最近 7 天",
     "periodLast30Days": "最近 30 天",
@@ -1667,6 +1737,7 @@
     "curationSave": "儲存",
     "curationStateInvalidated": "已失效",
     "editFieldContext": "情境",
+    "editFieldMentionedAt": "提及日期",
     "editFieldOccurredEnd": "結束日期",
     "editFieldOccurredStart": "開始日期",
     "editFieldType": "類型"
@@ -2031,7 +2102,8 @@
         "chunks": "取得文件片段失敗",
         "reprocess": "重新處理文件失敗",
         "export": "匯出文件失敗",
-        "import": "匯入文件失敗"
+        "import": "匯入文件失敗",
+        "history": "取得文件歷史失敗"
       },
       "files": {
         "upload": "上傳檔案失敗"
@@ -2081,7 +2153,8 @@
       },
       "auditLogs": {
         "list": "列出稽核記錄失敗",
-        "stats": "取得稽核記錄統計失敗"
+        "stats": "取得稽核記錄統計失敗",
+        "get": "取得稽核記錄項目失敗"
       },
       "llmRequests": {
         "list": "列出 LLM 請求失敗",
@@ -2259,5 +2332,38 @@
     "pausedTitle": "上次重新整理失敗，此模型不再自動更新——手動重新整理即可恢復",
     "retrying": "重試中",
     "retryingTitle": "上次嘗試失敗，已排入下一次嘗試——只有這次也失敗才會停止自動重新整理"
+  },
+  "documentHistory": {
+    "explainer": "每次變更對此文件的事實和觀察做了什麼。觀察會被重建而非保留版本：變更刪除的觀察，這裡的 ID 是唯一痕跡。歷史由銀行的操作重建，因此同步保留和關閉自動整合時的變更不會列出。展開一列查看 ID；將滑鼠停在 ID 上可在其他列中找到它。",
+    "empty": "尚無變更紀錄。歷史來自此銀行的操作：非同步保留，以及編輯後的整合。",
+    "loadError": "無法載入歷史。",
+    "idsRemoved": "已刪除",
+    "idsCreated": "已建立",
+    "idsUpdated": "已更新",
+    "chipRemoved": "被此變更刪除——已不存在",
+    "chipOpen": "開啟此觀察",
+    "moreIds": "還有 {count} 個",
+    "kind": {
+      "retain": "已保留",
+      "append": "已附加",
+      "reprocess": "已重新處理",
+      "retag": "標籤已變更",
+      "fact_edited": "事實已編輯",
+      "fact_invalidated": "事實已失效",
+      "fact_restored": "事實已還原",
+      "fact_deleted": "事實已刪除",
+      "observations_cleared": "觀察已清除",
+      "consolidation": "已整合"
+    },
+    "loadOlder": "載入更早的",
+    "colWhen": "時間",
+    "colChange": "變更",
+    "colFacts": "事實",
+    "colObservations": "觀察",
+    "colOperation": "操作",
+    "legendExists": "仍然存在——點擊開啟",
+    "legendRemovedLater": "被之後的變更刪除",
+    "legendRemovedHere": "被此變更刪除",
+    "chipRemovedLater": "之後被刪除：{kind}（{when}）"
   }
 }

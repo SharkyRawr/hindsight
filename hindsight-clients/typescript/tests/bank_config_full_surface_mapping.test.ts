@@ -69,6 +69,7 @@ describe("full bank config surface mapping", () => {
     await client.updateBankConfig("bank", {
       enableAutoConsolidation: false,
       consolidationUseDecisionModel: false,
+      mentalModelDeltaUseDecisionModel: false,
       consolidationLlmBatchSize: 4,
       consolidationLlmParallelism: 2,
       consolidationMaxMemoriesPerRound: 50,
@@ -82,6 +83,7 @@ describe("full bank config surface mapping", () => {
       consolidationStrategies: [
         { scopes: [{ tags: ["company:*"] }], observations_mission: "Trends only." },
       ],
+      defaultObservationScopes: [["topic:*", "user:*"]],
       retainDefaultStrategy: "fast",
       retainStrategies: { fast: { retain_extraction_mode: "concise" } },
       retainChunkBatchSize: 64,
@@ -96,6 +98,7 @@ describe("full bank config surface mapping", () => {
     expect(body.updates).toEqual({
       enable_auto_consolidation: false,
       consolidation_use_decision_model: false,
+      mental_model_delta_use_decision_model: false,
       consolidation_llm_batch_size: 4,
       consolidation_llm_parallelism: 2,
       consolidation_max_memories_per_round: 50,
@@ -109,6 +112,7 @@ describe("full bank config surface mapping", () => {
       consolidation_strategies: [
         { scopes: [{ tags: ["company:*"] }], observations_mission: "Trends only." },
       ],
+      default_observation_scopes: [["topic:*", "user:*"]],
       retain_default_strategy: "fast",
       retain_strategies: { fast: { retain_extraction_mode: "concise" } },
       retain_chunk_batch_size: 64,

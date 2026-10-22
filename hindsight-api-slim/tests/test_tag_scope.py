@@ -13,7 +13,8 @@ from pathlib import Path
 
 import pytest
 
-from hindsight_api.engine.memory_engine import _resolve_refresh_tag_filtering, _scope_mental_model_trigger
+from hindsight_api.engine.memories import MemoryPatch, get_memories
+from hindsight_api.engine.memory_engine import _resolve_refresh_tag_filtering, _scope_mental_model_trigger, fq_table
 from hindsight_api.engine.reflect.tools import tool_expand, tool_read_mental_models
 from hindsight_api.engine.schema import fq_store_table_explicit
 from hindsight_api.engine.search.tags import TagGroupLeaf, tags_satisfy_groups, tags_writable
@@ -105,13 +106,26 @@ async def scoped_bank(memory):
     # In production the rule tag comes from an entity label with `tag: true`, which needs a real
     # LLM to extract; the mock cannot. Forging it on the stored fact is the only way to put a
     # memory and its document in different scopes here, which is exactly the case under test.
+    # Written wherever this bank's memories live. Postgres's `update_memories` is a no-op (its
+    # callers write the row themselves), so for a SQL bank the UPDATE is that write.
+    store = get_memories()
     backend = await memory._get_backend()
     async with backend.acquire() as conn:
-        await conn.execute(
-            f"UPDATE {fq_store_table_explicit('memory_units')} SET tags = ARRAY['user:kate', 'kind:rule'] "
-            "WHERE bank_id = $1 AND fact_type = 'world' AND text ILIKE '%Fridays%'",
-            bank_id,
-        )
+        if store.store_owned_for(bank_id):
+            page = await store.scan_memories(
+                conn=conn, fq_table=fq_table, bank_id=bank_id, fact_types=["world"], limit=1_000_000
+            )
+            rules = [m.unit_id for m in page.memories if "fridays" in m.text.lower()]
+            assert rules, "the mock extracted no fact about Fridays to forge into the shared scope"
+            await store.update_memories(
+                bank_id, [MemoryPatch(unit_id=u, tags=["user:kate", "kind:rule"]) for u in rules]
+            )
+        else:
+            await conn.execute(
+                f"UPDATE {fq_store_table_explicit('memory_units')} SET tags = ARRAY['user:kate', 'kind:rule'] "
+                "WHERE bank_id = $1 AND fact_type = 'world' AND text ILIKE '%Fridays%'",
+                bank_id,
+            )
     validator = _ScopeByApiKey({"dan": DAN_SCOPE})
     original = memory._operation_validator
     memory._operation_validator = validator
@@ -168,6 +182,7 @@ async def test_document_text_follows_the_document(memory, scoped_bank):
     assert [d["id"] for d in docs["items"]] == ["dan-notes"]
     assert await memory.get_document("kate-sync", scoped_bank, request_context=dan) is None
     assert await memory.list_document_chunks(scoped_bank, "kate-sync", request_context=dan) is None
+    assert await memory.get_document_history(scoped_bank, "kate-sync", request_context=dan) is None
 
     admin_chunks = await memory.list_document_chunks(scoped_bank, "kate-sync", request_context=RequestContext())
     assert admin_chunks is not None
@@ -702,6 +717,7 @@ async def test_bank_wide_reads_and_writes_are_refused_to_a_scoped_caller(memory,
         "retry operation": lambda: memory.retry_operation(scoped_bank, some_id, request_context=dan),
         "delete operation": lambda: memory.delete_operation(scoped_bank, some_id, request_context=dan),
         "audit log": lambda: memory.list_audit_logs(scoped_bank, request_context=dan),
+        "audit log entry": lambda: memory.get_audit_log(scoped_bank, some_id, request_context=dan),
         "audit log stats": lambda: memory.audit_log_stats(scoped_bank, request_context=dan),
         "llm requests": lambda: memory.list_llm_requests(scoped_bank, request_context=dan),
         "llm request stats": lambda: memory.llm_request_stats(scoped_bank, request_context=dan),
@@ -756,6 +772,27 @@ async def test_reflect_works_where_bank_statistics_are_refused(memory, scoped_ba
     result = await memory.reflect_async(bank_id=scoped_bank, query="What are the rules?", request_context=dan)
     assert result.text is not None
     assert BankReadOperation.GET_BANK_STATS not in seen
+
+
+@pytest.mark.asyncio
+async def test_document_history_is_its_own_read_operation(memory, scoped_bank):
+    """Extensions see the history read under its own name, so they can refuse it without
+    refusing the document itself."""
+    seen: list = []
+
+    async def validate_bank_read(ctx):
+        seen.append(ctx.operation)
+        if ctx.operation == BankReadOperation.GET_DOCUMENT_HISTORY:
+            return ValidationResult.reject("history refused", status_code=403)
+        return ValidationResult.accept()
+
+    memory._operation_validator.validate_bank_read = validate_bank_read
+    admin = RequestContext()
+    with pytest.raises(OperationValidationError) as e:
+        await memory.get_document_history(scoped_bank, "dan-notes", request_context=admin)
+    assert e.value.status_code == 403
+    assert BankReadOperation.GET_DOCUMENT_HISTORY in seen
+    assert await memory.get_document("dan-notes", scoped_bank, request_context=admin) is not None
 
 
 @pytest.mark.asyncio

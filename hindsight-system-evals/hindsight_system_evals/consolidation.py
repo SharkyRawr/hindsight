@@ -49,7 +49,8 @@ from hindsight_system_evals.pages import SettleFn
 @dataclass(frozen=True)
 class Fact:
     text: str
-    #: When the statement was made (ISO date). Becomes the fact's ``mentioned_at``,
+    #: When the statement was made: an ISO date (read as noon UTC), or a full ISO
+    #: timestamp when the time of day matters. Becomes the fact's ``mentioned_at``,
     #: which is what consolidation is told to read as recency.
     on: str
     entities: tuple[str, ...] = ()
@@ -123,7 +124,7 @@ class ConsolidationCost:
     llm_seconds: float = 0.0
     #: Retain to settled, summed over waves: what a caller waits for.
     wall_seconds: float = 0.0
-    #: Decision-model triage requests (scope ``consolidation_triage``), priced apart.
+    #: Decision-model triage requests (scope ``decision_consolidation_triage``), priced apart.
     triage_calls: int = 0
     triage_input_tokens: int = 0
 
@@ -162,6 +163,9 @@ class ConsolidationOutcome:
             lines += [f"    - {o.text} [proof={o.proof_count}]" for o in snapshot]
         return "\n".join(lines)
 
+
+#: Scope the server traces consolidation's decision-model triage requests under.
+TRIAGE_SCOPE = "decision_consolidation_triage"
 
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 #: Prompt scaffolding that must never reach an observation's text (#2544: leaked
@@ -278,7 +282,9 @@ async def _consolidation_calls(client: Hindsight, bank_id: str) -> list[Consolid
                 output=c.output,
             )
             for c in page.items
-            if (c.scope or "").startswith("consolidation")
+            # The consolidation LLM calls plus its decision-model triage. Not the
+            # embeddings a consolidation run also makes: they are not the spend priced here.
+            if (c.scope or "").startswith("consolidation") or c.scope == TRIAGE_SCOPE
         ]
         offset += len(page.items)
         if not page.items or offset >= page.total:
@@ -340,7 +346,7 @@ async def run_scenario(client: Hindsight, bank_id: str, settled: SettleFn, scena
         for j, fact in enumerate(wave.facts):
             item: dict[str, Any] = {
                 "content": fact.text,
-                "timestamp": f"{fact.on}T12:00:00Z",
+                "timestamp": fact.on if "T" in fact.on else f"{fact.on}T12:00:00Z",
                 "document_id": f"{scenario.id}-w{wave_no}-{j}",
                 "entities": [{"text": e} for e in fact.entities],
             }
@@ -381,8 +387,8 @@ async def run_scenario(client: Hindsight, bank_id: str, settled: SettleFn, scena
         outcome.snapshots.append(observations)
 
     traced = await _consolidation_calls(client, bank_id)
-    triage = [c for c in traced if c.scope == "consolidation_triage"]
-    calls = [c for c in traced if c.scope != "consolidation_triage"]
+    triage = [c for c in traced if c.scope == TRIAGE_SCOPE]
+    calls = [c for c in traced if c.scope != TRIAGE_SCOPE]
     outcome.cost.triage_calls = len(triage)
     outcome.cost.triage_input_tokens = sum(c.input_tokens for c in triage)
     outcome.cost.calls = len(calls)

@@ -529,6 +529,29 @@ impl ApiClient {
         })
     }
 
+    pub fn get_document_history(
+        &self,
+        agent_id: &str,
+        document_id: &str,
+        limit: i32,
+        offset: i32,
+    ) -> Result<types::DocumentHistoryResponse> {
+        self.runtime.block_on(async {
+            let response = self
+                .client
+                .get_document_history(
+                    agent_id,
+                    document_id,
+                    std::num::NonZeroU64::new(limit.max(1) as u64),
+                    Some(offset as u64),
+                    None, // authorization
+                )
+                .humanized()
+                .await?;
+            Ok(response.into_inner())
+        })
+    }
+
     pub fn delete_document(
         &self,
         agent_id: &str,
@@ -940,7 +963,7 @@ impl ApiClient {
         self.runtime.block_on(async {
             let response = self
                 .client
-                .list_mental_models(bank_id, Some(detail), None, None, None, None, None)
+                .list_mental_models(bank_id, Some(detail), None, None, None, None, None, None)
                 .humanized()
                 .await?;
             Ok(response.into_inner())
@@ -1519,6 +1542,22 @@ impl ApiClient {
                 .list_audit_logs(
                     bank_id, action, end_date, limit_nz, offset, start_date, transport, None,
                 )
+                .humanized()
+                .await?;
+            Ok(response.into_inner())
+        })
+    }
+
+    pub fn get_audit_log(
+        &self,
+        bank_id: &str,
+        log_id: &str,
+        _verbose: bool,
+    ) -> Result<types::AuditLogEntry> {
+        self.runtime.block_on(async {
+            let response = self
+                .client
+                .get_audit_log(bank_id, log_id, None)
                 .humanized()
                 .await?;
             Ok(response.into_inner())

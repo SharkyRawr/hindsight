@@ -20,6 +20,12 @@ Strategies:
   it is stored and no other operation is affected — see ``config.py`` and the
   configuration docs for what this does and does not promise.
 
+A member that fails (after its own retries) is cooled down: for
+``strategy.cooldown_seconds`` it moves to the back of the order, so later requests
+stop paying for its errors and timeouts. Failing again once the cooldown is over
+doubles it (capped at an hour); a success clears it. A cooling member is only deprioritized,
+never removed, so a request still reaches it when every other member fails too.
+
 Batch retain runs on the **first batch-capable member** in declared order (see
 ``batch_provider_impl``), which need not be the primary; once selected, the whole
 batch lifecycle stays on that member and does not fail over. Every other direct
@@ -30,7 +36,7 @@ paths.
 
 import logging
 import threading
-import uuid
+import time
 from typing import TYPE_CHECKING, Any
 
 from ..config import LLM_STRATEGY_FAILOVER, LLM_STRATEGY_METADATA, LLMStrategyConfig
@@ -41,6 +47,10 @@ if TYPE_CHECKING:
     from .llm_wrapper import ConfiguredLLMProvider, LLMToolCallResult
 
 logger = logging.getLogger(__name__)
+
+# A fixed cap rather than per-member reset schedules: hourly probing finds a
+# daily quota back soon enough; schedule-aware routing is a router's job (LiteLLM).
+_MAX_COOLDOWN_SECONDS = 3600
 
 
 def _should_failover(exc: BaseException) -> bool:
@@ -118,6 +128,8 @@ class MultiLLMProvider:
                 f"{len(members)} members (primary + indexed); they must match."
             )
         self._scheduler = _WeightedRoundRobin(weights)
+        self._failures: dict[int, int] = {}
+        self._cooldown_until: dict[int, float] = {}
 
         if strategy.mode == LLM_STRATEGY_METADATA:
             for route in strategy.routes or []:
@@ -139,9 +151,29 @@ class MultiLLMProvider:
             # over into another member's lane.
             return [0]
         if self._strategy.mode == LLM_STRATEGY_FAILOVER:
-            return list(range(n))
-        start = self._scheduler.next()
-        return [(start + i) % n for i in range(n)]
+            order = list(range(n))
+        else:
+            start = self._scheduler.next()
+            order = [(start + i) % n for i in range(n)]
+        # Cooling members go last (stable sort keeps their relative order).
+        now = time.monotonic()
+        return sorted(order, key=lambda i: self._cooldown_until.get(i, 0.0) > now)
+
+    def _cool_down(self, idx: int) -> float:
+        """Record a failure of member ``idx``; return its cooldown in seconds."""
+        base = self._strategy.cooldown_seconds
+        if not base or len(self._members) == 1:
+            return 0.0
+        now = time.monotonic()
+        # Already cooling: concurrent in-flight calls (or a last-resort try) failing
+        # together are one outage, not several, so only a failure after the
+        # cooldown ended doubles it. Otherwise a burst would jump straight to the cap.
+        if self._cooldown_until.get(idx, 0.0) > now:
+            return self._cooldown_until[idx] - now
+        failures = self._failures[idx] = self._failures.get(idx, 0) + 1
+        delay = min(base * 2 ** (failures - 1), _MAX_COOLDOWN_SECONDS)
+        self._cooldown_until[idx] = now + delay
+        return delay
 
     def member_for_metadata(self, metadata: dict[str, Any] | None) -> LLMProvider | None:
         """The member selected by a retained item's metadata, or ``None``.
@@ -166,21 +198,28 @@ class MultiLLMProvider:
         for position, idx in enumerate(order):
             member = self._members[idx]
             try:
-                return await getattr(member, method_name)(**kwargs)
+                result = await getattr(member, method_name)(**kwargs)
             except BaseException as e:  # noqa: BLE001 - re-raised unless it should fail over
                 if not _should_failover(e):
                     raise
                 last_exc = e
                 remaining = len(order) - position - 1
+                cooldown = self._cool_down(idx)
                 logger.warning(
-                    "LLM member %d (%s/%s) failed on %s: %s%s",
+                    "LLM member %d (%s/%s) failed on %s: %s%s%s",
                     idx,
                     member.provider,
                     member.model,
                     method_name,
                     e,
+                    f"; trying it last for {cooldown:.0f}s" if cooldown else "",
                     f"; trying next member ({remaining} left)" if remaining else "; no members left",
                 )
+                continue
+            if self._failures.pop(idx, None):
+                self._cooldown_until.pop(idx, None)
+                logger.info("LLM member %d (%s/%s) recovered", idx, member.provider, member.model)
+            return result
         # All members failed; surface the last error (loop ran at least once).
         assert last_exc is not None
         raise last_exc
@@ -285,18 +324,10 @@ class MultiLLMProvider:
         """Mirror ``LLMProvider.with_config`` so the strategy runs inside the
         per-operation configured wrapper (gemini-safety + trace contextvars wrap
         every member call)."""
-        from .llm_trace import LLMTraceContext
+        from .llm_trace import operation_trace_context
         from .llm_wrapper import ConfiguredLLMProvider
 
-        trace_ctx = None
-        if bank_id is not None or operation is not None or metadata:
-            trace_ctx = LLMTraceContext(
-                bank_id=bank_id,
-                operation=operation,
-                metadata=dict(metadata or {}),
-                trace_id=str(uuid.uuid4()),
-                operation_span_id=str(uuid.uuid4()),
-            )
+        trace_ctx = operation_trace_context(bank_id, operation, metadata)
         return ConfiguredLLMProvider(self, config.llm_gemini_safety_settings, trace_ctx)
 
     # ── attribute passthrough ────────────────────────────────────────────────────

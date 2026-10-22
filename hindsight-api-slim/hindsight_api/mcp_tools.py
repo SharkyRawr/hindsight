@@ -7,6 +7,7 @@ This module provides the core tool logic used by both:
 
 import json
 import logging
+import time
 from collections.abc import Awaitable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -26,6 +27,7 @@ from hindsight_api.engine.audit import AuditEntry, AuditLogger
 from hindsight_api.engine.memory_engine import KEEP_PARENT, Budget
 from hindsight_api.engine.response_models import VALID_RECALL_FACT_TYPES, MinScores, TemporalWindow
 from hindsight_api.engine.search.tags import TagGroup, TagsMatch
+from hindsight_api.engine.stored_dates import is_placeholder_date
 from hindsight_api.extensions import OperationValidationError
 from hindsight_api.models import RequestContext
 
@@ -494,12 +496,15 @@ def parse_timestamp(timestamp: str) -> datetime | None:
         ValueError: If timestamp format is invalid
     """
     try:
-        return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
     except ValueError as e:
         raise ValueError(
             f"Invalid timestamp format '{timestamp}'. "
             "Expected ISO format like '2024-01-15T10:30:00' or '2024-01-15T10:30:00Z'"
         ) from e
+    if is_placeholder_date(parsed):
+        raise ValueError(f"Timestamp year {parsed.year} is a placeholder, not a date.")
+    return parsed
 
 
 def build_content_dict(
@@ -887,124 +892,83 @@ def _apply_bank_tool_filtering(mcp: FastMCP, memory: MemoryEngine, config: MCPTo
         logger.warning("Could not apply bank tool filtering: unknown FastMCP version")
 
 
-_AUDITABLE_MCP_TOOLS: frozenset[str] = frozenset(
+# Read-only tools are not audited, like the HTTP GET routes; every other tool is.
+# A deny-list, so a new write tool is audited without anyone remembering to add it.
+_UNAUDITED_MCP_TOOLS: frozenset[str] = frozenset(
     {
-        "retain",
-        "recall",
-        "reflect",
-        "create_bank",
-        "update_bank",
-        "delete_bank",
-        "clear_memories",
-        "create_mental_model",
-        "update_mental_model",
-        "delete_mental_model",
-        "refresh_mental_model",
-        "clear_mental_model",
-        "create_directive",
-        "delete_directive",
-        "delete_document",
-        "cancel_operation",
-        "create_knowledge_folder",
-        "create_knowledge_page",
-        "update_knowledge_node",
-        "delete_knowledge_node",
+        "get_bank",
+        "get_bank_stats",
+        "get_document",
+        "get_knowledge_base_tree",
+        "get_knowledge_page",
+        "get_memory",
+        "get_mental_model",
+        "get_operation",
+        "list_banks",
+        "list_directives",
+        "list_documents",
+        "list_memories",
+        "list_mental_models",
+        "list_operations",
+        "list_tags",
+        "search_knowledge_base",
     }
 )
 
 
 def _apply_audit_logging(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
-    """Wrap auditable MCP tool run methods with audit logging."""
+    """Log every MCP tool call, and write an audit row for the auditable ones."""
     audit_logger: AuditLogger = memory.audit_logger
+    original_call_tool = mcp.call_tool
 
-    def _wrap_tool_run(tool_name: str, original_run):
-        """Create an audited wrapper for a tool's run method."""
-
-        async def _audited_run(arguments, _name=tool_name, _orig=original_run):
-            # Cheap bank-independent pre-filter before resolving bank_id.
-            if not audit_logger.action_allowed(_name):
-                return await _orig(arguments)
-
-            bank_id = None
-            if isinstance(arguments, dict):
-                bank_id = arguments.get("bank_id") or (config.bank_id_resolver() if config.bank_id_resolver else None)
-            elif hasattr(arguments, "get"):
-                bank_id = arguments.get("bank_id")
-
-            # Per-bank decision, resolved after bank_id is known.
-            if not await audit_logger.should_log(_name, bank_id):
-                return await _orig(arguments)
-
-            entry = AuditEntry(
-                action=_name,
-                transport="mcp",
-                bank_id=bank_id,
-                started_at=datetime.now(timezone.utc),
-                request=dict(arguments) if isinstance(arguments, dict) else {"raw": str(arguments)},
+    async def _call_tool(name: str, arguments: dict[str, Any] | None = None, **kwargs: Any) -> Any:
+        bank_id = None
+        if isinstance(arguments, dict):
+            bank_id = arguments.get("bank_id") or (config.bank_id_resolver() if config.bank_id_resolver else None)
+        start = time.monotonic()
+        status = "error"
+        try:
+            with audit_logger.destructive_op(
+                name,
+                "mcp",
+                bank_id,
+                tenant_id=config.tenant_id_resolver() if config.tenant_id_resolver else None,
+                api_key_id=config.api_key_id_resolver() if config.api_key_id_resolver else None,
+            ):
+                result = await _audited(name, bank_id, arguments, **kwargs)
+            status = "ok"
+            return result
+        finally:
+            # The MCP SDK only logs "Processing request of type CallToolRequest" (#5960).
+            logger.info(
+                "mcp tool=%s bank=%s status=%s duration_ms=%d", name, bank_id, status, (time.monotonic() - start) * 1000
             )
 
-            try:
-                result = await _orig(arguments)
-                if isinstance(result, dict):
-                    entry.response = result
-                elif isinstance(result, list):
-                    entry.response = {"items": result}
-                elif isinstance(result, str):
-                    entry.response = {"text": result}
-                return result
-            finally:
-                entry.ended_at = datetime.now(timezone.utc)
-                audit_logger.log_fire_and_forget(entry)
+    async def _audited(name: str, bank_id: str | None, arguments: dict[str, Any] | None, **kwargs: Any) -> Any:
+        # Cheap bank-independent pre-filter, then the per-bank decision.
+        if (
+            name in _UNAUDITED_MCP_TOOLS
+            or not audit_logger.action_allowed(name)
+            or not await audit_logger.should_log(name, bank_id)
+        ):
+            return await original_call_tool(name, arguments, **kwargs)
 
-        return _audited_run
-
-    if hasattr(mcp, "_tool_manager"):
-        # FastMCP 2.x
+        entry = AuditEntry(
+            action=name,
+            transport="mcp",
+            bank_id=bank_id,
+            started_at=datetime.now(timezone.utc),
+            request=dict(arguments) if isinstance(arguments, dict) else {},
+        )
         try:
-            for name, tool in mcp._tool_manager._tools.items():  # type: ignore[unresolved-attribute]  # FastMCP 2.x internal; guarded by hasattr
-                if name in _AUDITABLE_MCP_TOOLS:
-                    object.__setattr__(tool, "run", _wrap_tool_run(name, tool.run))
-        except (AttributeError, KeyError) as e:
-            logger.warning(f"Could not apply MCP audit logging (v2): {e}")
-    elif hasattr(mcp, "get_tool"):
-        # FastMCP 3.x: wrap call_tool
-        original_call_tool = getattr(mcp, "call_tool", None)
-        if original_call_tool:
+            result = await original_call_tool(name, arguments, **kwargs)
+            entry.response = {"result": str(result)[:4096]}
+            return result
+        finally:
+            entry.ended_at = datetime.now(timezone.utc)
+            audit_logger.log_fire_and_forget(entry)
 
-            async def _audited_call_tool(name, arguments=None, **kwargs):
-                # Cheap bank-independent pre-filter before resolving bank_id.
-                if name not in _AUDITABLE_MCP_TOOLS or not audit_logger.action_allowed(name):
-                    return await original_call_tool(name, arguments, **kwargs)
-
-                bank_id = None
-                if isinstance(arguments, dict):
-                    bank_id = arguments.get("bank_id") or (
-                        config.bank_id_resolver() if config.bank_id_resolver else None
-                    )
-
-                # Per-bank decision, resolved after bank_id is known.
-                if not await audit_logger.should_log(name, bank_id):
-                    return await original_call_tool(name, arguments, **kwargs)
-
-                entry = AuditEntry(
-                    action=name,
-                    transport="mcp",
-                    bank_id=bank_id,
-                    started_at=datetime.now(timezone.utc),
-                    request=dict(arguments) if isinstance(arguments, dict) else {},
-                )
-
-                try:
-                    result = await original_call_tool(name, arguments, **kwargs)
-                    entry.response = {"result": str(result)[:4096]}
-                    return result
-                finally:
-                    entry.ended_at = datetime.now(timezone.utc)
-                    audit_logger.log_fire_and_forget(entry)
-
-            object.__setattr__(mcp, "call_tool", _audited_call_tool)
-    else:
-        logger.warning("Could not apply MCP audit logging: unknown FastMCP version")
+    object.__setattr__(mcp, "call_tool", _call_tool)
 
 
 def _register_retain(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsConfig) -> None:
@@ -3688,8 +3652,8 @@ def _register_update_memory(mcp: FastMCP, memory: MemoryEngine, config: MCPTools
     _EDIT_DOC = """
             Edit a memory unit to correct what was extracted.
 
-            Pass any of text / context / occurred_start / occurred_end / fact_type /
-            entities. For context and the dates, "" clears the field and omitting it
+            Pass any of text / context / occurred_start / occurred_end / mentioned_at /
+            fact_type / entities. For context and the dates, "" clears the field and omitting it
             leaves it unchanged; entities replaces the fact's entity set ([] detaches
             all). The memory is re-embedded and its derived observations, links, and
             graph are recomputed automatically.
@@ -3712,6 +3676,7 @@ def _register_update_memory(mcp: FastMCP, memory: MemoryEngine, config: MCPTools
         context: str | None,
         occurred_start: str | None,
         occurred_end: str | None,
+        mentioned_at: str | None,
         fact_type: str | None,
         entities: list[str] | None,
         resolve_entities: bool,
@@ -3723,6 +3688,7 @@ def _register_update_memory(mcp: FastMCP, memory: MemoryEngine, config: MCPTools
             context=context,
             occurred_start=occurred_start,
             occurred_end=occurred_end,
+            mentioned_at=mentioned_at,
             new_fact_type=fact_type,
             entities=entities,
             resolve_entities=resolve_entities,
@@ -3741,6 +3707,7 @@ def _register_update_memory(mcp: FastMCP, memory: MemoryEngine, config: MCPTools
             context: str | None = None,
             occurred_start: str | None = None,
             occurred_end: str | None = None,
+            mentioned_at: str | None = None,
             fact_type: str | None = None,
             entities: list[str] | None = None,
             resolve_entities: bool = True,
@@ -3763,6 +3730,7 @@ def _register_update_memory(mcp: FastMCP, memory: MemoryEngine, config: MCPTools
                     context,
                     occurred_start,
                     occurred_end,
+                    mentioned_at,
                     fact_type,
                     entities,
                     resolve_entities,
@@ -3779,6 +3747,7 @@ def _register_update_memory(mcp: FastMCP, memory: MemoryEngine, config: MCPTools
             context: str | None = None,
             occurred_start: str | None = None,
             occurred_end: str | None = None,
+            mentioned_at: str | None = None,
             fact_type: str | None = None,
             entities: list[str] | None = None,
             resolve_entities: bool = True,
@@ -3799,6 +3768,7 @@ def _register_update_memory(mcp: FastMCP, memory: MemoryEngine, config: MCPTools
                     context,
                     occurred_start,
                     occurred_end,
+                    mentioned_at,
                     fact_type,
                     entities,
                     resolve_entities,

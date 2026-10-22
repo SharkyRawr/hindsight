@@ -107,16 +107,19 @@ export interface WebhookDelivery {
   updated_at: string | null;
 }
 
-export interface AuditLogEntry {
+export interface AuditLogSummary {
   id: string;
   action: string;
   transport: string;
   bank_id: string | null;
   started_at: string | null;
   ended_at: string | null;
+  metadata: Record<string, unknown>;
+}
+
+export interface AuditLogEntry extends AuditLogSummary {
   request: Record<string, unknown> | null;
   response: Record<string, unknown> | null;
-  metadata: Record<string, unknown>;
 }
 
 export interface AuditLogsResponse {
@@ -124,7 +127,7 @@ export interface AuditLogsResponse {
   total: number;
   limit: number;
   offset: number;
-  items: AuditLogEntry[];
+  items: AuditLogSummary[];
 }
 
 export interface AuditStatsBucket {
@@ -166,6 +169,9 @@ export interface LLMRequestEntry {
   llm_info: Record<string, unknown>;
   metadata: Record<string, unknown>;
 }
+
+/** Kind of model call, derived server-side from the scope (embedding_*, rerank, decision_*, else llm). */
+export type LLMCallType = "llm" | "embedding" | "rerank" | "decision";
 
 export interface LLMRequestsResponse {
   bank_id: string;
@@ -280,6 +286,8 @@ export interface MentalModel {
   created_at: string;
   reflect_response?: any;
   is_stale?: boolean | null;
+  /** True when this model holds a knowledge page's content (not a standalone model). */
+  is_knowledge_page?: boolean | null;
   /** When the last refresh failed. Set = automatic refreshes are paused for this model. */
   last_refresh_failed_at?: string | null;
   /** When a refresh last ran in full mode. `trigger.full_refresh_cron` comes due against this. */
@@ -410,6 +418,45 @@ export interface BankAliasesResponse {
   /** The bank's own id, which an alias never replaces. */
   bank_id: string;
   aliases: BankAliasEntry[];
+}
+
+export type DocumentEventKind =
+  | "retain"
+  | "append"
+  | "reprocess"
+  | "retag"
+  | "fact_edited"
+  | "fact_invalidated"
+  | "fact_restored"
+  | "fact_deleted"
+  | "observations_cleared"
+  | "consolidation";
+
+/** How many observations an event touched, and (up to 100) which. */
+export interface ObservationIdSample {
+  count: number;
+  ids: string[];
+}
+
+export interface DocumentEvent {
+  document_id: string;
+  kind: DocumentEventKind;
+  created_at: string;
+  operation_id: string | null;
+  fact_id: string | null;
+  facts_added: number;
+  facts_removed: number;
+  observations_created: ObservationIdSample;
+  observations_updated: ObservationIdSample;
+  observations_removed: ObservationIdSample;
+}
+
+interface DocumentHistoryResponse {
+  document_id: string;
+  total: number;
+  limit: number;
+  offset: number;
+  items: DocumentEvent[];
 }
 
 export class ControlPlaneClient {
@@ -1129,6 +1176,16 @@ export class ControlPlaneClient {
   }
 
   /**
+   * A document's change history, newest first: what each retain, fact edit and
+   * consolidation did to its facts and observations.
+   */
+  async getDocumentHistory(documentId: string, bankId: string, offset = 0, limit = 100) {
+    return this.fetchApi<DocumentHistoryResponse>(
+      `${documentApi(documentId, bankId, "/history")}&limit=${limit}&offset=${offset}`
+    );
+  }
+
+  /**
    * Reprocess a document (re-run retain with existing content)
    */
   async reprocessDocument(documentId: string, bankId: string) {
@@ -1287,6 +1344,7 @@ export class ControlPlaneClient {
       context?: string;
       occurredStart?: string;
       occurredEnd?: string;
+      mentionedAt?: string;
       factType?: "world" | "experience";
       entities?: string[];
       resolveEntities?: boolean;
@@ -1299,6 +1357,7 @@ export class ControlPlaneClient {
     if (update.context !== undefined) body.context = update.context;
     if (update.occurredStart !== undefined) body.occurred_start = update.occurredStart;
     if (update.occurredEnd !== undefined) body.occurred_end = update.occurredEnd;
+    if (update.mentionedAt !== undefined) body.mentioned_at = update.mentionedAt;
     if (update.factType !== undefined) body.fact_type = update.factType;
     if (update.entities !== undefined) body.entities = update.entities;
     if (update.resolveEntities !== undefined) body.resolve_entities = update.resolveEntities;
@@ -1749,6 +1808,8 @@ export class ControlPlaneClient {
       detail?: "metadata" | "content" | "full";
       limit?: number;
       offset?: number;
+      /** Leave out the models that back knowledge pages (standalone models only). */
+      excludeKnowledgePages?: boolean;
     } = {}
   ) {
     const params = new URLSearchParams();
@@ -1766,6 +1827,9 @@ export class ControlPlaneClient {
     }
     if (options.offset !== undefined) {
       params.append("offset", String(options.offset));
+    }
+    if (options.excludeKnowledgePages) {
+      params.append("exclude_knowledge_pages", "true");
     }
     const query = params.toString();
     // Shape of detail="full"; the endpoint DEFAULTS to "metadata", which omits
@@ -1804,6 +1868,8 @@ export class ControlPlaneClient {
         last_memory_seen_at: string | null;
         /** Whether a memory in this model's own scope has been written since it last read them. */
         is_stale: boolean | null;
+        /** True when this model holds a knowledge page's content (not a standalone model). */
+        is_knowledge_page?: boolean | null;
         /** When the last refresh failed. Set = automatic refreshes are paused for this model. */
         last_refresh_failed_at?: string | null;
         created_at: string;
@@ -1827,7 +1893,12 @@ export class ControlPlaneClient {
    */
   async listAllMentalModels(
     bankId: string,
-    options: { tags?: string[]; tagsMatch?: string; detail?: "metadata" | "content" | "full" } = {}
+    options: {
+      tags?: string[];
+      tagsMatch?: string;
+      detail?: "metadata" | "content" | "full";
+      excludeKnowledgePages?: boolean;
+    } = {}
   ) {
     const PAGE_SIZE = 1000;
     const items: Awaited<ReturnType<typeof this.listMentalModels>>["items"] = [];
@@ -2445,6 +2516,12 @@ export class ControlPlaneClient {
     );
   }
 
+  async getAuditLog(bankId: string, logId: string): Promise<AuditLogEntry> {
+    return this.fetchApi<AuditLogEntry>(
+      bankApi(bankId, `/audit-logs/${encodeURIComponent(logId)}`)
+    );
+  }
+
   async getAuditLogStats(
     bankId: string,
     options?: { action?: string; period?: string }
@@ -2467,6 +2544,7 @@ export class ControlPlaneClient {
       status?: string;
       operation?: string;
       scope?: string;
+      call_type?: LLMCallType;
       provider?: string;
       trace_id?: string;
       document_id?: string;
@@ -2482,6 +2560,7 @@ export class ControlPlaneClient {
     if (options?.status) params.append("status", options.status);
     if (options?.operation) params.append("operation", options.operation);
     if (options?.scope) params.append("scope", options.scope);
+    if (options?.call_type) params.append("call_type", options.call_type);
     if (options?.provider) params.append("provider", options.provider);
     if (options?.trace_id) params.append("trace_id", options.trace_id);
     if (options?.document_id) params.append("document_id", options.document_id);
@@ -2499,10 +2578,11 @@ export class ControlPlaneClient {
 
   async getLLMRequestStats(
     bankId: string,
-    options?: { operation?: string; period?: string }
+    options?: { operation?: string; call_type?: LLMCallType; period?: string }
   ): Promise<LLMRequestStatsResponse> {
     const params = new URLSearchParams();
     if (options?.operation) params.append("operation", options.operation);
+    if (options?.call_type) params.append("call_type", options.call_type);
     if (options?.period) params.append("period", options.period);
     const query = params.toString();
     return this.fetchApi<LLMRequestStatsResponse>(

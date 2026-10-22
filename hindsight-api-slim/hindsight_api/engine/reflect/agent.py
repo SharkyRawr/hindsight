@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from ...cancellation import OperationCancelledError
 from ...config import DEFAULT_RECALL_CHUNKS_MAX_TOKENS, DEFAULT_RECALL_MAX_TOKENS, get_config
-from ..llm_interface import LLM_TOOL_CHOICE_AUTO, LLMToolChoice
+from ..llm_interface import LLM_TOOL_CHOICE_REQUIRED, LLMToolChoice
 from ..llm_trace import LLMQueueWait, reset_queue_wait_sink, set_queue_wait_sink
 from ..llm_transport import describe_llm_error
 from ..response_models import LLMToolCall, LLMToolCallResult
@@ -159,6 +159,9 @@ _NOTHING_TO_SEARCH = "NONE"
 _ROUND_RECALL_MAX_TOKENS = 8192
 
 DEFAULT_MAX_ITERATIONS = 10
+
+# The tools that search the bank: any one that returns a result satisfies the done guardrail.
+_RETRIEVAL_TOOLS = frozenset({"search_mental_models", "read_mental_models", "search_observations", "recall"})
 _COMPACTED_TOOL_RESULT = "[Earlier tool result omitted to fit the context budget; it is kept for the final answer.]"
 
 #: How many times a ``done`` document whose shape the schema refuses is fed back
@@ -713,6 +716,10 @@ async def _run_reflect_agent_inner(
     # The expand tool only reads back raw source text (chunks/documents), so it is
     # useless and excluded when document text storage is disabled (per bank).
     include_expand = store_document_text
+    # The closing step writes the answer unless a decision model takes the free turn's done
+    # as-is (see the done handling below). Then a free turn only has to say "enough", and
+    # the cheap way to say it is answer_ready (one bool), not an answer that is discarded.
+    closing_step_answers = evidence_is_sufficient_fn is None or answer_as_document
     tools = get_reflect_tools(
         directive_rules=directive_rules,
         include_mental_models=has_mental_models,
@@ -721,6 +728,7 @@ async def _run_reflect_agent_inner(
         include_expand=include_expand,
         answer_as_document=answer_as_document,
         llm_output_language=llm_output_language,
+        answer_ready=closing_step_answers,
     )
     # Build set of enabled tool names to guard against LLM hallucinating disabled tool calls
     enabled_tools: frozenset[str] = frozenset(t["function"]["name"] for t in tools if t.get("type") == "function")
@@ -735,6 +743,7 @@ async def _run_reflect_agent_inner(
         budget=budget,
         answer_as_document=answer_as_document,
         llm_output_language=llm_output_language,
+        answer_ready=closing_step_answers,
     )
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
@@ -753,7 +762,7 @@ async def _run_reflect_agent_inner(
     # Caching only the static system+tools prefix wins little here: it's dwarfed
     # by the tool results (recall/observations) that get re-sent on every turn.
     # Instead we roll a cache forward one step at a time — after each turn the
-    # cache is extended to cover that turn's FULL input, so the next ``auto`` turn
+    # cache is extended to cover that turn's FULL input, so the next free turn
     # reuses the entire prior conversation at the cached rate and sends only its
     # own new tool results as the delta. Note what this costs on Gemini: a cache
     # CREATE is billed at the full input rate plus storage, and each rolling cache is
@@ -764,7 +773,7 @@ async def _run_reflect_agent_inner(
     # The cache create for turn N+1 covers turn N's input, which is fully known the
     # moment turn N's LLM call returns — so we kick it off as a background task that
     # runs CONCURRENTLY with turn N's tool execution (``_schedule_cache``) and only
-    # await it (``_resolve_pending_cache``) right before the next ``auto`` call,
+    # await it (``_resolve_pending_cache``) right before the next free call,
     # hiding the create latency behind work we'd do anyway.
     #
     # ``rolling_cache_boundary`` is the number of leading ``messages`` baked into
@@ -805,7 +814,11 @@ async def _run_reflect_agent_inner(
         try:
             task = asyncio.ensure_future(
                 provider_impl.create_incremental_cache(
-                    session_id=cache_session_id, messages=messages[:upto], tools=tools
+                    session_id=cache_session_id,
+                    messages=messages[:upto],
+                    tools=tools,
+                    # Only free turns use the cache (see ``next_is_free``).
+                    tool_choice=LLM_TOOL_CHOICE_REQUIRED,
                 )
             )
         except Exception:
@@ -1297,7 +1310,7 @@ async def _run_reflect_agent_inner(
     # When a forced ``search_mental_models`` returns fresh, usable models on a
     # low/mid-budget call, we stop forcing the lower retrieval layers for the
     # rest of the run and let the agent answer (or retrieve deeper itself)
-    # under ``auto`` tool choice. A negative answer still needs recall: see the
+    # on a free turn. A negative answer still needs recall: see the
     # ``answer_found`` gate below.
     forcing_released = False
     # How many forced steps actually produced a tool call. The next forced step
@@ -1326,6 +1339,8 @@ async def _run_reflect_agent_inner(
     # from the page or observation layer alone (#4567). Prompt-level rules for
     # this were measured and ignored; the bool on ``done`` is checkable in code.
     recall_ran = False
+    # A retrieval tool returned a result, even an empty one (see the done guardrail).
+    searched = False
     absence_recall_forced = False
     for iteration in range(max_iterations):
         # Cooperative cancellation checkpoint: abort the agent loop between
@@ -1337,7 +1352,7 @@ async def _run_reflect_agent_inner(
 
         # After a parallel round: a decision model judges whether
         # that evidence already answers the question. Yes ends retrieval here, so the
-        # only LLM call left is the answer itself; no hands over to ordinary ``auto``
+        # only LLM call left is the answer itself; no hands over to ordinary free
         # turns, where the LLM writes follow-up queries from what it has read.
         if decision_orchestrated and iteration == 1 and pages_answered:
             return await _finish(iteration)
@@ -1350,7 +1365,7 @@ async def _run_reflect_agent_inner(
             follow_up_required = not searched_after_not_enough and not decision_model_failed
 
         # Determine tool_choice for this iteration.
-        # Force the full hierarchical retrieval path (only for enabled tools) before allowing auto.
+        # Force the full hierarchical retrieval path (only for enabled tools) before the free turns.
         # Build the forced sequence from the tools that are actually enabled.
         forced_sequence = []
         if has_mental_models:
@@ -1376,7 +1391,10 @@ async def _run_reflect_agent_inner(
         elif absence_recall_forced and not recall_ran:
             iter_tool_choice = LLMToolChoice.named("recall")
         else:
-            iter_tool_choice = LLM_TOOL_CHOICE_AUTO
+            # ``required``, not ``auto``: left free, most models stopped with the answer as
+            # prose, which is thrown away and written again by the closing step (#5832).
+            # A provider that ignores ``required`` downgrades it to ``auto`` itself.
+            iter_tool_choice = LLM_TOOL_CHOICE_REQUIRED
         follow_up_required = False
 
         is_last = iteration == max_iterations - 1
@@ -1420,20 +1438,21 @@ async def _run_reflect_agent_inner(
         # Call LLM with tools
         llm_start = time.perf_counter()
 
-        # Will the NEXT turn be an ``auto`` turn (the only kind that references a
+        # Will the NEXT turn be a free turn (the only kind that references a
         # cache)? The cache we schedule this turn covers this turn's input and is
         # used by the next turn, so we only bother building it when the next turn
         # can use it — skipping the wasted creates between two forced turns.
-        next_is_auto = not forced_step_pending or forced_steps_done + 1 >= len(forced_sequence)
+        next_is_free = not forced_step_pending or forced_steps_done + 1 >= len(forced_sequence)
 
-        # Before an ``auto`` turn, adopt the cache that was being built in the
+        # Before a free turn, adopt the cache that was being built in the
         # background during the previous turn's tool execution. It covers that
         # turn's full input, so THIS call reuses the entire prior conversation at
         # the cached rate and sends only the turns appended since. Forced turns
-        # can't use a cache (Gemini rejects ``cached_content`` + ``tool_config``),
-        # but the cache still advances underneath them, so the first ``auto`` turn
+        # can't use a cache: Gemini rejects ``cached_content`` + ``tool_config``, so each
+        # cache holds the free turns' ``required`` and cannot carry a forced turn's choice;
+        # but the cache still advances underneath them, so the first free turn
         # inherits a cache covering all the forced results.
-        if incremental_caching and iter_tool_choice is LLM_TOOL_CHOICE_AUTO:
+        if incremental_caching and iter_tool_choice is LLM_TOOL_CHOICE_REQUIRED:
             await _resolve_pending_cache()
 
         call_msg_count = len(messages)
@@ -1510,7 +1529,11 @@ async def _run_reflect_agent_inner(
                     # field was written (#4437).
                     max_completion_tokens=synthesis_max_completion_tokens,
                 )
-                if incremental_caching and iter_tool_choice is LLM_TOOL_CHOICE_AUTO and rolling_cache_name is not None:
+                if (
+                    incremental_caching
+                    and iter_tool_choice is LLM_TOOL_CHOICE_REQUIRED
+                    and rolling_cache_name is not None
+                ):
                     ct_kwargs["cached_prefix"] = rolling_cache_name
                     ct_kwargs["cached_prefix_message_count"] = rolling_cache_boundary
                 result = await llm_config.call_with_tools(**ct_kwargs)
@@ -1624,14 +1647,52 @@ async def _run_reflect_agent_inner(
         if forced_step_pending:
             forced_steps_done += 1
 
+        # "Enough to answer": the closing step writes the answer. Alongside other calls, those
+        # run and the model is asked again. Only where it was offered: elsewhere it is an
+        # unknown tool, answered as one below.
+        ready_call = (
+            next((tc for tc in result.tool_calls if _normalize_tool_name(tc.name) == "answer_ready"), None)
+            if closing_step_answers
+            else None
+        )
+        if ready_call is not None:
+            rest = [tc for tc in result.tool_calls if tc is not ready_call]
+            if not rest and not searched and iteration < max_iterations - 1:
+                # Before any search returned: told so, as done is, rather than dropped unanswered.
+                (ready_wire_id,) = _unique_tool_call_ids([ready_call], emitted_wire_ids)
+                messages.append({"role": "assistant", "tool_calls": [_tool_call_to_dict(ready_call, ready_wire_id)]})
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": ready_wire_id,
+                        "content": json.dumps({"error": _SEARCH_FIRST_ERROR}, ensure_ascii=False),
+                    }
+                )
+                continue
+            if not rest:
+                # The same gate as done's: "nothing is known" needs recall first (#4567). A
+                # fresh mental model can release the forced recall, so it may not have run.
+                if (
+                    include_recall
+                    and not recall_ran
+                    and not absence_recall_forced
+                    and iteration < max_iterations - 1
+                    and not _answer_found(ready_call.arguments)
+                ):
+                    absence_recall_forced = True
+                    logger.info(
+                        f"[REFLECT {reflect_id}] answer_ready reported nothing found before recall ran; forcing recall."
+                    )
+                    continue
+                return await (_forced_final_synthesis if compacted else _finish)(iteration + 1)
+            result = result.model_copy(update={"tool_calls": rest})
+
         # Check for done tool call (handle various LLM output formats)
         done_call = next((tc for tc in result.tool_calls if _is_done_tool(tc.name)), None)
         if done_call:
-            # Guardrail: Require evidence before done
-            has_gathered_evidence = (
-                bool(available_memory_ids) or bool(available_mental_model_ids) or bool(available_observation_ids)
-            )
-            if not has_gathered_evidence and iteration < max_iterations - 1:
+            # Guardrail: a search must have run before done. One that ran and found
+            # nothing counts: "nothing is recorded" is then the honest answer (#5702).
+            if not searched and iteration < max_iterations - 1:
                 # Add assistant message and fake tool result asking for evidence.
                 # This branch loops, so its tool_use lands in the same request as
                 # every later turn -- it needs a deduped wire id just like the
@@ -1649,9 +1710,7 @@ async def _run_reflect_agent_inner(
                         "role": "tool",
                         "tool_call_id": done_wire_id,
                         "content": json.dumps(
-                            {
-                                "error": "You must search for information first. Use search_mental_models(), search_observations(), or recall() before providing your final answer."
-                            },
+                            {"error": _SEARCH_FIRST_ERROR},
                             ensure_ascii=False,
                         ),
                     }
@@ -1827,11 +1886,11 @@ async def _run_reflect_agent_inner(
 
             # Kick off the next-turn cache (covering THIS call's input) so it
             # builds concurrently with the tool execution below — hiding the
-            # create latency. Only schedule when the next turn is ``auto`` (the
+            # create latency. Only schedule when the next turn is free (the
             # only kind that references it); the next turn's pre-call resolve then
             # adopts it. Resolve any prior in-flight create first so we don't drop
-            # its handle. Not after compaction: no auto turn follows it.
-            if incremental_caching and next_is_auto and not compacted:
+            # its handle. Not after compaction: no free turn follows it.
+            if incremental_caching and next_is_free and not compacted:
                 await _resolve_pending_cache()
                 _schedule_cache(call_msg_count)
 
@@ -1932,6 +1991,9 @@ async def _run_reflect_agent_inner(
                         f"[REFLECT {reflect_id}] Tool {normalized_tool_name} returned error: {output['error']}"
                     )
 
+                if normalized_tool_name in _RETRIEVAL_TOOLS and isinstance(output, dict) and "error" not in output:
+                    searched = True
+
                 # Track available IDs from tool results (only for successful responses)
                 if (
                     normalized_tool_name == "search_mental_models"
@@ -1944,7 +2006,7 @@ async def _run_reflect_agent_inner(
                     # Deterministic short-circuit (no extra LLM call): on a
                     # low/mid-budget call, if every retrieved mental model is
                     # fresh and has usable content, stop forcing the lower
-                    # retrieval layers. The next iteration runs under ``auto``
+                    # retrieval layers. The next iteration is a free turn
                     # tool choice, so the agent can answer directly when the
                     # mental model suffices, or — having just read it — issue a
                     # targeted ``search_observations``/``recall`` itself. Stale,
@@ -1964,7 +2026,7 @@ async def _run_reflect_agent_inner(
                         releases_forcing = True
                         logger.info(
                             f"[REFLECT {reflect_id}] Fresh mental models sufficient on iteration {iteration + 1}; "
-                            "releasing forced lower-level retrieval to auto."
+                            "releasing forced lower-level retrieval to free turns."
                         )
 
                 if normalized_tool_name == "read_mental_models" and isinstance(output, dict):
@@ -2412,6 +2474,13 @@ def _decode_json_argument(raw: str, finish_reason: str | None, field: str) -> An
         ) from exc
 
 
+#: What done (or answer_ready) is told when it comes before any search has returned.
+_SEARCH_FIRST_ERROR = (
+    "You must search for information first. Use search_mental_models(), search_observations(), or recall() "
+    "before providing your final answer."
+)
+
+
 def _answer_found(args: dict[str, Any]) -> bool:
     """``done``'s ``answer_found``, read leniently: only an explicit false counts as not found.
 
@@ -2440,6 +2509,18 @@ def _done_arguments(done_call: "LLMToolCall", finish_reason: str | None) -> dict
     # Repair only ever returns a dict, and a plain parse of what the provider
     # already failed to parse fails again — so this is a dict or it raised.
     return _decode_json_argument(args["_raw"], finish_reason, "arguments")
+
+
+def _cited_ids(value: object, available: set[str]) -> list[str]:
+    """The ids in a ``done`` id field that were actually retrieved.
+
+    The tool schema asks for a list of strings, but the model's arguments are not
+    validated against it: a field sent as ``true`` or a bare string is treated as
+    empty rather than failing the whole reflect (#5927).
+    """
+    if not isinstance(value, list):
+        return []
+    return [i for i in value if isinstance(i, str) and i in available]
 
 
 async def _process_done_tool(
@@ -2548,9 +2629,9 @@ async def _process_done_tool(
         document = _map_document_text(document, presenter.drop_unseen_ids)
 
     # Validate IDs (only include IDs that were actually retrieved)
-    used_memory_ids = [mid for mid in (args.get("memory_ids") or []) if mid in available_memory_ids]
-    used_mental_model_ids = [mid for mid in (args.get("mental_model_ids") or []) if mid in available_mental_model_ids]
-    used_observation_ids = [oid for oid in (args.get("observation_ids") or []) if oid in available_observation_ids]
+    used_memory_ids = _cited_ids(args.get("memory_ids"), available_memory_ids)
+    used_mental_model_ids = _cited_ids(args.get("mental_model_ids"), available_mental_model_ids)
+    used_observation_ids = _cited_ids(args.get("observation_ids"), available_observation_ids)
 
     # Generate structured output if schema provided
     structured_output = None
@@ -2665,6 +2746,22 @@ async def _execute_tool_with_timing(
             raise
 
 
+def _expand_memory_ids(args: dict[str, Any]) -> list[str]:
+    """``expand``'s memory_ids as a list, whatever shape the model sent.
+
+    The tool schema asks for a list, but the model's arguments are not validated
+    against it. A bare string is one id; anything else that is not a list (e.g.
+    ``true``) is empty, so ``expand`` answers with a tool error instead of the
+    trace summary's ``len()`` failing the whole reflect (#5953).
+    """
+    memory_ids = args.get("memory_ids")
+    if isinstance(memory_ids, str):
+        return [memory_ids]
+    if not isinstance(memory_ids, list):
+        return []
+    return memory_ids
+
+
 async def _execute_tool(
     tool_name: str,
     args: dict[str, Any],
@@ -2760,7 +2857,7 @@ async def _execute_tool(
         return await recall_fn(query, max_tokens, max_chunk_tokens)
 
     elif tool_name == "expand":
-        memory_ids = args.get("memory_ids", [])
+        memory_ids = _expand_memory_ids(args)
         if not memory_ids:
             return {"error": "expand requires memory_ids"}
         depth = args.get("depth", "chunk")
@@ -2878,7 +2975,7 @@ def _summarize_input(
         )
         return f"(query={query_preview}, max_tokens={max_tokens}, max_chunk_tokens={max_chunk_tokens})"
     elif tool_name == "expand":
-        memory_ids = args.get("memory_ids", [])
+        memory_ids = _expand_memory_ids(args)
         depth = args.get("depth", "chunk")
         return f"(memory_ids=[{len(memory_ids)} ids], depth={depth})"
     elif tool_name == "done":

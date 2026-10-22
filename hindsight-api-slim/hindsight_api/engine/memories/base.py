@@ -65,6 +65,10 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 logger = logging.getLogger(__name__)
 
+#: The page :meth:`MemoriesExtension._scan_all_memories` asks for — no larger than a store's page
+#: cap, so every page is served whole.
+_SCAN_ALL_PAGE = 1000
+
 
 class StoreWriteUnavailable(RuntimeError):
     """The store cannot accept writes for this bank *right now*, but will shortly.
@@ -795,6 +799,13 @@ class RecallArms:
 #: How many semantic hits seed the graph arm's link expansion — its entry points into the graph.
 GRAPH_SEED_LIMIT = 20
 
+#: Most edges of each kind one graph-view answer carries: the links a store reads (with the ones
+#: observations inherit from them), and the edges the engine derives (shared source, shared
+#: entity) -- so at most twice this in all. The UI cannot usefully draw more, and uncapped a bank
+#: of a few thousand observations derives hundreds of thousands -- seconds of Python on the event
+#: loop and a multi-MB answer (#5703).
+GRAPH_MAX_EDGES = 10_000
+
 
 @dataclass
 class SemanticBm25Result:
@@ -1380,7 +1391,12 @@ class MemoriesExtension(Extension, ABC):
         """Release resources. Called during engine shutdown."""
 
     async def ensure_bank_storage(self, bank_id: str) -> None:
-        """Ensure per-bank storage exists. Idempotent."""
+        """Ensure per-bank storage exists. Idempotent.
+
+        Called BEFORE the bank row is written (bank creation and bank import), so it must not
+        require the row to exist. A failed create can leave storage behind with no row; the next
+        call for that bank must adopt it.
+        """
 
     def allocate_unit_ids(self, count: int) -> list[str]:
         """Mint unit ids for a batch about to be written.
@@ -1918,6 +1934,21 @@ class MemoriesExtension(Extension, ABC):
         returns rather than what it reads.
         """
 
+    async def _scan_all_memories(self, **filters: Any) -> list[StoredMemory]:
+        """Every memory :meth:`scan_memories` matches for ``filters``, paged to the end.
+
+        Never one oversized page: a store caps what one page holds, so a single call with a huge
+        ``limit`` silently stops at the cap, and a store that sizes its admission by the limit
+        asked for reserves memory for rows it will never return."""
+        found: list[StoredMemory] = []
+        page_token = ""
+        while True:
+            page = await self.scan_memories(**filters, limit=_SCAN_ALL_PAGE, page_token=page_token)
+            found.extend(page.memories)
+            page_token = page.next_page_token
+            if not page_token:
+                return found
+
     @abstractmethod
     async def count_memories(self, *, conn, fq_table, bank_id: str) -> dict[str, int]:
         """Live memory count per fact_type."""
@@ -2150,6 +2181,28 @@ class MemoriesExtension(Extension, ABC):
         than defaulted: a store that answered None here would leave every refresh
         with nothing to read, which is silent rather than wrong-looking.
         """
+
+    async def memories_updated_between(
+        self,
+        *,
+        conn,
+        fq_table,
+        bank_id: str,
+        until: datetime,
+        since: datetime,
+        limit: int,
+        fact_types: list[str] | None = None,
+        tags: list[str] | None = None,
+        tags_match: TagsMatch = "any",
+        tag_groups: list | None = None,
+    ) -> list[StoredMemory] | None:
+        """The memories in :meth:`newest_memory_updated_at`'s scope and window, oldest first.
+
+        A delta knowledge-page refresh reads them to ask a decision model which could
+        change the page, instead of searching for them. None means this store cannot
+        list them, and the refresh searches as it always has.
+        """
+        return None
 
     async def latest_memory_write_at(self, *, conn, fq_table, bank_id: str) -> datetime | None:
         """The newest ``updated_at`` across the bank's memories, or None if it has none.
@@ -2418,7 +2471,7 @@ class MemoriesExtension(Extension, ABC):
     ) -> None:
         """Apply a curation field edit to a live memory.
 
-        Writes the new text / context / fact_type / occurred window, resets the
+        Writes the new text / context / fact_type / occurred window / mention time, resets the
         consolidation markers (the memory re-consolidates) and stamps the edit
         time, and drops the memory's derived links (they are recomputed).
 
@@ -2599,6 +2652,10 @@ class MemoriesExtension(Extension, ABC):
         Returns how many observations were removed. Called whenever facts are
         replaced or deleted, so an observation never outlives the facts it
         summarises; sources that survive go back in the consolidation queue.
+
+        Pass what was removed to ``document_history.note_observations_removed``
+        before returning: the rows are gone for good, and the document change
+        history is the only place their ids survive (#5638).
         """
 
     # ------------------------------------------------------------------ maintenance
@@ -2889,13 +2946,11 @@ class MemoriesExtension(Extension, ABC):
             # take it off, so the payload is the same shape on either backend.
             "attachment_filenames": document_attachment_filenames(_rec),
         }
-        _page = await self.scan_memories(
-            conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id, limit=1_000_000
-        )
-        doc["unit_count"] = len(_page.memories)
-        doc["world_count"] = sum(1 for m in _page.memories if m.fact_type == "world")
-        doc["experience_count"] = sum(1 for m in _page.memories if m.fact_type == "experience")
-        _sids = [m.unit_id for m in _page.memories if m.fact_type in ("experience", "world")]
+        _units = await self._scan_all_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id)
+        doc["unit_count"] = len(_units)
+        doc["world_count"] = sum(1 for m in _units if m.fact_type == "world")
+        doc["experience_count"] = sum(1 for m in _units if m.fact_type == "experience")
+        _sids = [m.unit_id for m in _units if m.fact_type in ("experience", "world")]
         _obs = (
             await self.observations_for_sources(conn=conn, ops=ops, fq_table=fq_table, bank_id=bank_id, unit_ids=_sids)
             if _sids
@@ -2910,20 +2965,13 @@ class MemoriesExtension(Extension, ABC):
 
         Default: a scan of the document's memories and :meth:`document_memory_counts`. Postgres
         reads `memory_units`."""
-        src_page = await self.scan_memories(
-            conn=conn,
-            fq_table=fq_table,
-            bank_id=bank_id,
-            document_id=document_id,
-            fact_types=["experience", "world"],
-            limit=1_000_000,
+        sources = await self._scan_all_memories(
+            conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id, fact_types=["experience", "world"]
         )
         _doc_counts = await self.document_memory_counts(
             conn=conn, fq_table=fq_table, bank_id=bank_id, document_ids=[document_id]
         )
-        return DocumentSourceUnits(
-            unit_ids=[m.unit_id for m in src_page.memories], units_count=_doc_counts.get(document_id, 0)
-        )
+        return DocumentSourceUnits(unit_ids=[m.unit_id for m in sources], units_count=_doc_counts.get(document_id, 0))
 
     async def delete_document_rows(
         self, *, conn, ops, fq_table, bank_id: str, document_id: str, unit_ids: list[str]
@@ -3040,10 +3088,9 @@ class MemoriesExtension(Extension, ABC):
         :meth:`delete_stale_observations` (which requeues surviving co-sources) and
         :meth:`mark_consolidated`. Postgres runs the same cascade as SQL."""
         invalidated_obs = 0
-        _doc_page = await self.scan_memories(
-            conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id, limit=1_000_000
+        _doc_units = await self._scan_all_memories(
+            conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id
         )
-        _doc_units = _doc_page.memories
         from ..consolidation.consolidator import write_scopes_changed
 
         # Only the memories whose observation scopes actually move (#5593). Decided BEFORE the
@@ -3213,10 +3260,12 @@ class MemoriesExtension(Extension, ABC):
         types, which drive the stale-observation sweep) and their count."""
         unit_ids: list[str] = []
         if fact_type in ("experience", "world"):
-            page = await self.scan_memories(
-                conn=conn, fq_table=fq_table, bank_id=bank_id, fact_types=[fact_type], limit=1_000_000
-            )
-            unit_ids = [m.unit_id for m in page.memories]
+            unit_ids = [
+                m.unit_id
+                for m in await self._scan_all_memories(
+                    conn=conn, fq_table=fq_table, bank_id=bank_id, fact_types=[fact_type]
+                )
+            ]
         counts = await self.count_memories(conn=conn, fq_table=fq_table, bank_id=bank_id)
         return TypedMemoryScope(unit_ids=unit_ids, count=int(counts.get(fact_type, 0)))
 
@@ -3270,10 +3319,12 @@ class MemoriesExtension(Extension, ABC):
         ``consolidated_at`` in three statements on the caller's transaction."""
         count = (await self.count_memories(conn=conn, fq_table=fq_table, bank_id=bank_id)).get("observation", 0)
         await self.delete_observations(conn=conn, fq_table=fq_table, bank_id=bank_id)
-        page = await self.scan_memories(
-            conn=conn, fq_table=fq_table, bank_id=bank_id, fact_types=["experience", "world"], limit=1_000_000
-        )
-        src_ids = [m.unit_id for m in page.memories]
+        src_ids = [
+            m.unit_id
+            for m in await self._scan_all_memories(
+                conn=conn, fq_table=fq_table, bank_id=bank_id, fact_types=["experience", "world"]
+            )
+        ]
         if src_ids:
             await self.mark_consolidated(conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=src_ids, when=None)
         return count
@@ -3449,6 +3500,10 @@ class MemoriesExtension(Extension, ABC):
         """Insert a ``'__pending__'`` document row if none exists, then row-lock it — the
         zero-batch retain's document tracking. A no-op here: there is no row."""
 
+    async def lock_document_row(self, *, conn, fq_table, bank_id: str, document_id: str) -> None:
+        """Row-lock the document before touching its memories — the order every writer of a
+        document's memories takes, consolidation included (#5433). A no-op here: there is no row."""
+
     async def lock_document_hash(self, *, conn, fq_table, bank_id: str, document_id: str) -> str | None:
         """Row-lock the document and read its content_hash (``None`` if absent) — the delta
         write's concurrency gate. Here the stored hash, unlocked (see :meth:`lock_document_for_write`)."""
@@ -3548,9 +3603,7 @@ class MemoriesExtension(Extension, ABC):
         from ..consolidation.consolidator import write_scopes_changed
         from ..metadata_utils import drop_null_values
 
-        page = await self.scan_memories(
-            conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id, limit=1_000_000
-        )
+        units = await self._scan_all_memories(conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id)
         # Metadata too, not just tags: a survivor left carrying the PREVIOUS retain's metadata is
         # exactly what this exists to prevent — measured on an append, older units still read
         # {"source": "email"} after a retain carrying {"source": "crm"}.
@@ -3564,7 +3617,7 @@ class MemoriesExtension(Extension, ABC):
         #
         # Set in full on every patched memory, mirroring Postgres's `SET metadata = $4`: a document
         # whose metadata was cleared must clear on its survivors too, which an absent key would not do.
-        new_tags_by_unit = {m.unit_id: final_tags(m.tags) for m in page.memories}
+        new_tags_by_unit = {m.unit_id: final_tags(m.tags) for m in units}
         new_metadata = drop_null_values(metadata or {})
         # Only memories whose labels actually differ: a patch moves `updated_at`, the "this
         # fact was edited" signal consolidation discards an in-flight batch on (#5614), so a
@@ -3578,7 +3631,7 @@ class MemoriesExtension(Extension, ABC):
                     META_OBSERVATION_SCOPES: json.dumps(observation_scopes),
                 },
             )
-            for m in page.memories
+            for m in units
             if m.tags != new_tags_by_unit[m.unit_id]
             or (m.metadata or {}) != new_metadata
             or m.observation_scopes != observation_scopes
@@ -3590,7 +3643,7 @@ class MemoriesExtension(Extension, ABC):
         # BEFORE the patch: a store may hand back live records that the patch then rewrites.
         rescoped = [
             m.unit_id
-            for m in page.memories
+            for m in units
             if m.fact_type in ("experience", "world")
             and write_scopes_changed(m.tags, m.observation_scopes, new_tags_by_unit[m.unit_id], observation_scopes)
         ]
@@ -3741,6 +3794,16 @@ class MemoriesExtension(Extension, ABC):
     # rolls back together (#3876). The defaults are what a store that owns its rows does;
     # Postgres overrides them with the SQL in ``pg/consolidation.py``.
 
+    async def lock_consolidation_write_set(
+        self, *, conn, fq_table, bank_id: str, fact_ids: list[str], observation_ids: list[str]
+    ) -> None:
+        """Lock what one consolidation response writes — the batch ``fact_ids``, the
+        ``observation_ids`` it rewrites, deletes or folds into — before it writes any of it, in
+        the order other writers take them, so the two cannot deadlock (#5433).
+
+        A no-op here: a store that keeps memories outside SQL has its own concurrency model.
+        """
+
     async def lock_live_memory_ids(self, *, conn, fq_table, bank_id: str, unit_ids: list[uuid.UUID]) -> set[str]:
         """Which of ``unit_ids`` still exist, held so a concurrent delete cannot remove one before
         the caller's transaction commits.
@@ -3773,10 +3836,13 @@ class MemoriesExtension(Extension, ABC):
         return []
 
     async def count_observations_with_tags(self, *, conn, fq_table, bank_id: str, tags: list[str]) -> int:
-        """Observations whose tags contain every one of ``tags``. Postgres runs one ``COUNT``."""
+        """Observations whose tags contain every one of ``tags``. Postgres runs one ``COUNT``.
+
+        Counted to the end: a count cut off at a page budget reads low, and a scope's observation
+        cap compares against it, so a low count lets the scope grow past its cap."""
         total = 0
         page_token = ""
-        for _ in range(100):
+        while True:
             page = await self.scan_memories(
                 conn=conn,
                 fq_table=fq_table,
@@ -4142,25 +4208,33 @@ class MemoriesExtension(Extension, ABC):
 
         return await _load_observations_from_store(self, bank_id, unit_index)
 
-    async def dump_entity_maintenance_queue(self, *, conn, fq_table, bank_id: str) -> list[dict]:
-        """The bank's entity-maintenance queue for export, each entity named rather than numbered.
+    async def iter_entity_maintenance_queue(
+        self, *, backend, fq_table, bank_id: str, page_size: int
+    ) -> AsyncIterator[list[dict]]:
+        """The bank's entity-maintenance queue for export, ``page_size`` rows at a time, each entity named
+        rather than numbered.
 
-        Postgres joins the queue to `entities` on ``conn``. Empty here: a store that keeps its own
-        entity registry queues no entity maintenance in Postgres (see
-        :meth:`enqueue_entity_prune_candidates`).
+        ``backend`` is a pool or one connection. Postgres joins the queue to `entities`, each page on a
+        connection it returns before the page is yielded. Empty here: a store that keeps its own entity
+        registry queues no entity maintenance in Postgres (see :meth:`enqueue_entity_prune_candidates`).
         """
-        return []
+        return
+        yield  # unreachable: makes this an async generator that yields no pages
 
-    async def dump_archived_memories(self, *, conn, fq_table, bank_id: str) -> list[dict]:
-        """The curation archive (invalidated, still revertable memories) as portable export rows.
+    async def iter_archived_memories(
+        self, *, backend, fq_table, bank_id: str, page_size: int
+    ) -> AsyncIterator[list[dict]]:
+        """The curation archive (invalidated, still revertable memories) as portable export rows, by page.
 
         One dict per archived memory, keyed like an `invalidated_memory_units` row, except that
         ``entity_ids`` becomes ``entity_names`` (canonical names), ``chunk_id`` becomes
-        ``chunk_index`` (the id embeds the bank), and the surrogate ``id`` is dropped. Postgres
-        reads the archive table on ``conn``. No default: the interface has no way to list an
-        archive, so a store that owns its memories must answer this itself.
+        ``chunk_index`` (the id embeds the bank), and the surrogate ``id`` is dropped. ``backend`` is a
+        pool or one connection; Postgres reads the archive table ``page_size`` rows at a time. No
+        default: the interface has no way to list an archive, so a store that owns its memories must
+        answer this itself — raising before it yields anything.
         """
         raise NotImplementedError("this store cannot list its archived memories")
+        yield  # unreachable: makes this an async generator, so the error is raised on first iteration
 
     async def restore_archived_memories(
         self,
@@ -4173,12 +4247,12 @@ class MemoriesExtension(Extension, ABC):
         document_id_map: dict[str, str],
         bank_rows_json_encoding: str,
     ) -> int:
-        """Write :meth:`dump_archived_memories` rows into this bank's archive; returns how many.
+        """Write one page of :meth:`iter_archived_memories` rows into this bank's archive; returns how many.
 
         ``unit_id_map`` / ``document_id_map`` map the source's unit and document ids to the ones the
         import wrote (a causal-link snapshot whose endpoint did not come back is dropped). Postgres
         re-resolves the entity names and inserts on ``conn``. No default, like
-        :meth:`dump_archived_memories`.
+        :meth:`iter_archived_memories`.
         """
         raise NotImplementedError("this store cannot restore archived memories")
 

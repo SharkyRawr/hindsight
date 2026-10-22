@@ -116,7 +116,7 @@ enum Commands {
     #[command(subcommand)]
     Webhook(WebhookCommands),
 
-    /// Inspect audit logs (list, stats)
+    /// Inspect audit logs (list, get, stats)
     #[command(subcommand)]
     Audit(AuditCommands),
 
@@ -510,7 +510,7 @@ enum MemoryCommands {
         #[arg(short = 't', long)]
         fact_type: Option<String>,
 
-        /// Full-text search query
+        /// Substring filter on memory text and context (unindexed scan, for browsing; use recall to search)
         #[arg(short = 'q', long)]
         query: Option<String>,
 
@@ -773,6 +773,23 @@ enum DocumentCommands {
         document_id: String,
     },
 
+    /// Show what each change did to a document's facts and observations (rebuilt from operations)
+    History {
+        /// Bank ID
+        bank_id: String,
+
+        /// Document ID
+        document_id: String,
+
+        /// Maximum number of operations to read
+        #[arg(short = 'l', long, default_value = "50")]
+        limit: i32,
+
+        /// Offset for pagination, in operations
+        #[arg(short = 's', long, default_value = "0")]
+        offset: i32,
+    },
+
     /// Delete a document and all its memory units
     Delete {
         /// Bank ID
@@ -997,6 +1014,15 @@ enum AuditCommands {
         /// Offset for pagination
         #[arg(short = 's', long)]
         offset: Option<u64>,
+    },
+
+    /// Show one audit log entry with its full request and response
+    Get {
+        /// Bank ID
+        bank_id: String,
+
+        /// Audit log entry ID (from `audit list`)
+        log_id: String,
     },
 
     /// Show audit log statistics bucketed over time
@@ -1868,6 +1894,19 @@ fn run() -> Result<()> {
                 bank_id,
                 document_id,
             } => commands::document::get(&client, &bank_id, &document_id, verbose, output_format),
+            DocumentCommands::History {
+                bank_id,
+                document_id,
+                limit,
+                offset,
+            } => commands::document::history(
+                &client,
+                &bank_id,
+                &document_id,
+                limit,
+                offset,
+                output_format,
+            ),
             DocumentCommands::Delete {
                 bank_id,
                 document_id,
@@ -2347,6 +2386,9 @@ fn run() -> Result<()> {
                 verbose,
                 output_format,
             ),
+            AuditCommands::Get { bank_id, log_id } => {
+                commands::audit::get(&client, &bank_id, &log_id, verbose, output_format)
+            }
             AuditCommands::Stats {
                 bank_id,
                 action,
