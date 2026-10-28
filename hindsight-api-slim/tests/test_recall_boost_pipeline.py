@@ -10,8 +10,7 @@ import pytest
 from hindsight_api.config import _get_raw_config
 from hindsight_api.engine import memory_engine
 from hindsight_api.engine.cross_encoder import CrossEncoderModel, MultiCrossEncoder, RRFPassthroughCrossEncoder
-from hindsight_api.engine.memory_engine import Budget
-from hindsight_api.engine.response_models import MinScores, RecallResult
+from hindsight_api.engine.response_models import Budget, MinScores, RecallResult
 from hindsight_api.engine.search.reranking import CrossEncoderReranker, RerankResult
 from hindsight_api.engine.search.retrieval import MultiFactTypeRetrievalResult, ParallelRetrievalResult
 from hindsight_api.engine.search.types import MergedCandidate, RetrievalResult
@@ -163,6 +162,7 @@ async def test_concurrent_recalls_use_their_own_rerank_provider(
     first_scored = asyncio.Event()
     second_scored = asyncio.Event()
     chain = MultiCrossEncoder([_Primary(), RRFPassthroughCrossEncoder()])
+    chain.MEMBER_COOLDOWN_SECONDS = 0.0  # the primary fails per query, not per outage
 
     class _InterleavedReranker(CrossEncoderReranker):
         async def rerank(self, query: str, candidates: list[MergedCandidate], now=None) -> RerankResult:

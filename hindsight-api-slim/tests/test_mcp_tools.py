@@ -6,9 +6,10 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastmcp.exceptions import ValidationError as FastMCPValidationError
 from pydantic import ValidationError
 
-from hindsight_api.api import page_markdown
+from hindsight_api.engine import page_markdown
 from hindsight_api.engine.memory_engine import KEEP_PARENT, DirectivePage, MentalModelPage
 from hindsight_api.engine.response_models import MemoryFact, RecallResult
 from hindsight_api.mcp_tools import (
@@ -24,6 +25,11 @@ from hindsight_api.mcp_tools import (
     register_mcp_tools,
 )
 from hindsight_api.models import RequestContext
+
+# Argument validation failures surface from ``call_tool`` as ``pydantic.ValidationError``
+# on fastmcp < 3.4 and as ``fastmcp.exceptions.ValidationError`` (chained from the
+# pydantic error) on fastmcp >= 3.4.
+MCP_ARG_VALIDATION_ERRORS = (ValidationError, FastMCPValidationError)
 
 
 class TestParseTimestamp:
@@ -1259,7 +1265,7 @@ class TestRecallNewParams:
 
     async def test_recall_default_budget_high(self, mock_memory):
         """Default budget should be HIGH (backward compat)."""
-        from hindsight_api.engine.memory_engine import Budget
+        from hindsight_api.engine.response_models import Budget
 
         mcp = _make_mcp_server(mock_memory, {"recall"})
         await _tools(mcp)["recall"].fn(query="test")
@@ -1267,7 +1273,7 @@ class TestRecallNewParams:
         assert call_kwargs["budget"] == Budget.HIGH
 
     async def test_recall_budget_low(self, mock_memory):
-        from hindsight_api.engine.memory_engine import Budget
+        from hindsight_api.engine.response_models import Budget
 
         mcp = _make_mcp_server(mock_memory, {"recall"})
         await _tools(mcp)["recall"].fn(query="test", budget="low")
@@ -1807,10 +1813,8 @@ class TestListToolBounds:
         ],
     )
     async def test_out_of_range_is_rejected(self, mock_memory, tool, args):
-        from pydantic import ValidationError
-
         mcp = _make_mcp_server(mock_memory, {tool}, include_bank_id=True)
-        with pytest.raises(ValidationError):
+        with pytest.raises(MCP_ARG_VALIDATION_ERRORS):
             await mcp.call_tool(tool, args)
         engine_method = "list_memory_units" if tool == "list_memories" else tool
         getattr(mock_memory, engine_method).assert_not_called()
@@ -1835,10 +1839,8 @@ class TestRecallReflectTagsMatch:
     @pytest.mark.parametrize("include_bank_id", [True, False])
     @pytest.mark.parametrize("tool", ["recall", "reflect"])
     async def test_unknown_mode_is_rejected(self, mock_memory, tool, include_bank_id):
-        from pydantic import ValidationError
-
         mcp = _make_mcp_server(mock_memory, {tool}, include_bank_id=include_bank_id)
-        with pytest.raises(ValidationError):
+        with pytest.raises(MCP_ARG_VALIDATION_ERRORS):
             await mcp.call_tool(tool, {"query": "q", "tags": ["typescript"], "tags_match": "any-strict"})
         getattr(mock_memory, f"{tool}_async").assert_not_called()
 
@@ -2747,7 +2749,7 @@ class TestMentalModelTriggerInput:
         ``MentalModelTrigger`` has and this one lacks is not "not exposed yet" — it is
         a hard validation error on a request the HTTP API would have accepted.
         """
-        from hindsight_api.api.http import MentalModelTrigger
+        from hindsight_api.engine.response_models import MentalModelTrigger
 
         assert set(MentalModelTrigger.model_fields) == set(MentalModelTriggerInput.model_fields)
 
@@ -2861,7 +2863,9 @@ class TestMcpCallLogging:
             and "status=ok" in m
             for m in messages
         ), messages
-        assert any(m.startswith("mcp tool=delete_bank bank=test-bank status=ok") for m in messages), messages
+        # FastMCP 3 re-enters call_tool after its middleware; that inner call must not log again (#6071).
+        assert sum(m.startswith("destructive_op action=delete_bank") for m in messages) == 1, messages
+        assert sum(m.startswith("mcp tool=delete_bank bank=test-bank status=ok") for m in messages) == 1, messages
 
     async def test_read_tool_named_but_not_destructive(self, mock_memory, caplog):
         mcp = _make_mcp_server(mock_memory, {"list_tags"}, include_bank_id=False)
@@ -2876,5 +2880,6 @@ class TestMcpCallLogging:
         mock_memory.audit_logger.log_fire_and_forget = MagicMock()
         mcp = _make_mcp_server(mock_memory, {"sync_retain"}, include_bank_id=False)
         await mcp.call_tool("sync_retain", {"content": "hello"})
+        mock_memory.audit_logger.log_fire_and_forget.assert_called_once()  # not once more for the inner call (#6071)
         entry = mock_memory.audit_logger.log_fire_and_forget.call_args.args[0]
         assert (entry.action, entry.transport, entry.bank_id) == ("sync_retain", "mcp", "test-bank")

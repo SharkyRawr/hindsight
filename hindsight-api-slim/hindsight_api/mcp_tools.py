@@ -18,14 +18,14 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationInfo, field_validator, model_validator
 
 from hindsight_api import MemoryEngine
-from hindsight_api.api import page_markdown
 from hindsight_api.config import (
     DEFAULT_MCP_RECALL_DESCRIPTION,
     DEFAULT_MCP_RETAIN_DESCRIPTION,
 )
+from hindsight_api.engine import page_markdown
 from hindsight_api.engine.audit import AuditEntry, AuditLogger
-from hindsight_api.engine.memory_engine import KEEP_PARENT, Budget
-from hindsight_api.engine.response_models import VALID_RECALL_FACT_TYPES, MinScores, TemporalWindow
+from hindsight_api.engine.memory_engine import KEEP_PARENT
+from hindsight_api.engine.response_models import VALID_RECALL_FACT_TYPES, Budget, MinScores, TemporalWindow
 from hindsight_api.engine.search.tags import TagGroup, TagsMatch
 from hindsight_api.engine.stored_dates import is_placeholder_date
 from hindsight_api.extensions import OperationValidationError
@@ -922,6 +922,10 @@ def _apply_audit_logging(mcp: FastMCP, memory: MemoryEngine, config: MCPToolsCon
     original_call_tool = mcp.call_tool
 
     async def _call_tool(name: str, arguments: dict[str, Any] | None = None, **kwargs: Any) -> Any:
+        # FastMCP 3 re-enters self.call_tool (this wrapper) with run_middleware=False after the
+        # middleware chain; the outer call already logs and audits it (#6071).
+        if kwargs.get("run_middleware") is False:
+            return await original_call_tool(name, arguments, **kwargs)
         bank_id = None
         if isinstance(arguments, dict):
             bank_id = arguments.get("bank_id") or (config.bank_id_resolver() if config.bank_id_resolver else None)

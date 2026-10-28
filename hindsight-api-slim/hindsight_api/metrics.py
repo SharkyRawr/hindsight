@@ -30,15 +30,15 @@ from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.view import ExplicitBucketHistogramAggregation, View
 from opentelemetry.sdk.resources import Resource
 
+from hindsight_api.operation_runs import add_phase
+from hindsight_api.schema_context import _current_schema, get_current_schema
+
 if TYPE_CHECKING:
     import asyncpg
 
 
 def _get_tenant() -> str:
     """Get current tenant (schema) from context for metrics labeling."""
-    # Import here to avoid circular imports
-    from hindsight_api.engine.memory_engine import get_current_schema
-
     return get_current_schema()
 
 
@@ -420,13 +420,14 @@ class NoOpMetricsCollector(MetricsCollectorBase):
         pass
 
     def record_retain_phase(self, phase: str, seconds: float, calls: int = 1, store: str = ""):
-        pass
+        add_phase(f"retain.{phase}", seconds)
 
     def record_validator_phase(self, operation: str, hook: str, seconds: float):
         pass
 
     def record_recall_phase(self, phase: str, seconds: float, *, diagnostic: bool = False):
-        pass
+        if not diagnostic:
+            add_phase(f"recall.{phase}", seconds)
 
     def record_loop_stall(self, stall_seconds: float):
         """No-op loop-stall recording."""
@@ -901,6 +902,7 @@ class MetricsCollector(MetricsCollectorBase):
     def record_retain_phase(self, phase: str, seconds: float, calls: int = 1, store: str = ""):
         """Record one phase of a retain. `store` labels which memories backend served it, so a
         store-owned bank's profile is separable from a Postgres one on the same deployment."""
+        add_phase(f"retain.{phase}", seconds)
         attrs = {"phase": phase, **self._tenant_attrs()}
         if store:
             attrs["store"] = store
@@ -919,6 +921,9 @@ class MetricsCollector(MetricsCollectorBase):
         per-arm timing inside `parallel_retrieval`, say — so a consumer summing phases into a
         request total can exclude them instead of double-counting.
         """
+        if not diagnostic:
+            # Every recall's phases, whatever the sampling below: the run is per recall.
+            add_phase(f"recall.{phase}", seconds)
         if diagnostic and not self._record_diagnostic_phases:
             return
         # Opt-in sampling: ~10 phases per recall each go through OTel's aggregation, which was
@@ -1239,7 +1244,6 @@ class MetricsCollector(MetricsCollectorBase):
         per_bank = self._include_bank_id
         bank_sel = "bank_id, " if per_bank else ""
         from .engine.memories import get_memories
-        from .engine.memory_engine import _current_schema
 
         async with self._db_pool.acquire() as conn:
             # memory_units is the central per-tenant table; its presence marks a

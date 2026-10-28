@@ -150,10 +150,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# What the round's query rewrite replies when the request asks for nothing a memory bank could
-# answer ("yes", "thanks", "go ahead"): reflect then returns an empty answer without searching.
-_NOTHING_TO_SEARCH = "NONE"
-
 # A parallel round's recall, when the decision model will prune it: wide enough that a decision
 # the fused order ranks low still reaches the decision model, which re-ranks and cuts it.
 _ROUND_RECALL_MAX_TOKENS = 8192
@@ -1386,7 +1382,7 @@ async def _run_reflect_agent_inner(
             # the decision itself (sde-bench dedupe-history, 1/4). Sending that ``done`` back with
             # "search first" fixed the answer but billed the refused turn as well: with a reflect
             # mission asking for the source of every rule, it was most first rounds, and reflect
-            # with the decision model ran slower than agent turns (test_09, 15.3s against 14.3s).
+            # with the decision model ran slower than agent turns (the coding-agent reflect benchmark, 15.3s against 14.3s).
             iter_tool_choice = LLMToolChoice.named(forced_sequence[-1])
         elif absence_recall_forced and not recall_ran:
             iter_tool_choice = LLMToolChoice.named("recall")
@@ -1464,8 +1460,9 @@ async def _run_reflect_agent_inner(
             # Every request is rewritten into one search query first. It used to be only the
             # long ones (over 80 tokens): a plugin wraps the developer's goal in ~2k characters
             # of rendering rules, and searching with all of it found nothing (sde-bench
-            # boltons-budget). The same call now also spots a request with nothing to look up
-            # ("yes", "thanks"), which then returns at once instead of paying for a retrieval.
+            # boltons-budget). It never ends reflect: it used to answer NONE for "nothing to look
+            # up", and a local model said NONE to real questions, which came back empty. A "thanks"
+            # now pays for one retrieval round instead.
             #
             # The caller's context goes with it: "should I go ahead with it?" names nothing without
             # the plan it came with. The temperature is the mechanical passes' one, which stays
@@ -1494,20 +1491,7 @@ async def _run_reflect_agent_inner(
                     f"{describe_llm_error(exc)}"
                 )
                 distilled = ""
-            # A document is never "nothing": a refresh must not store an empty page.
-            if distilled == _NOTHING_TO_SEARCH and not answer_as_document:
-                logger.info(f"[REFLECT {reflect_id}] Decision-orchestrated: nothing to search for; empty answer.")
-                return ReflectAgentResult(
-                    text="",
-                    iterations=0,
-                    tools_called=0,
-                    tool_trace=tool_trace,
-                    llm_trace=_get_llm_trace(),
-                    usage=_get_usage(),
-                    directives_applied=directives_applied,
-                )
-            # NONE on a document (a refresh) searches the request itself, never the word "NONE".
-            result = _parallel_round(query if distilled in ("", _NOTHING_TO_SEARCH) else distilled, "round_")
+            result = _parallel_round(distilled or query, "round_")
             parallel_round = True
             forced_steps_done = len(forced_sequence) - 1  # the increment below completes the sequence
         else:
@@ -1751,10 +1735,10 @@ async def _run_reflect_agent_inner(
             # False" was in the evidence three times), and the agent needed a correction for it.
             # A decision-orchestrated reflect keeps the free turn's done: there the done comes right
             # after a pruned round, and re-writing it in the closing step lost the recorded decision
-            # on the coding-agent eval (test_09 with Jev: 10/12 before, 7/12 with the closing step).
+            # on the coding-agent eval (the coding-agent reflect benchmark with Jev: 10/12 before, 7/12 with the closing step).
             # A document (a page refresh) still goes through the closing step: the page update
             # merges only the facts the answer cites, and the free turn's done cited fewer of them
-            # (a Q2 count lost two of four new customers on test_01 hq-count-billing).
+            # (a Q2 count lost two of four new customers on the refresh-pages eval, hq-count-billing).
             if not decision_orchestrated or decision_model_failed or answer_as_document:
                 return await (_forced_final_synthesis if compacted else _finish)(iteration + 1)
 
@@ -2118,7 +2102,11 @@ async def _run_reflect_agent_inner(
 
 
 def _fresh_usable_pages(tool_calls: list["LLMToolCall"], tool_results: list[Any]) -> dict[str, Any] | None:
-    """The page search's output when every page in it is fresh and has text, else None."""
+    """The page search's whole pages when every hit in it is fresh and has text, else None.
+
+    Only the pages that came back whole: a snippet is the page opening, and a verdict that
+    it answers the question ends retrieval before the page is ever read (#5787).
+    """
     pages = next(
         (
             result[0]
@@ -2128,7 +2116,7 @@ def _fresh_usable_pages(tool_calls: list["LLMToolCall"], tool_results: list[Any]
         None,
     )
     if isinstance(pages, dict) and pages.get("mental_models") and _all_mental_models_are_usable_and_fresh(pages):
-        return pages
+        return {**pages, "mental_models": [m for m in pages["mental_models"] if "content" in m]}
     return None
 
 

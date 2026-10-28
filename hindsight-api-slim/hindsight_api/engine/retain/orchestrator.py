@@ -35,7 +35,8 @@ from ..document_history import (
     append_operation_events,
     track_observation_changes,
 )
-from ..memory_engine import count_tokens, fq_table
+from ..memory_engine import count_tokens
+from ..schema import fq_table
 
 if TYPE_CHECKING:
     from .attachment_store import RetainAttachmentLoader
@@ -3637,8 +3638,11 @@ async def _streaming_retain_batch(
                     await outbox_callback(conn)
             outbox_fired[0] = True
 
-        # Mark facts as committed in operation metadata (crash recovery checkpoint)
-        if operation_id and all_unit_ids:
+        # Mark facts as committed in operation metadata (crash recovery checkpoint). Not for a
+        # retain session: it may buffer until `commit()`, so its facts are not durable here, and a
+        # retry trusting the checkpoint would skip a document whose facts were never written
+        # (#6099). The session commits once for the whole retain, so there is nothing to resume.
+        if operation_id and all_unit_ids and retain_session is None:
             try:
                 async with acquire_with_retry(pool) as conn:
                     await _persist_facts_committed_checkpoint(
