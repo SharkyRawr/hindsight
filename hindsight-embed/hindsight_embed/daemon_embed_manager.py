@@ -323,6 +323,24 @@ class DaemonEmbedManager(EmbedManager):
         safe_profile = self._sanitize_profile_name(profile)
         return f"pg0://hindsight-embed-{safe_profile}"
 
+    def resolve_database_url(self, profile: str, config: Mapping[str, str] | None = None) -> str:
+        """Return the database the daemon for this profile runs on.
+
+        A URL the user set wins, from the profile .env (or ``config``) first and
+        the process environment second: HINDSIGHT_EMBED_API_DATABASE_URL, then
+        the API's own HINDSIGHT_API_DATABASE_URL. Only with neither set does the
+        profile get its own pg0. The API variable used to be overwritten with
+        pg0, which left no way to use an external server on a machine where pg0
+        cannot start (issue #6065).
+        """
+        if config is None:
+            config = self._profile_manager.load_profile_config(profile)
+        for key in ("HINDSIGHT_EMBED_API_DATABASE_URL", "HINDSIGHT_API_DATABASE_URL"):
+            url = config.get(key) or os.getenv(key)
+            if url:
+                return url
+        return self.get_database_url(profile)
+
     def get_url(self, profile: str) -> str:
         """
         Get the URL for the daemon serving this profile.
@@ -480,22 +498,36 @@ class DaemonEmbedManager(EmbedManager):
             return dev_command
 
         # Prefer a hindsight-api entry point installed alongside hindsight-embed.
-        # Try two strategies:
+        # Try three strategies:
         #
         # 1. sysconfig: resolves <venv>/bin or <venv>/Scripts for standard
         #    pip/venv installs (issue #1401).
-        # 2. __file__-relative: resolves <target>/bin or <target>/Scripts for
+        # 2. The venv holding this file, found by its pyvenv.cfg: a different
+        #    interpreter can load the venv's site-packages (Hermes runs the base
+        #    Python with site.addsitedir), and then sysconfig reports that
+        #    interpreter's scripts dir instead of the venv's (issue #6252).
+        # 3. __file__-relative: resolves <target>/bin or <target>/Scripts for
         #    `pip install --target` layouts where sysconfig still points at the
         #    system/venv scripts dir (issue #1240).
-        binary_name = "hindsight-api.exe" if platform.system() == "Windows" else "hindsight-api"
+        is_windows = platform.system() == "Windows"
+        binary_name = "hindsight-api.exe" if is_windows else "hindsight-api"
 
-        scripts_dir = Path(sysconfig.get_path("scripts"))
-        candidate = scripts_dir / binary_name
-        if candidate.exists() and self._can_use_installed_api_binary(env):
-            # The console exe lives in sys.executable's scripts dir, so
-            # hindsight_api is importable by the GUI interpreter; prefer it on
-            # Windows to avoid ConPTY popping a terminal tab (issue #1885).
-            return self._windows_gui_api_command(scripts_dir) or [str(candidate)]
+        scripts_dirs = [Path(sysconfig.get_path("scripts"))]
+        site_packages = Path(__file__).parent.parent
+        if site_packages.name == "site-packages":
+            # Only the venv that owns this site-packages: <venv>/Lib/site-packages
+            # on Windows, <venv>/lib/pythonX.Y/site-packages elsewhere. Walking every
+            # parent would let an unrelated outer venv shadow a --target bundle.
+            venv_root = next((p for p in site_packages.parents[1:3] if (p / "pyvenv.cfg").is_file()), None)
+            if venv_root is not None:
+                scripts_dirs.append(venv_root / ("Scripts" if is_windows else "bin"))
+        installed = [d for d in dict.fromkeys(scripts_dirs) if (d / binary_name).exists()]
+        if installed and self._can_use_installed_api_binary(env):
+            # hindsight_api is importable by that venv's own interpreter, so
+            # prefer its GUI pythonw.exe on Windows to avoid ConPTY popping a
+            # terminal tab (issue #1885).
+            scripts_dir = installed[0]
+            return self._windows_gui_api_command(scripts_dir) or [str(scripts_dir / binary_name)]
 
         # --target installs place binaries alongside site-packages contents.
         # The running interpreter usually can't import hindsight_api here (it's
@@ -635,13 +667,17 @@ class DaemonEmbedManager(EmbedManager):
     def _process_command_line(pid: int) -> str | None:
         """The command line of `pid`, or None when it cannot be determined."""
         if platform.system() == "Windows":
-            # Both Windows probes get a longer deadline than the default. wmic is
-            # gone from current Windows images, so it usually fails instantly and
-            # everything rests on PowerShell — whose cold start alone can exceed
-            # five seconds on a loaded machine, before Get-CimInstance has asked
-            # WMI anything. Timing out here is not harmless: the caller reads None
-            # as "not one of our processes" (see _process_matches), so the daemon
-            # manager refuses to stop a daemon it does in fact own.
+            # Ask the kernel first. The subprocess probes below are slow: wmic is
+            # gone from current Windows images, so the answer rests on a cold
+            # PowerShell, which can take longer than any fixed deadline on a loaded
+            # machine. A timeout there is not harmless — the caller reads None as
+            # "not one of our processes" (see _process_matches), so the manager
+            # refused to stop a daemon it owns (#6017).
+            native = DaemonEmbedManager._windows_native_command_line(pid)
+            if native:
+                return native
+            # Fallback for processes the native read cannot open. Both probes get
+            # a longer deadline than the default for the cold start above.
             output = DaemonEmbedManager._run_probe(
                 ["wmic", "process", "where", f"ProcessId={pid}", "get", "CommandLine", "/format:list"],
                 timeout=_WINDOWS_PROBE_TIMEOUT_S,
@@ -673,6 +709,68 @@ class DaemonEmbedManager(EmbedManager):
         # macOS (and Linux hosts without procfs).
         output = DaemonEmbedManager._run_probe(["ps", "-p", str(pid), "-o", "args="])
         return output.strip() if output and output.strip() else None
+
+    @staticmethod
+    def _windows_native_command_line(pid: int) -> str | None:
+        """`pid`'s command line read in-process from the kernel, or None.
+
+        Uses NtQueryInformationProcess(ProcessCommandLineInformation), available
+        since Windows 8.1, which needs only limited query access — enough for any
+        process of the same user, which is every daemon we started. No subprocess,
+        so it answers in microseconds however loaded the machine is.
+        """
+        import ctypes
+        from ctypes import wintypes
+
+        process_query_limited_information = 0x1000
+        process_command_line_information = 60
+
+        class _UnicodeString(ctypes.Structure):
+            _fields_ = [
+                ("Length", wintypes.USHORT),  # in bytes, without the terminator
+                ("MaximumLength", wintypes.USHORT),
+                ("Buffer", ctypes.c_void_p),
+            ]
+
+        win_dll = getattr(ctypes, "WinDLL", None)  # only defined on Windows
+        if win_dll is None:
+            return None
+        try:
+            kernel32 = win_dll("kernel32", use_last_error=True)
+            ntdll = win_dll("ntdll")
+        except OSError:
+            return None
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        query = ntdll.NtQueryInformationProcess
+        query.restype = ctypes.c_long  # NTSTATUS; negative means failure
+        query.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.ULONG,
+            ctypes.POINTER(wintypes.ULONG),
+        ]
+
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            return None
+        try:
+            # The first call only reports the size the answer needs.
+            size = wintypes.ULONG(0)
+            query(handle, process_command_line_information, None, 0, ctypes.byref(size))
+            if size.value < ctypes.sizeof(_UnicodeString):
+                return None
+            buffer = ctypes.create_string_buffer(size.value)
+            if query(handle, process_command_line_information, buffer, size, ctypes.byref(size)) < 0:
+                return None
+            text = _UnicodeString.from_buffer(buffer)
+            if not text.Buffer or not text.Length:
+                return None
+            return ctypes.wstring_at(text.Buffer, text.Length // 2).strip() or None
+        finally:
+            kernel32.CloseHandle(handle)
 
     @staticmethod
     def _process_matches(pid: int, markers: tuple[str, ...]) -> bool:
@@ -892,12 +990,7 @@ class DaemonEmbedManager(EmbedManager):
             if key.startswith("HINDSIGHT_") and value is not None:
                 env[key] = str(value)
 
-        # Use profile-specific database (check config for override)
-        db_override = config.get("HINDSIGHT_EMBED_API_DATABASE_URL") or env.get("HINDSIGHT_EMBED_API_DATABASE_URL")
-        if db_override:
-            env["HINDSIGHT_API_DATABASE_URL"] = db_override
-        else:
-            env["HINDSIGHT_API_DATABASE_URL"] = self.get_database_url(profile)
+        env["HINDSIGHT_API_DATABASE_URL"] = self.resolve_database_url(profile, config)
 
         database_url = env["HINDSIGHT_API_DATABASE_URL"]
         is_pg0 = database_url.startswith("pg0://")

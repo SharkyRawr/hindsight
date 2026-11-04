@@ -28,10 +28,12 @@ from ..config import (
     DEFAULT_RERANKER_ALIBABA_MODEL,
     DEFAULT_RERANKER_COHERE_MAX_CONCURRENT,
     DEFAULT_RERANKER_COHERE_MODEL,
+    DEFAULT_RERANKER_COHERE_TIMEOUT,
     DEFAULT_RERANKER_FLASHRANK_BATCH_SIZE,
     DEFAULT_RERANKER_FLASHRANK_CACHE_DIR,
     DEFAULT_RERANKER_FLASHRANK_MODEL,
     DEFAULT_RERANKER_GOOGLE_MODEL,
+    DEFAULT_RERANKER_HINDSIGHT_MODEL,
     DEFAULT_RERANKER_LITELLM_MODEL,
     DEFAULT_RERANKER_LITELLM_SDK_MODEL,
     DEFAULT_RERANKER_LOCAL_BATCH_SIZE,
@@ -58,6 +60,7 @@ from ..config import (
     DEFAULT_RERANKER_TYPESAFE_TIMEOUT,
     DEFAULT_RERANKER_ZEROENTROPY_MODEL,
     DEFAULT_ZEROENTROPY_BASE_URL,
+    HINDSIGHT_INFERENCE_URL,
     RerankerMemberConfig,
 )
 from .aiohttp_session import LoopLocal, LoopLocalSession, UpstreamHTTPError, per_phase_timeout, raise_for_status
@@ -96,6 +99,10 @@ _served_provider: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 # for these and publishes no reranker score.
 # "decision_model" is recall's decision-model reranker (engine/search/decision_reranker.py).
 RANK_SCORE_PROVIDERS = frozenset({"typesafe", "decision_model"})
+
+# The recall this rerank belongs to, so a failover warning can be joined to the
+# recall's own log lines when several are in flight. Set by recall_async.
+recall_log_id: contextvars.ContextVar[str | None] = contextvars.ContextVar("hindsight_recall_log_id", default=None)
 
 
 class RerankTimeoutError(Exception):
@@ -259,10 +266,10 @@ class LocalSTCrossEncoder(CrossEncoderModel):
 
     Call initialize() during startup to load the model and avoid cold starts.
 
-    Default model is cross-encoder/ms-marco-MiniLM-L-6-v2:
-    - Fast inference (~80ms for 100 pairs on CPU)
-    - Small model (80MB)
-    - Trained for passage re-ranking
+    Default model is hindsight-ai/hs-rerank-1:
+    - Multilingual (en, es, fr, de, pt, ja, ko, zh)
+    - Small model (114M parameters, a 15M-parameter transformer per pass)
+    - Trained for Hindsight memory re-ranking
 
     Uses a dedicated thread pool to limit concurrent CPU-bound work.
     """
@@ -287,7 +294,7 @@ class LocalSTCrossEncoder(CrossEncoderModel):
 
         Args:
             model_name: Name of the CrossEncoder model to use.
-                       Default: cross-encoder/ms-marco-MiniLM-L-6-v2
+                       Default: hindsight-ai/hs-rerank-1
             max_concurrent: Maximum concurrent reranking calls (default: 2).
                            Higher values may cause CPU thrashing under load.
             force_cpu: Force CPU mode for local inference.
@@ -390,11 +397,17 @@ class LocalSTCrossEncoder(CrossEncoderModel):
                 transformers_logger.setLevel(logging.ERROR)
 
                 try:
+                    import torch
+
+                    # Raw logits, as the other providers return: recall applies the sigmoid.
+                    # sentence-transformers otherwise defaults single-label models to Sigmoid,
+                    # and the second sigmoid squashes every score into 0.5..0.73.
                     self._model = CrossEncoder(
                         self.model_name,
                         device=device,
                         model_kwargs={"low_cpu_mem_usage": False},
                         trust_remote_code=self.trust_remote_code,
+                        activation_fn=torch.nn.Identity(),
                     )
                 finally:
                     # Restore original logging level
@@ -402,8 +415,8 @@ class LocalSTCrossEncoder(CrossEncoderModel):
 
             # Safetensors weights are mapped zero-copy and can land on a byte offset that
             # is not a multiple of the dtype size, which makes torch's vectorized CPU matmul
-            # return corrupt scores. See engine/local_device.py. The default reranker
-            # (ms-marco-MiniLM-L-6-v2) is one of the affected files.
+            # return corrupt scores. See engine/local_device.py. ms-marco-MiniLM-L-6-v2 is
+            # one of the affected files.
             align_local_model_weights(self._model.model, label=f"Reranker[{self.model_name}]")
 
             self._device_type = resolve_model_device_type(self._model)
@@ -1176,14 +1189,26 @@ _SUFFICIENCY_INSTRUCTIONS = (
     "not what could be guessed from it."
 )
 
+# The page-impact gate answers with the single most likely option, and anything but
+# "no" keeps the memory. With only yes/no, a memory that bears on the topic by
+# implication lost to "no": "the payment SDK vendor ends support on 1 September"
+# against a page of risks to a 15 September launch got p(yes) 0.10-0.22, so a new
+# launch risk never reached the page. Several ways to say "it may matter" split the
+# doubt across options that all keep the memory, so "no" wins only when it is the
+# model's clear answer: on replayed eval pages, 54/54 memories that should change a
+# page kept (48/54 before), unrelated memories let through 13/80 (12/80 before).
 _PAGE_IMPACT_INSTRUCTIONS = (
-    "Could the new memory change this page? Answer yes if it adds to, updates, corrects or "
-    "contradicts anything the page says, or is about the page's topic in a way the page does "
-    "not cover yet. Answer no only if the page would read the same with or without it."
+    "Is the new memory about the page's topic, or about anything the topic depends on (a "
+    "dependency, vendor, date, person or system the topic relies on)? A memory that could "
+    "threaten, block, delay or change what the topic is about counts, even when it never names "
+    "the topic. Answer no only when it concerns a different subject altogether."
 )
 _PAGE_IMPACT_OPTIONS = {
-    "yes": "Yes, the page could change because of it",
-    "no": "No, it has nothing to do with this page",
+    "yes": "Yes, it concerns the page's topic or something it depends on",
+    "maybe": "Possibly, it might affect the topic or something it relies on",
+    "unsure": "Unclear whether it bears on the topic",
+    "depends": "It concerns something the topic relies on (a vendor, dependency, date, person or system)",
+    "no": "No, a different subject altogether: nothing this page covers or relies on",
 }
 
 _OPTION_KEY_OVERHEAD = 7  # JSON envelope overhead per choice option: '"c249": "' + comma/newline
@@ -1364,6 +1389,12 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
 
     async def _rank_once(self, query: str, docs: list[str], indices: list[int]) -> list[int]:
         """Rank one group of candidates, returning their indices best first."""
+        # Jev rejects a Choice with fewer than two options ("criteria must map 2 or more
+        # options"), and one candidate is already ranked. Guarded here, where every round
+        # (single pool, preliminaries, finals) asks, so a bank holding one memory does not
+        # fail recall with a 400.
+        if len(indices) < 2:
+            return list(indices)
         body = {
             "state": f"Question: {query}",
             "model": self.model,
@@ -1486,25 +1517,31 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
             count_tokens(_SUFFICIENCY_INSTRUCTIONS) + sum(count_tokens(level) for level in self.SUFFICIENCY_LEVELS) + 50
         )
         prefix = f"Question: {query}\n\nEvidence:\n"
+        policy = self.retry_policy or RetryPolicy()
 
         async def ask(question_budget: int) -> dict:
             budget = max(100, question_budget - overhead - count_tokens(prefix))
             # ponytail: keeps the head of the evidence; the agent's own results come
             # first (pages, then observations, then facts), so the tail is raw facts.
             fitted = truncate_to_tokens(evidence, budget).text if count_tokens(evidence) > budget else evidence
-            return await self._ask(
-                {
-                    "state": f"{prefix}{fitted}",
-                    "model": self.model,
-                    "questions": {
-                        "sufficient": {
-                            "type": "score",
-                            "instructions": _SUFFICIENCY_INSTRUCTIONS,
-                            "criteria": self.SUFFICIENCY_LEVELS,
-                        }
-                    },
+            body = {
+                "state": f"{prefix}{fitted}",
+                "model": self.model,
+                "questions": {
+                    "sufficient": {
+                        "type": "score",
+                        "instructions": _SUFFICIENCY_INSTRUCTIONS,
+                        "criteria": self.SUFFICIENCY_LEVELS,
+                    }
                 },
-                "decision_evidence_sufficiency",
+            }
+            # Retried as the page-impact question is: a rate limit read as "not enough" bought
+            # the agent turns the decision model exists to save.
+            return await acall_with_retry(
+                lambda: self._ask(body, "decision_evidence_sufficiency"),
+                policy=policy,
+                budget=policy.new_budget(),
+                provider=self.provider_name,
             )
 
         result = await self._within_window(ask)
@@ -2738,7 +2775,8 @@ class MultiCrossEncoder(CrossEncoderModel):
                 self._benched_until[index] = time.monotonic() + self.MEMBER_COOLDOWN_SECONDS
                 remaining = len(order) - position - 1
                 logger.warning(
-                    "Reranker member %d (%s) failed: %s%s",
+                    "[RECALL %s] Reranker member %d (%s) failed: %s%s",
+                    recall_log_id.get() or "-",
                     index,
                     member.provider_name,
                     e,
@@ -2987,13 +3025,30 @@ def _create_cross_encoder_backend(member: RerankerMemberConfig) -> CrossEncoderM
             max_concurrent=member.typesafe_max_concurrent,
             prune_candidates=member.typesafe_prune_candidates,
         )
+    elif provider == "hindsight":
+        # Imported here: cloud_auth pulls in aiohttp's server, which only this provider needs.
+        from .providers.cloud_auth import saved_api_key
+
+        api_key = member.hindsight_api_key or saved_api_key()
+        if not api_key:
+            raise ValueError(
+                f"{member.env_name('HINDSIGHT_API_KEY')} is required when {member.env_name('PROVIDER')} is "
+                "'hindsight' (or run `hindsight-admin cloud login`)"
+            )
+        # Hindsight Inference speaks Cohere's /v1/rerank, so the Cohere-compatible client serves it.
+        return CohereCrossEncoder(
+            api_key=api_key,
+            model=DEFAULT_RERANKER_HINDSIGHT_MODEL,
+            base_url=f"{HINDSIGHT_INFERENCE_URL}/v1/rerank",
+            timeout=DEFAULT_RERANKER_COHERE_TIMEOUT,
+        )
     elif provider == "rrf":
         return RRFPassthroughCrossEncoder()
     elif provider == "jina-mlx":
         return JinaMLXCrossEncoder()
     else:
         raise ValueError(
-            f"Unknown reranker provider: {provider}. Supported: 'local', 'tei', 'cohere', 'zeroentropy', 'siliconflow', 'nvidia', 'typesafe', 'alibaba', 'google', 'flashrank', 'onnx', 'litellm', 'litellm-sdk', 'rrf', 'jina-mlx'"
+            f"Unknown reranker provider: {provider}. Supported: 'local', 'tei', 'cohere', 'zeroentropy', 'siliconflow', 'nvidia', 'typesafe', 'hindsight', 'alibaba', 'google', 'flashrank', 'onnx', 'litellm', 'litellm-sdk', 'rrf', 'jina-mlx'"
         )
 
 

@@ -55,6 +55,7 @@ import type {
   TagGroupOrInput,
   TagGroupNotInput,
   MinScores,
+  RerankOptions,
   TemporalWindow,
   AsyncOperationSubmitResponse,
   CreateKnowledgePageResponse,
@@ -566,6 +567,8 @@ export class HindsightClient {
       types?: string[];
       /** When recalling raw facts ('world'/'experience') together with 'observation', drop any raw fact a returned observation was consolidated from, so the observation supersedes it (no duplicate content). No effect unless 'observation' and at least one raw type are both in types. Omitted: the bank's recall_prefer_observations config decides (false unless configured). */
       preferObservations?: boolean;
+      /** What a decision model set up for recall does beyond ordering: `prune` drops the results it judges no help instead of only ranking them last; `dedup` drops a result repeating a better-ranked one, at the cost of one more decision-model request. A field left out uses the bank's recall_decision_model_prune / recall_decision_model_dedup config (false unless configured). */
+      rerank?: RerankOptions;
       maxTokens?: number;
       budget?: Budget;
       trace?: boolean;
@@ -600,6 +603,7 @@ export class HindsightClient {
             query,
             types: options?.types,
             prefer_observations: options?.preferObservations,
+            rerank: options?.rerank,
             max_tokens: options?.maxTokens,
             budget: options?.budget || "mid",
             trace: options?.trace,
@@ -958,6 +962,8 @@ export class HindsightClient {
       retainChunkBatchSize?: number;
       /** Persist the original document text alongside extracted facts. */
       storeDocumentText?: boolean;
+      /** IANA zone (e.g. "Europe/Rome") a retain time with no UTC offset is read in. */
+      defaultTimezone?: string;
       /** Cap on observations retained per scope (-1 for unlimited). */
       maxObservationsPerScope?: number;
       /** Per-scope observation caps, overriding maxObservationsPerScope. */
@@ -972,7 +978,7 @@ export class HindsightClient {
         | string[][];
       /** Consolidate automatically after retain() rather than on demand. */
       enableAutoConsolidation?: boolean;
-      /** When the server has a decision model, let it settle restatements, new facts and chatter before the consolidation LLM call. */
+      /** When the server has a decision model, let it settle restatements and chatter before the consolidation LLM call. */
       consolidationUseDecisionModel?: boolean;
       /** Number of LLM calls to batch during consolidation. */
       consolidationLlmBatchSize?: number;
@@ -1004,6 +1010,10 @@ export class HindsightClient {
       recallIncludeChunks?: boolean;
       /** Default prefer_observations for recall requests that omit it. */
       recallPreferObservations?: boolean;
+      /** Default prune for recall requests that omit it. */
+      recallDecisionModelPrune?: boolean;
+      /** Default dedup for recall requests that omit it. */
+      recallDecisionModelDedup?: boolean;
       /** Token budget for those chunks. */
       recallChunksMaxTokens?: number;
       /** How the per-query result budget is derived: 'fixed' or 'adaptive'. */
@@ -1075,6 +1085,7 @@ export class HindsightClient {
       updates.retain_chunk_batch_size = options.retainChunkBatchSize;
     if (options.storeDocumentText !== undefined)
       updates.store_document_text = options.storeDocumentText;
+    if (options.defaultTimezone !== undefined) updates.default_timezone = options.defaultTimezone;
     if (options.maxObservationsPerScope !== undefined)
       updates.max_observations_per_scope = options.maxObservationsPerScope;
     if (options.observationScopeLimits !== undefined)
@@ -1118,6 +1129,10 @@ export class HindsightClient {
       updates.recall_include_chunks = options.recallIncludeChunks;
     if (options.recallPreferObservations !== undefined)
       updates.recall_prefer_observations = options.recallPreferObservations;
+    if (options.recallDecisionModelPrune !== undefined)
+      updates.recall_decision_model_prune = options.recallDecisionModelPrune;
+    if (options.recallDecisionModelDedup !== undefined)
+      updates.recall_decision_model_dedup = options.recallDecisionModelDedup;
     if (options.recallChunksMaxTokens !== undefined)
       updates.recall_chunks_max_tokens = options.recallChunksMaxTokens;
     if (options.recallBudgetFunction !== undefined)
@@ -2167,6 +2182,7 @@ export type {
   TagGroupOrInput,
   TagGroupNotInput,
   MinScores,
+  RerankOptions,
   TemporalWindow,
   AsyncOperationSubmitResponse,
   CreateKnowledgePageResponse,

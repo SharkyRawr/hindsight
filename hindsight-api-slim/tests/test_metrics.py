@@ -10,6 +10,7 @@ from hindsight_api.metrics import (
     MetricsCollector,
     MetricsCollectorBase,
     NoOpMetricsCollector,
+    OperationOutcome,
     get_metrics_collector,
     get_token_bucket,
     create_metrics_collector,
@@ -137,14 +138,14 @@ class TestMetricsCollector:
         attributes = call_args[0][1]
         assert attributes["success"] == "false"
 
-    def test_record_operation_cancellation_excluded_from_metric(self, collector):
+    def test_record_operation_cancellation_recorded_as_cancelled(self, collector):
         """A client-disconnect cancellation is neither a success nor a failure.
 
         Recall/reflect run the engine call inside record_operation; when the
         client disconnects the engine raises OperationCancelledError (issue
-        #2122). That abandoned request must not be recorded on
-        hindsight.operation.total at all -- inflating neither the failure nor
-        the success rate -- even though the exception still propagates.
+        #2122). That abandoned request is counted with success="cancelled", so
+        it shows up in hindsight.operation.total (and its time-until-cancel in
+        the duration histogram) without inflating the failure rate (#6126).
         """
         from hindsight_api.cancellation import OperationCancelledError
 
@@ -152,13 +153,13 @@ class TestMetricsCollector:
             with collector.record_operation("recall", bank_id="test_bank", source="api"):
                 raise OperationCancelledError("client disconnected")
 
-        collector.operation_total.add.assert_not_called()
-        collector.operation_duration.record.assert_not_called()
+        assert collector.operation_total.add.call_args[0][1]["success"] == "cancelled"
+        assert collector.operation_duration.record.call_args[0][1]["success"] == "cancelled"
 
-    def test_record_operation_http_499_from_cancellation_excluded(self, collector):
+    def test_record_operation_http_499_from_cancellation_recorded_as_cancelled(self, collector):
         """run_cancellable_on_disconnect re-raises the cancellation as
         ``HTTPException(499) from exc``; the cause chain marks it as a
-        cancellation, so it is excluded from the metric too."""
+        cancellation, so it is recorded as cancelled too."""
         from fastapi import HTTPException
 
         from hindsight_api.cancellation import OperationCancelledError
@@ -170,8 +171,7 @@ class TestMetricsCollector:
                 except OperationCancelledError as cancel:
                     raise HTTPException(status_code=499, detail="client disconnected") from cancel
 
-        collector.operation_total.add.assert_not_called()
-        collector.operation_duration.record.assert_not_called()
+        assert collector.operation_total.add.call_args[0][1]["success"] == "cancelled"
 
     def test_record_operation_unrelated_499_still_recorded_as_failure(self, collector):
         """A 499 that is NOT caused by a cancellation (no OperationCancelledError
@@ -184,6 +184,48 @@ class TestMetricsCollector:
 
         attributes = collector.operation_duration.record.call_args[0][1]
         assert attributes["success"] == "false"
+
+    def test_record_operation_validator_rejection_recorded_as_rejected(self, collector):
+        """An operation a validator refused did not fail: it is counted with
+        success="rejected", outside the failure rate, like a cancellation."""
+        from hindsight_api.extensions.operation_validator import OperationValidationError
+
+        with pytest.raises(OperationValidationError):
+            with collector.record_operation("retain", bank_id="test_bank", source="api"):
+                raise OperationValidationError("quota exceeded", status_code=402)
+
+        assert collector.operation_total.add.call_args[0][1]["success"] == "rejected"
+        assert collector.operation_duration.record.call_args[0][1]["success"] == "rejected"
+
+    def test_record_operation_http_error_from_rejection_recorded_as_rejected(self, collector):
+        """A rejection re-raised as an HTTPException ``from`` it is still a rejection."""
+        from fastapi import HTTPException
+
+        from hindsight_api.extensions.operation_validator import OperationValidationError
+
+        with pytest.raises(HTTPException):
+            with collector.record_operation("recall", bank_id="test_bank", source="api"):
+                try:
+                    raise OperationValidationError("quota exceeded", status_code=402)
+                except OperationValidationError as rejection:
+                    raise HTTPException(status_code=402, detail=rejection.reason) from rejection
+
+        assert collector.operation_total.add.call_args[0][1]["success"] == "rejected"
+
+    def test_record_operation_unrelated_402_still_recorded_as_failure(self, collector):
+        """A 402 that no validator raised is a real failure and is still recorded as one."""
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException):
+            with collector.record_operation("retain", bank_id="test_bank", source="api"):
+                raise HTTPException(status_code=402, detail="upstream provider out of quota")
+
+        assert collector.operation_total.add.call_args[0][1]["success"] == "false"
+
+    def test_record_operation_result_records_rejected(self, collector):
+        collector.record_operation_result("retain", "test_bank", outcome=OperationOutcome.REJECTED, duration=0.1)
+
+        assert collector.operation_total.add.call_args[0][1]["success"] == "rejected"
 
     def test_record_operation_with_budget(self, collector):
         """Test that budget is included in attributes when provided."""
@@ -243,7 +285,9 @@ class TestMetricsCollector:
 
     def test_record_operation_result_records_with_explicit_success(self, collector):
         """Direct recording path used by the worker (source=worker, explicit success)."""
-        collector.record_operation_result("retain", bank_id="test_bank", success=False, duration=1.5, source="worker")
+        collector.record_operation_result(
+            "retain", bank_id="test_bank", outcome=OperationOutcome.FAILURE, duration=1.5, source="worker"
+        )
 
         duration, attributes = collector.operation_duration.record.call_args[0]
         assert duration == 1.5
@@ -308,7 +352,7 @@ class TestMetricsCollector:
         ):
             collector = MetricsCollector()
 
-        collector.record_operation_result("recall", "test_bank", success=True, duration=0.1)
+        collector.record_operation_result("recall", "test_bank", outcome=OperationOutcome.SUCCESS, duration=0.1)
         collector.record_recall_phase("engine_auth", 0.01)
         collector.record_retain_phase("write", 0.01)
 

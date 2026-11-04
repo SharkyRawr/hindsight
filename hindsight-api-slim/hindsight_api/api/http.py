@@ -14,7 +14,7 @@ import re
 import time
 import traceback
 import uuid
-from collections.abc import Awaitable, Sequence
+from collections.abc import Awaitable, Iterator, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
@@ -40,7 +40,7 @@ from hindsight_api.engine.audit import (
     AuditLogStatsResponse,
 )
 from hindsight_api.engine.document_history import DocumentHistoryResponse
-from hindsight_api.engine.llm_trace import LLMCallType, LLMRequestListResponse, LLMRequestStatsResponse
+from hindsight_api.engine.llm_trace import LLMCallType, LLMRequestListResponse, LLMRequestStatsResponse, LLMStatsSplit
 from hindsight_api.extensions import AuthenticationError, PrecheckContext, PrecheckOperation
 
 
@@ -203,6 +203,8 @@ from hindsight_api.engine.mental_model_refresh import (
 from hindsight_api.engine.providers.none_llm import LLMNotAvailableError
 from hindsight_api.engine.reflect import ReflectNoAnswerError, ReflectToolCallError, ReflectToolExecutionError
 from hindsight_api.engine.response_models import (
+    DIRECTIVE_PRIORITY_MAX,
+    DIRECTIVE_PRIORITY_MIN,
     VALID_RECALL_FACT_TYPES,
     Budget,
     ConsolidationStrategiesPreview,
@@ -214,8 +216,10 @@ from hindsight_api.engine.response_models import (
     MinScores,
     RecallScores,
     ReflectDefaultOptions,
+    RerankOptions,
     TemporalWindow,
     TokenUsage,
+    check_mental_model_id,
 )
 from hindsight_api.engine.retain.attachment_content import (
     CanonicalContent,
@@ -286,9 +290,10 @@ logger = logging.getLogger(__name__)
 def _internal_error(exc: Exception, where: str) -> HTTPException:
     """Log an unhandled handler exception with its traceback, and map it to a 500.
 
-    Two exceptions keep their own status instead: a validator rejection (the
-    validator's code — routes that forgot to catch it used to answer 500, #5448)
-    and a store that shed the request (503).
+    Three failures keep their own status instead: a validator rejection (the
+    validator's code — routes that forgot to catch it used to answer 500, #5448),
+    a store that shed the request (503), and client text the database cannot
+    store, such as a NUL byte (400 — every route answered 500 for it, #6231).
 
     Every route's catch-all used to do this inline — 72 byte-identical copies of
     the same four lines, plus seven near-copies that logged the traceback without
@@ -310,8 +315,45 @@ def _internal_error(exc: Exception, where: str) -> HTTPException:
     if unavailable is not None:
         logger.warning(f"Store unavailable in {where}, answering 503: {exc}")
         return unavailable
+    unstorable = _unstorable_text(exc)
+    if unstorable is not None:
+        return unstorable
     logger.error(f"Error in {where}: {exc}\n\nTraceback:\n{traceback.format_exc()}")
     return HTTPException(status_code=500, detail=str(exc))
+
+
+def _exception_chain(exc: BaseException) -> Iterator[BaseException]:
+    """``exc`` and every exception it was raised from or while handling, once each."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        yield cur
+        cur = cur.__cause__ or cur.__context__
+
+
+# Postgres rejects text it cannot store: a NUL byte (22021) or a character the
+# database encoding lacks (22P05). Every such string came from the client.
+_UNSTORABLE_TEXT_SQLSTATES = {"22021", "22P05"}
+
+
+def _unstorable_text(exc: BaseException) -> HTTPException | None:
+    """The 400 for client text the database cannot store, or None if that is not what failed.
+
+    Covers a NUL byte, a character outside the database encoding, and a lone surrogate
+    (which asyncpg fails to encode before the query is sent, so it carries no SQLSTATE).
+    """
+    for cur in _exception_chain(exc):
+        if getattr(cur, "sqlstate", None) in _UNSTORABLE_TEXT_SQLSTATES or (
+            isinstance(cur, UnicodeEncodeError) and cur.reason == "surrogates not allowed"
+        ):
+            return HTTPException(status_code=400, detail=f"Input contains text that cannot be stored: {cur}")
+    return None
+
+
+def _expected_failure(exc: BaseException) -> HTTPException | None:
+    """The 503 or 400 for a failure that is not a server bug, for catch-alls that build their own 500."""
+    return _store_unavailable(exc) or _unstorable_text(exc)
 
 
 def _store_unavailable(exc: BaseException) -> HTTPException | None:
@@ -326,17 +368,13 @@ def _store_unavailable(exc: BaseException) -> HTTPException | None:
     Walks the cause/context chain because the engine usually wraps the store's error before a route
     sees it.
     """
-    seen: set[int] = set()
-    cur: BaseException | None = exc
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
+    for cur in _exception_chain(exc):
         if isinstance(cur, StoreWriteUnavailable):
             return HTTPException(
                 status_code=503,
                 detail=str(cur),
                 headers={"Retry-After": str(cur.retry_after)},
             )
-        cur = cur.__cause__ or cur.__context__
     return None
 
 
@@ -566,6 +604,14 @@ class RecallRequest(BaseModel):
             "it and you don't get duplicate content. The freed slots are backfilled with the next results, "
             "keeping the result count at the requested budget. When omitted, uses the bank/global "
             "recall_prefer_observations config (false unless configured). No effect unless 'observation' and at least one raw type are both requested."
+        ),
+    )
+    rerank: RerankOptions | None = Field(
+        default=None,
+        description=(
+            "What the decision-model reranker does beyond ordering: drop results that do not help "
+            "(`prune`) or that repeat a better-ranked one (`dedup`). Each field left unset uses the "
+            "bank/global config. No effect unless a decision model is set up for recall."
         ),
     )
     budget: Budget = Budget.MID
@@ -1027,6 +1073,7 @@ async def _attach_to_memories(
     bank_id: str,
     items: "list[dict[str, Any]]",
     request_context: RequestContext,
+    read_uncarried: bool = False,
 ) -> None:
     """Add ``attachments`` to memory dicts, in place — the ones each fact came from.
 
@@ -1043,7 +1090,8 @@ async def _attach_to_memories(
     the item as ``attachment_ids``. Those are taken off here — the key is an
     internal carrier, and leaving it would make the payload differ by backend —
     and handed to the engine, so the lookup resolves them instead of reading them
-    back from a table the store never wrote.
+    back from a table the store never wrote. ``read_uncarried`` is for items that are
+    bare stored ids rather than store rows: see ``attachments_for_memories``.
     """
     unit_ids: list[str] = []
     observation_ids: list[str] = []
@@ -1063,7 +1111,12 @@ async def _attach_to_memories(
     if not unit_ids:
         return
     by_unit = await memory_app.attachments_for_memories(
-        bank_id, unit_ids, request_context, carried=carried, observation_ids=observation_ids
+        bank_id,
+        unit_ids,
+        request_context,
+        carried=carried,
+        observation_ids=observation_ids,
+        read_uncarried=read_uncarried,
     )
     if not by_unit:
         return
@@ -1844,7 +1897,7 @@ class CreateBankAliasRequest(BaseModel):
 
     alias: str = Field(
         description=(
-            "The extra bank id. Same rules as a bank id (non-empty, at most 192 bytes of UTF-8, no "
+            "The extra bank id. Same rules as a bank id (non-empty, at most 192 bytes of UTF-8, no '/', no "
             "control characters, no leading underscore), and it must not already name a bank or another alias."
         )
     )
@@ -3200,7 +3253,12 @@ class CreateDirectiveRequest(BaseModel):
 
     name: str = Field(description="Human-readable name for the directive")
     content: str = Field(description="The directive text to inject into prompts")
-    priority: int = Field(default=0, description="Higher priority directives are injected first")
+    priority: int = Field(
+        default=0,
+        ge=DIRECTIVE_PRIORITY_MIN,
+        le=DIRECTIVE_PRIORITY_MAX,
+        description="Higher priority directives are injected first",
+    )
     is_active: bool = Field(default=True, description="Whether this directive is active")
     tags: list[str] = FieldWithDefault(
         list,
@@ -3213,7 +3271,9 @@ class UpdateDirectiveRequest(BaseModel):
 
     name: str | None = Field(default=None, description="New name")
     content: str | None = Field(default=None, description="New content")
-    priority: int | None = Field(default=None, description="New priority")
+    priority: int | None = Field(
+        default=None, ge=DIRECTIVE_PRIORITY_MIN, le=DIRECTIVE_PRIORITY_MAX, description="New priority"
+    )
     is_active: bool | None = Field(default=None, description="New active status")
     tags: list[str] | None = Field(default=None, description="New tags")
 
@@ -3299,7 +3359,11 @@ class MentalModelResponse(BaseModel):
     )
     reflect_response: dict | None = Field(
         default=None,
-        description="Full reflect API response payload including based_on facts and observations",
+        description=(
+            "Full reflect API response payload including based_on facts and observations. On a "
+            "single-model read, each world/experience/observation entry in based_on also carries "
+            "`attachments`: the retained images and files that memory was extracted from."
+        ),
     )
     is_stale: bool | None = Field(
         default=None,
@@ -3403,7 +3467,7 @@ class CreatePageRequest(BaseModel):
             "'all' to require the tags while still including untagged memories."
         ),
     )
-    max_tokens: int | None = None
+    max_tokens: int | None = Field(default=None, ge=256, le=8192)
     trigger: MentalModelTrigger | None = None
 
 
@@ -3425,7 +3489,7 @@ class UpdateNodeRequest(BaseModel):
             "matching rules on this field in `CreatePageRequest`; `trigger.tags_match` widens them."
         ),
     )
-    max_tokens: int | None = None
+    max_tokens: int | None = Field(default=None, ge=256, le=8192)
     trigger: MentalModelTrigger | None = Field(
         default=None,
         description=(
@@ -3606,13 +3670,23 @@ class CreateMentalModelRequest(BaseModel):
     )
 
     id: str | None = Field(
-        None, description="Optional custom ID for the mental model (alphanumeric lowercase with hyphens)"
+        None,
+        description=(
+            "Optional custom ID for the mental model (same rules as a bank id: at most 192 bytes of UTF-8, "
+            "no '/' and no control characters)"
+        ),
     )
     name: str = Field(description="Human-readable name for the mental model")
     source_query: str = Field(description="The query to run to generate content")
     tags: list[str] = FieldWithDefault(list, description="Tags for scoped visibility")
     max_tokens: int = Field(default=2048, ge=256, le=8192, description="Maximum tokens for generated content")
     trigger: MentalModelTrigger = FieldWithDefault(MentalModelTrigger, description="Trigger settings")
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, v: str | None) -> str | None:
+        # An empty id means "generate one", as it always has.
+        return check_mental_model_id(v) if v else v
 
 
 class CreateMentalModelResponse(BaseModel):
@@ -5417,6 +5491,8 @@ def _register_routes(app: FastAPI):
                         enable_trace=request.trace,
                         fact_type=fact_types,
                         prefer_observations=request.prefer_observations,
+                        prune=request.rerank.prune if request.rerank else None,
+                        dedup=request.rerank.dedup if request.rerank else None,
                         question_date=question_date,
                         include_entities=include_entities,
                         max_entity_tokens=max_entity_tokens,
@@ -5555,7 +5631,7 @@ def _register_routes(app: FastAPI):
                 detail="Request timed out while searching memories. Try a shorter or more specific query.",
             )
         except Exception as e:
-            if (unavailable := _store_unavailable(e)) is not None:
+            if (unavailable := _expected_failure(e)) is not None:
                 raise unavailable
             import traceback
 
@@ -5736,7 +5812,7 @@ def _register_routes(app: FastAPI):
             # reply built on a partial (often empty) evidence set, which callers
             # store as a real answer (#2894). Returning the failure lets them retry.
             # A tool whose recall the store shed is "not now", so it gets the same 503 as recall.
-            if (unavailable := _store_unavailable(e)) is not None:
+            if (unavailable := _expected_failure(e)) is not None:
                 raise unavailable
             logger.warning("Reflect retrieval failure in bank %s: %s", bank_id, e)
             raise HTTPException(status_code=500, detail=str(e))
@@ -6172,6 +6248,25 @@ def _register_routes(app: FastAPI):
             )
             if mental_model is None:
                 raise HTTPException(status_code=404, detail=f"Mental model '{mental_model_id}' not found")
+
+            # The refresh stores its evidence by id only. Resolve the attachments
+            # behind those memories on read, the same per-fact edge reflect's
+            # based_on carries, so a page can show the images it was built from
+            # without storing a copy of them.
+            based_on = (mental_model.get("reflect_response") or {}).get("based_on")
+            if isinstance(based_on, dict):
+                await _attach_to_memories(
+                    app.state.memory,
+                    bank_id,
+                    [
+                        fact
+                        for fact_type in ("world", "experience", "observation")
+                        for fact in based_on.get(fact_type) or []
+                    ],
+                    request_context,
+                    # Stored ids, not store rows: nothing carried their attachment ids.
+                    read_uncarried=True,
+                )
 
             return MentalModelResponse(**mental_model)
         except (AuthenticationError, HTTPException):
@@ -6864,6 +6959,8 @@ def _register_routes(app: FastAPI):
             return DirectiveResponse(**directive)
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -6936,6 +7033,8 @@ def _register_routes(app: FastAPI):
             return DirectiveResponse(**directive)
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -6966,6 +7065,8 @@ def _register_routes(app: FastAPI):
             return {"status": "deleted"}
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -8843,6 +8944,8 @@ def _register_routes(app: FastAPI):
             return ClearMemoryObservationsResponse(deleted_count=result["deleted_count"])
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         except (AuthenticationError, HTTPException):
             raise
         except Exception as e:
@@ -9560,7 +9663,7 @@ def _register_routes(app: FastAPI):
                     status_code=422,
                     detail={"violations": [asdict(v) for v in e.violations]},
                 )
-            if (unavailable := _store_unavailable(e)) is not None:
+            if (unavailable := _expected_failure(e)) is not None:
                 raise unavailable
             import traceback
 
@@ -9911,7 +10014,9 @@ def _register_routes(app: FastAPI):
         "/v1/default/banks/{bank_id}/llm-requests",
         summary="List LLM request traces",
         description="List traced LLM requests for a bank, ordered by most recent first. "
-        "Requires LLM request tracing to be enabled (HINDSIGHT_API_LLM_TRACE_ENABLED).",
+        "Requires LLM request tracing to be enabled (HINDSIGHT_API_LLM_TRACE_ENABLED). "
+        "Requests older than HINDSIGHT_API_LLM_TRACE_RETENTION_DAYS are deleted; `retention_days` "
+        "in the response says how many days are kept (null = forever).",
         operation_id="list_llm_requests",
         tags=["LLM Traces"],
         response_model=LLMRequestListResponse,
@@ -9974,7 +10079,9 @@ def _register_routes(app: FastAPI):
     @app.get(
         "/v1/default/banks/{bank_id}/llm-requests/stats",
         summary="LLM request statistics",
-        description="Get LLM request counts grouped by time bucket and status for charting.",
+        description="Get LLM request counts grouped by time bucket and status for charting. "
+        "Only requests within HINDSIGHT_API_LLM_TRACE_RETENTION_DAYS are kept, so a period longer than "
+        "`retention_days` (in the response; null = kept forever) only covers the last `retention_days`.",
         operation_id="llm_request_stats",
         tags=["LLM Traces"],
         response_model=LLMRequestStatsResponse,
@@ -9986,7 +10093,10 @@ def _register_routes(app: FastAPI):
         call_type: LLMCallType | None = Query(
             None, description="Filter by kind of model call: llm, embedding, rerank or decision"
         ),
-        period: str = Query("7d", description="Time period: 1d, 7d, or 30d"),
+        period: str = Query("7d", description="Time period: 1d (by hour), 7d, or 30d (by day)"),
+        split_by: LLMStatsSplit | None = Query(
+            None, description="Also split each bucket by model or by operation (returned in `series`)"
+        ),
         request_context: RequestContext = Depends(get_request_context),
     ):
         """Get LLM request counts grouped by time bucket and status."""
@@ -9997,6 +10107,7 @@ def _register_routes(app: FastAPI):
                 operation=operation,
                 call_type=call_type,
                 period=period,
+                split_by=split_by,
             )
             if result is None:
                 raise HTTPException(status_code=404, detail=f"Bank '{bank_id}' not found")

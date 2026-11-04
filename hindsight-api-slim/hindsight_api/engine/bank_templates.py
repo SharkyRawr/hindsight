@@ -4,14 +4,20 @@ Shared by the HTTP import/export endpoints and by ``MemoryEngine``, which applie
 server's default template (``HINDSIGHT_API_DEFAULT_BANK_TEMPLATE``) to every new bank.
 """
 
-import re
 from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from hindsight_api.config import RETAIN_EXTRACTION_MODES, get_config
 from hindsight_api.engine.interface import BankTemplateImportWrite
-from hindsight_api.engine.response_models import ConsolidationStrategySpec, FieldWithDefault, MentalModelTrigger
+from hindsight_api.engine.response_models import (
+    DIRECTIVE_PRIORITY_MAX,
+    DIRECTIVE_PRIORITY_MIN,
+    ConsolidationStrategySpec,
+    FieldWithDefault,
+    MentalModelTrigger,
+    check_mental_model_id,
+)
 from hindsight_api.engine.retain.entity_labels import LabelGroup, migrate_entity_labels_input
 from hindsight_api.extensions.operation_validator import BankWriteOperation
 from hindsight_api.models import RequestContext
@@ -26,7 +32,12 @@ BANK_TEMPLATE_CURRENT_VERSION = "1"
 class BankTemplateMentalModel(BaseModel):
     """A mental model definition within a bank template manifest."""
 
-    id: str = Field(description="Unique ID for the mental model (alphanumeric lowercase with hyphens)")
+    id: str = Field(
+        description=(
+            "Unique ID for the mental model (same rules as a bank id: at most 192 bytes of UTF-8, "
+            "no '/' and no control characters)"
+        )
+    )
     name: str = Field(description="Human-readable name for the mental model")
     source_query: str = Field(description="The query to run to generate content")
     tags: list[str] = FieldWithDefault(list, description="Tags for scoped visibility")
@@ -36,11 +47,7 @@ class BankTemplateMentalModel(BaseModel):
     @field_validator("id")
     @classmethod
     def validate_id(cls, v: str) -> str:
-        if not re.match(r"^[a-z0-9][a-z0-9-]*$", v):
-            raise ValueError(
-                f"Mental model id '{v}' must be alphanumeric lowercase with hyphens, starting with a letter or digit."
-            )
-        return v
+        return check_mental_model_id(v)
 
 
 class BankTemplateConfig(BaseModel):
@@ -230,13 +237,18 @@ class BankTemplateConfig(BaseModel):
         description="Persist raw source text (documents.original_text / chunks.chunk_text). "
         "Set false to keep only derived facts.",
     )
+    default_timezone: str | None = Field(
+        default=None,
+        description="IANA zone (e.g. 'Europe/Rome') a retain timestamp, or a time the LLM extracts, "
+        "is read in when it carries no UTC offset.",
+    )
     enable_auto_consolidation: bool | None = Field(
         default=None, description="Automatically consolidate observations after retain"
     )
     consolidation_use_decision_model: bool | None = Field(
         default=None,
-        description="When the server has a decision model, consolidation lets it settle restatements, new "
-        "facets and chatter before the LLM call",
+        description="When the server has a decision model, consolidation lets it settle restatements and "
+        "chatter before the LLM call",
     )
     consolidation_max_memories_per_round: int | None = Field(
         default=None, description="Max memory units fed into a single consolidation round"
@@ -247,6 +259,12 @@ class BankTemplateConfig(BaseModel):
     recall_include_chunks: bool | None = Field(default=None, description="Include raw chunks in recall results")
     recall_prefer_observations: bool | None = Field(
         default=None, description="Default for recall prefer_observations when the request omits it"
+    )
+    recall_decision_model_prune: bool | None = Field(
+        default=None, description="Default for recall prune when the request omits it (decision-model reranker only)"
+    )
+    recall_decision_model_dedup: bool | None = Field(
+        default=None, description="Default for recall dedup when the request omits it (decision-model reranker only)"
     )
     recall_max_tokens: int | None = Field(default=None, description="Max tokens of results returned by recall")
     recall_chunks_max_tokens: int | None = Field(
@@ -271,7 +289,12 @@ class BankTemplateDirective(BaseModel):
 
     name: str = Field(description="Human-readable name for the directive (used as match key on re-import)")
     content: str = Field(description="The directive text to inject into prompts")
-    priority: int = Field(default=0, description="Higher priority directives are injected first")
+    priority: int = Field(
+        default=0,
+        ge=DIRECTIVE_PRIORITY_MIN,
+        le=DIRECTIVE_PRIORITY_MAX,
+        description="Higher priority directives are injected first",
+    )
     is_active: bool = Field(default=True, description="Whether this directive is active")
     tags: list[str] = FieldWithDefault(list, description="Tags for filtering")
 

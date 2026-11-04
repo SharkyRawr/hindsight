@@ -93,19 +93,6 @@ async def _call(llm: OpenAICompatibleLLM, create: AsyncMock, **kwargs):
     return create
 
 
-async def _call_with_tools(llm: OpenAICompatibleLLM, create: AsyncMock, **kwargs):
-    """Drive `call_with_tools()` against a mocked client."""
-    llm._client.chat.completions.create = create
-    with patch("hindsight_api.engine.providers.openai_compatible_llm.get_metrics_collector"):
-        await llm.call_with_tools(
-            messages=[{"role": "user", "content": "ping"}],
-            tools=[{"type": "function", "function": {"name": "noop", "parameters": {}}}],
-            max_retries=0,
-            **kwargs,
-        )
-    return create
-
-
 @contextmanager
 def _bound_trace(trace_id: str):
     """Bind an operation trace context, as `ConfiguredLLMProvider` does per call."""
@@ -314,55 +301,39 @@ async def test_call_uses_the_fallback_hash_without_a_trace_context():
     assert sent == cache_affinity_id(create.call_args.kwargs["messages"])
 
 
-# ── AC6: call_with_tools parity ───────────────────────────────────────────────
-
-
-async def test_tools_path_sends_xai_header():
-    llm = _llm("xai_conv_id")
-    create = await _call_with_tools(llm, AsyncMock(return_value=_chat_response("done")))
-    assert _HEX32.match(create.call_args.kwargs["extra_headers"][XAI_CONV_ID_HEADER])
-
-
-async def test_tools_path_sends_session_id_header():
-    llm = _llm("header", cache_affinity_header="x-session-id")
-    create = await _call_with_tools(llm, AsyncMock(return_value=_chat_response("done")))
-    assert _HEX32.match(create.call_args.kwargs["extra_headers"]["x-session-id"])
-
-
-async def test_tools_path_sends_prompt_cache_key():
-    llm = _llm("openai_prompt_cache_key")
-    create = await _call_with_tools(llm, AsyncMock(return_value=_chat_response("done")))
-    assert _HEX32.match(create.call_args.kwargs[OPENAI_PROMPT_CACHE_KEY_PARAM])
-
-
-async def test_tools_path_sends_nothing_by_default():
-    llm = _llm()
-    create = await _call_with_tools(llm, AsyncMock(return_value=_chat_response("done")))
-    kwargs = create.call_args.kwargs
-    assert "extra_headers" not in kwargs
-    assert OPENAI_PROMPT_CACHE_KEY_PARAM not in kwargs
-
-
-# ── AC13: fallback hash on the tools path ─────────────────────────────────────
-
-
-async def test_tools_path_fallback_hash_is_stable():
-    """`call_with_tools` builds its message list differently; its fallback id must
-    still derive from the first message and survive a growing conversation."""
-    llm = _llm("xai_conv_id")
-    create = AsyncMock(return_value=_chat_response("done"))
-    llm._client.chat.completions.create = create
-    tools = [{"type": "function", "function": {"name": "noop", "parameters": {}}}]
-    system = {"role": "system", "content": "you are helpful"}
-    with patch("hindsight_api.engine.providers.openai_compatible_llm.get_metrics_collector"):
-        await llm.call_with_tools(messages=[system], tools=tools, max_retries=0)
-        first = create.call_args.kwargs["extra_headers"][XAI_CONV_ID_HEADER]
-        await llm.call_with_tools(
-            messages=[system, {"role": "user", "content": "and now?"}], tools=tools, max_retries=0
-        )
-        second = create.call_args.kwargs["extra_headers"][XAI_CONV_ID_HEADER]
-    assert _HEX32.match(first)
-    assert first == second
+@pytest.mark.parametrize("header_name", ["x-session-id", "x-opencode-session", "X-Gateway-Conversation"])
+@pytest.mark.parametrize("mode", ["header", "xai_conv_id", "openai_prompt_cache_key", "none"])
+async def test_schema_tools_path_preserves_affinity(mode: str, header_name: str):
+    llm = LLMProvider(
+        provider="openai",
+        api_key="test-key",
+        base_url="https://example.test/v1",
+        model="gpt-4o-mini",
+        cache_affinity=mode,
+        cache_affinity_header=header_name,
+    )
+    create = AsyncMock(return_value=_chat_response('{"call": {"name": "noop", "arguments": {}}}'))
+    llm._provider_impl._client.chat.completions.create = create
+    try:
+        with patch("hindsight_api.engine.providers.openai_compatible_llm.get_metrics_collector"):
+            result = await llm.call_with_tools(
+                messages=[{"role": "user", "content": "ping"}],
+                tools=[{"type": "function", "function": {"name": "noop", "parameters": {}}}],
+                max_retries=0,
+            )
+        sent = create.call_args.kwargs
+        assert "tools" not in sent and "tool_choice" not in sent
+        assert result.tool_calls[0].name == "noop"
+        if mode == "header":
+            assert _HEX32.fullmatch(sent["extra_headers"][header_name])
+        elif mode == "xai_conv_id":
+            assert _HEX32.fullmatch(sent["extra_headers"][XAI_CONV_ID_HEADER])
+        elif mode == "openai_prompt_cache_key":
+            assert _HEX32.fullmatch(sent[OPENAI_PROMPT_CACHE_KEY_PARAM])
+        else:
+            assert "extra_headers" not in sent and OPENAI_PROMPT_CACHE_KEY_PARAM not in sent
+    finally:
+        await llm.cleanup()
 
 
 # ── AC7: adjacent fix — default_headers reaches the SDK client ────────────────
@@ -729,11 +700,9 @@ def test_header_mode_requires_valid_header_name(header_name):
 
 
 @pytest.mark.parametrize("header_name", ["x-session-id", "x-opencode-session", "X-Gateway-Conversation"])
-@pytest.mark.parametrize("with_tools", [False, True])
-async def test_generic_header_name_reaches_both_call_paths(header_name, with_tools):
+async def test_generic_header_name_reaches_plain_call(header_name):
     llm = _llm("header", cache_affinity_header=header_name)
-    call = _call_with_tools if with_tools else _call
-    create = await call(llm, AsyncMock(return_value=_chat_response()))
+    create = await _call(llm, AsyncMock(return_value=_chat_response()))
     assert _HEX32.match(create.call_args.kwargs["extra_headers"][header_name])
 
 

@@ -32,6 +32,7 @@ from types import SimpleNamespace
 from typing import IO, TYPE_CHECKING, Any, Literal, NoReturn, ParamSpec, TypeVar, cast
 
 import asyncpg
+import numpy as np
 from pydantic import TypeAdapter, ValidationError
 
 from .._vector_index import (
@@ -50,6 +51,7 @@ from ..config import (
     DEFAULT_STORE_DOCUMENT_TEXT,
     ENV_MODEL_INIT_TIMEOUT,
     LLM_STRATEGY_METADATA,
+    SYSTEM_ONE_DECISION_MODEL_PROVIDERS,
     ConfigLike,
     HindsightConfig,
     LLMMemberConfig,
@@ -123,9 +125,11 @@ from .llm_interface import ProviderAuthError, ProviderContentPolicyError, Provid
 from .llm_trace import (
     LLMRequestEntry,
     LLMRequestListResponse,
+    LLMRequestSeriesSums,
     LLMRequestStatsBucket,
     LLMRequestStatsResponse,
     LLMRequestTokenSums,
+    LLMStatsSplit,
     LLMTraceRecorder,
     call_type_clause,
     current_trace_context,
@@ -643,10 +647,11 @@ def validate_sql_schema(sql: str) -> None:
 from ..operation_runs import set_sink as set_operation_sink
 from ..operation_runs import timed as timed_operation_method
 from .bank_templates import apply_default_bank_template_resources, load_default_bank_template_manifest
-from .cross_encoder import RANK_SCORE_PROVIDERS, CrossEncoderModel, TypeSafeCrossEncoder
+from .cross_encoder import RANK_SCORE_PROVIDERS, CrossEncoderModel, TypeSafeCrossEncoder, recall_log_id
 from .embeddings import Embeddings, create_embeddings_from_env
 from .interface import BankConfigState, BankTemplateImportWrite, MemoryEngineInterface
 from .memories import sql_memories
+from .memories.base import watermark_may_postdate as _may_need_refresh
 from .page_markdown import EMPTY_PAGE_NOTICE
 from .schema import _is_oracle, fq_table
 from .search.decision_reranker import PROVIDER_NAME as DECISION_MODEL_RERANKER
@@ -722,8 +727,10 @@ from .reflect.tools import (
     tool_search_mental_models,
     tool_search_observations,
 )
-from .remote_retry import is_transient_remote_error, status_code_of
+from .remote_retry import RetryPolicy, is_transient_remote_error, status_code_of
 from .response_models import (
+    DIRECTIVE_PRIORITY_MAX,
+    DIRECTIVE_PRIORITY_MIN,
     VALID_RECALL_FACT_TYPES,
     Budget,
     ConsolidationStrategiesPreview,
@@ -737,6 +744,7 @@ from .response_models import (
     TemporalWindow,
     TokenUsage,
     ToolCallTrace,
+    check_mental_model_id,
 )
 from .response_models import RecallResult as RecallResultModel
 from .retain import bank_utils, embedding_utils
@@ -882,7 +890,7 @@ def _member_to_llm(member: "LLMMemberConfig", config: ConfigLike, defaults: _LLM
         cache_affinity_header=member.cache_affinity_header or config.llm_cache_affinity_header,
         ollama_num_ctx=config.llm_ollama_num_ctx,
         bedrock_service_tier=member.bedrock_service_tier,
-        structured_output_forced_tool=config.llm_structured_output_forced_tool,
+        structured_output_in_prompt=config.llm_structured_output_in_prompt,
         gemini_service_tier=member.gemini_service_tier or config.llm_gemini_service_tier,
         gemini_safety_settings=_get_raw_config().llm_gemini_safety_settings,
         prompt_cache_enabled=config.llm_prompt_cache_enabled,
@@ -963,6 +971,51 @@ def _build_llm(
         return base
     extra = [_member_to_llm(m, config, defaults) for m in members]
     return MultiLLMProvider([base, *extra], strategy)
+
+
+async def verify_llm_connections(configs: "list[tuple[str, LLMConfig | MultiLLMProvider]]") -> None:
+    """Probe each startup LLM config, fail-open and bounded (#1166, #6136).
+
+    The probes run in parallel and each is capped at _LLM_PROBE_TIMEOUT_SECONDS:
+    a busy backend that queues the probe behind long jobs must not hold startup
+    for the whole model-init budget (and then fail it), since a failed probe only
+    warns anyway. A multi-LLM chain is probed member by member, so a slow failover
+    member never hides a healthy primary.
+
+    One probe per distinct provider/model/endpoint, deduped after chains are
+    expanded: an operation whose model is already queued (as a plain config or as a
+    chain member) adds nothing, while the same model on a second host (a common
+    failover setup) is still probed. Deduping chains by their primary, as before, skipped a chain's
+    failover members whenever another config shared that primary.
+    """
+
+    async def verify(config_name: str, llm_config: LLMConfig) -> None:
+        try:
+            await asyncio.wait_for(llm_config.verify_connection(), timeout=_LLM_PROBE_TIMEOUT_SECONDS)
+        except Exception as e:
+            reason = f"no answer within {_LLM_PROBE_TIMEOUT_SECONDS:g}s" if isinstance(e, TimeoutError) else str(e)
+            logger.warning(
+                "LLM connection verification failed for '%s' config: %s. "
+                "Server will start but LLM-dependent operations may fail "
+                "until the provider is available.",
+                config_name,
+                reason,
+            )
+
+    probes: list[tuple[str, LLMConfig]] = []
+    seen: set[tuple[str | None, str | None, str | None]] = set()
+    for name, cfg in configs:
+        members = (
+            [(f"{name} ({m.provider}/{m.model})", m) for m in cfg.members]
+            if isinstance(cfg, MultiLLMProvider)
+            else [(name, cfg)]
+        )
+        for probe_name, member in members:
+            key = (member.provider, member.model, member.base_url)
+            if key not in seen:
+                seen.add(key)
+                probes.append((probe_name, member))
+    await asyncio.gather(*(verify(name, cfg) for name, cfg in probes))
 
 
 async def validate_retain_batch_support(retain_llm_config: "LLMConfig | MultiLLMProvider", config: ConfigLike) -> None:
@@ -1752,6 +1805,13 @@ def _recall_scoring_now(question_date: datetime | None) -> datetime:
 # Logger for memory system
 logger = logging.getLogger(__name__)
 
+
+def _check_directive_priority(priority: int) -> None:
+    """Reject a priority the INT column cannot hold, before it reaches the database as a 500."""
+    if not DIRECTIVE_PRIORITY_MIN <= priority <= DIRECTIVE_PRIORITY_MAX:
+        raise ValueError(f"Invalid priority: {priority} is outside {DIRECTIVE_PRIORITY_MIN}..{DIRECTIVE_PRIORITY_MAX}")
+
+
 #: Sentinel for "the store has never seen this page", distinct from a page indexed with no
 #: timestamp — the two must not compare equal or a reconcile would skip a genuinely missing entry.
 _MISSING_FROM_INDEX = object()
@@ -1865,11 +1925,13 @@ class KnowledgeTagFilter:
         )
 
 
-#: Above this many new memories a delta refresh searches instead of asking about each:
-#: search and pruning are what handle volume, and the per-memory questions add up.
-# ponytail: one question per memory, run in parallel; batch several memories per request
-# if a burst this size turns out slow.
-_DELTA_GATE_MAX_MEMORIES = 200
+#: Questions one delta refresh keeps in flight. The decision model's own cap
+#: (HINDSIGHT_API_DECISION_MODEL_MAX_CONCURRENT) is per process and shared with recall and
+#: consolidation; without this a 200-memory refresh fills it alone, and on a rate-limited
+#: endpoint half its requests came back 429 (#6103).
+# ponytail: one question per memory, not batched: asked in one request the model blurs the
+# memories together and drops on-topic ones (1-13 of 20 kept, against 20 of 20 alone).
+_DELTA_GATE_MAX_CONCURRENT = 8
 
 
 @dataclass(frozen=True)
@@ -2035,34 +2097,6 @@ def _knowledge_tree_sort_key(row: Any) -> tuple[bool, int, str]:
     """ORDER BY sort_order, name (PostgreSQL ASC: NULL sort_order last), in Python."""
     sort_order = row["sort_order"]
     return (sort_order is None, sort_order or 0, row["name"] or "")
-
-
-def _may_need_refresh(last_refreshed_at: datetime | None, watermark: datetime | None) -> bool:
-    """Cheap half of staleness: rule a model current from the bank watermark alone.
-
-    False is exact — nothing in the bank has been written since the model last
-    read the memories, so nothing in its scope has either, and no scoped query is
-    needed. True means only that *something* was written, possibly outside the
-    model's tags, so it is a signal to go and ask
-    (:func:`_mental_model_stale_scope` plus the store's scoped check), never an
-    answer to report. Surfaces used to report it as "may need refresh" because
-    asking per model was expensive; they now ask the scoped question instead
-    (#3291), and this stays what it always was — a free way to skip it. Every
-    staleness caller runs it first (#4169): the scoped check is bounded by the
-    writes since the model's own watermark, so a model this settles is exactly the
-    one that would have paid the most to be asked.
-    """
-    if last_refreshed_at is None:
-        return True  # Never refreshed — nothing to be current with.
-    if watermark is None:
-        return False  # Empty bank.
-    # Oracle's TIMESTAMP columns come back naive while the bank watermark is aware;
-    # compare both in UTC, as engine/reflect/tools.py already does for last_refreshed_at.
-    if last_refreshed_at.tzinfo is None:
-        last_refreshed_at = last_refreshed_at.replace(tzinfo=UTC)
-    if watermark.tzinfo is None:
-        watermark = watermark.replace(tzinfo=UTC)
-    return watermark > last_refreshed_at
 
 
 def _mental_model_stale_scope(
@@ -3032,7 +3066,7 @@ class MemoryEngine(MemoryEngineInterface):
             ollama_num_ctx=config.llm_ollama_num_ctx,
             litellmrouter_config=config.llm_litellmrouter_config,
             bedrock_service_tier=config.llm_bedrock_service_tier,
-            structured_output_forced_tool=config.llm_structured_output_forced_tool,
+            structured_output_in_prompt=config.llm_structured_output_in_prompt,
             gemini_service_tier=config.llm_gemini_service_tier,
             groq_service_tier=config.llm_groq_service_tier,
             openai_service_tier=config.llm_openai_service_tier,
@@ -3081,7 +3115,7 @@ class MemoryEngine(MemoryEngineInterface):
             ollama_num_ctx=config.llm_ollama_num_ctx,
             litellmrouter_config=config.retain_llm_litellmrouter_config or config.llm_litellmrouter_config,
             bedrock_service_tier=config.llm_bedrock_service_tier,
-            structured_output_forced_tool=config.llm_structured_output_forced_tool,
+            structured_output_in_prompt=config.llm_structured_output_in_prompt,
             gemini_service_tier=config.llm_gemini_service_tier,
             groq_service_tier=config.llm_groq_service_tier,
             openai_service_tier=config.llm_openai_service_tier,
@@ -3103,6 +3137,16 @@ class MemoryEngine(MemoryEngineInterface):
         # more expensive for the text-only chunks that are the vast majority.
         if config.vlm_provider or config.vlm_model or config.vlm_api_key or config.vlm_base_url:
             vlm_provider = config.vlm_provider or retain_provider
+            # Each HINDSIGHT_API_VLM_* knob overrides its retain value. A vision
+            # model rarely wants the extraction model's settings: a small text
+            # model at `xhigh` made every image call run the vision model at
+            # `xhigh` too, past the retain timeout (#6202).
+            vlm_call_defaults = _LLMCallDefaults(
+                **{
+                    field: retain_value if (vlm_value := getattr(config, f"vlm_{field}")) is None else vlm_value
+                    for field, retain_value in retain_call_defaults.as_kwargs().items()
+                }
+            )
             _vlm_base_llm = LLMConfig(
                 provider=vlm_provider,
                 api_key=config.vlm_api_key or retain_api_key,
@@ -3115,14 +3159,18 @@ class MemoryEngine(MemoryEngineInterface):
                     or (_provider_default_base_url(vlm_provider) if config.vlm_provider else retain_base_url)
                 ),
                 model=config.vlm_model or retain_model,
-                reasoning_effort=config.retain_llm_reasoning_effort or config.llm_reasoning_effort,
-                extra_body=config.retain_llm_extra_body or config.llm_extra_body,
+                reasoning_effort=(
+                    config.vlm_reasoning_effort or config.retain_llm_reasoning_effort or config.llm_reasoning_effort
+                ),
+                extra_body=config.vlm_extra_body or config.retain_llm_extra_body or config.llm_extra_body,
                 default_headers=config.llm_default_headers,
-                cache_affinity=config.retain_llm_cache_affinity or config.llm_cache_affinity,
+                cache_affinity=config.vlm_cache_affinity
+                or config.retain_llm_cache_affinity
+                or config.llm_cache_affinity,
                 cache_affinity_header=config.retain_llm_cache_affinity_header or config.llm_cache_affinity_header,
                 ollama_num_ctx=config.llm_ollama_num_ctx,
                 bedrock_service_tier=config.llm_bedrock_service_tier,
-                structured_output_forced_tool=config.llm_structured_output_forced_tool,
+                structured_output_in_prompt=config.llm_structured_output_in_prompt,
                 gemini_service_tier=config.llm_gemini_service_tier,
                 groq_service_tier=config.llm_groq_service_tier,
                 openai_service_tier=config.llm_openai_service_tier,
@@ -3132,7 +3180,7 @@ class MemoryEngine(MemoryEngineInterface):
                 vertexai_project_id=config.llm_vertexai_project_id,
                 vertexai_region=config.llm_vertexai_region,
                 vertexai_service_account_key=config.llm_vertexai_service_account_key,
-                **retain_call_defaults.as_kwargs(),
+                **vlm_call_defaults.as_kwargs(),
             )
             # Deliberately NOT run through `_build_llm`: that would make the
             # vision model member 0 of the *retain* chain and append the retain
@@ -3179,7 +3227,7 @@ class MemoryEngine(MemoryEngineInterface):
             ollama_num_ctx=config.llm_ollama_num_ctx,
             litellmrouter_config=config.reflect_llm_litellmrouter_config or config.llm_litellmrouter_config,
             bedrock_service_tier=config.llm_bedrock_service_tier,
-            structured_output_forced_tool=config.llm_structured_output_forced_tool,
+            structured_output_in_prompt=config.llm_structured_output_in_prompt,
             gemini_service_tier=config.llm_gemini_service_tier,
             groq_service_tier=config.llm_groq_service_tier,
             openai_service_tier=config.llm_openai_service_tier,
@@ -3255,7 +3303,7 @@ class MemoryEngine(MemoryEngineInterface):
                     or config.llm_litellmrouter_config
                 ),
                 bedrock_service_tier=config.llm_bedrock_service_tier,
-                structured_output_forced_tool=config.llm_structured_output_forced_tool,
+                structured_output_in_prompt=config.llm_structured_output_in_prompt,
                 gemini_service_tier=config.llm_gemini_service_tier,
                 groq_service_tier=config.llm_groq_service_tier,
                 openai_service_tier=config.llm_openai_service_tier,
@@ -3304,7 +3352,7 @@ class MemoryEngine(MemoryEngineInterface):
             ollama_num_ctx=config.llm_ollama_num_ctx,
             litellmrouter_config=config.consolidation_llm_litellmrouter_config or config.llm_litellmrouter_config,
             bedrock_service_tier=config.llm_bedrock_service_tier,
-            structured_output_forced_tool=config.llm_structured_output_forced_tool,
+            structured_output_in_prompt=config.llm_structured_output_in_prompt,
             gemini_service_tier=config.llm_gemini_service_tier,
             groq_service_tier=config.llm_groq_service_tier,
             openai_service_tier=config.llm_openai_service_tier,
@@ -6151,34 +6199,15 @@ class MemoryEngine(MemoryEngineInterface):
             provider becomes available (e.g. after a quota reset).
             """
             if not self._skip_llm_verification:
-                # One probe per distinct provider/model: an operation whose config
-                # matches one already queued adds nothing.
-                configs_to_verify: list[tuple[str, LLMConfig | MultiLLMProvider]] = []
-                seen: set[tuple[str | None, str | None]] = set()
-                for config_name, llm_config in (
-                    ("default", self._llm_config),
-                    ("retain", self._retain_llm_config),
-                    ("reflect", self._reflect_llm_config),
-                    ("consolidation", self._consolidation_llm_config),
-                    ("mental model refresh", self._mental_model_refresh_llm_config),
-                ):
-                    key = (llm_config.provider, llm_config.model)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    configs_to_verify.append((config_name, llm_config))
-
-                for config_name, llm_config in configs_to_verify:
-                    try:
-                        await llm_config.verify_connection()
-                    except Exception as e:
-                        logger.warning(
-                            "LLM connection verification failed for '%s' config: %s. "
-                            "Server will start but LLM-dependent operations may fail "
-                            "until the provider is available.",
-                            config_name,
-                            e,
-                        )
+                await verify_llm_connections(
+                    [
+                        ("default", self._llm_config),
+                        ("retain", self._retain_llm_config),
+                        ("reflect", self._reflect_llm_config),
+                        ("consolidation", self._consolidation_llm_config),
+                        ("mental model refresh", self._mental_model_refresh_llm_config),
+                    ]
+                )
 
                 # Validate batch API compatibility: if retain_batch_enabled is
                 # set, the retain LLM configuration must actually be able to
@@ -6212,9 +6241,9 @@ class MemoryEngine(MemoryEngineInterface):
         except TimeoutError as e:
             raise RuntimeError(
                 f"Model/connection initialization did not complete within "
-                f"{init_timeout:g}s. A model load (embeddings/cross-encoder) or LLM "
-                f"verification is likely blocked — e.g. an offline model download or "
-                f"an unreachable provider. Increase {ENV_MODEL_INIT_TIMEOUT} if the "
+                f"{init_timeout:g}s. A model load (embeddings/cross-encoder) is "
+                f"likely blocked — e.g. an offline model download or an unreachable "
+                f"embeddings/reranker provider. Increase {ENV_MODEL_INIT_TIMEOUT} if the "
                 f"first-time model download legitimately needs more time."
             ) from e
 
@@ -8610,6 +8639,7 @@ class MemoryEngine(MemoryEngineInterface):
         *,
         carried: "Mapping[str, tuple[str | None, Sequence[str]]] | None" = None,
         observation_ids: "Sequence[str]" = (),
+        read_uncarried: bool = False,
     ) -> "dict[str, list[StoredAttachment]]":
         """The attachments each memory was actually drawn from, keyed by unit id.
 
@@ -8633,6 +8663,12 @@ class MemoryEngine(MemoryEngineInterface):
         rewriting an observation's sources, and a copy would go stale with them.
         ``observation_ids`` names which of ``unit_ids`` are observations — the caller
         already has each row's type, and only an observation pays for the source read.
+
+        ``read_uncarried`` is for a caller that holds memory ids and no rows -- a knowledge
+        page's stored evidence. For a store-owned bank, the non-observation memories it carried
+        nothing for are then read back from the store for their ids. Off by default: a caller
+        rendering store rows has already carried everything there is, and a read would cost a
+        store round trip on every recall.
         """
         if not unit_ids:
             return {}
@@ -8645,6 +8681,8 @@ class MemoryEngine(MemoryEngineInterface):
         wanted_observations = [u for u in wanted_units if u in observation_set]
         store_owned = store.store_owned_for(bank_id)
         refs: dict[str, list[AttachmentRef]] = {}
+        # The memories whose ids are read from the store rather than taken from ``carried``.
+        unread = wanted_units
         if store_owned:
             # Never `memory_units` for a store-owned bank. It holds none of the bank's memories,
             # so the read can only come back empty, and it is not a cheap empty read: the table
@@ -8658,7 +8696,12 @@ class MemoryEngine(MemoryEngineInterface):
                 for unit_id, (document_id, ids) in (carried or {}).items()
                 if unit_id in wanted_units and ids
             }
-            if not refs and not wanted_observations:
+            unread = (
+                [u for u in wanted_units if u not in observation_set and u not in (carried or {})]
+                if read_uncarried
+                else []
+            )
+            if not refs and not wanted_observations and not unread:
                 return {}
 
         profile = await self.get_bank_profile(bank_id, request_context=request_context)
@@ -8666,15 +8709,15 @@ class MemoryEngine(MemoryEngineInterface):
             return {}
         backend = await self._get_backend()
         async with backend.acquire() as conn:
-            if not store_owned:
-                refs = {
-                    unit_id: [ref]
+            if unread:
+                refs.update(
+                    (unit_id, [ref])
                     for unit_id, ref in (
                         await store.memory_attachment_refs(
-                            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=wanted_units
+                            conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=unread
                         )
                     ).items()
-                }
+                )
             if wanted_observations:
                 refs.update(await _observation_attachment_refs(conn, store, bank_id, wanted_observations))
             if not refs:
@@ -9284,6 +9327,10 @@ class MemoryEngine(MemoryEngineInterface):
         max_entity_tokens: int = 500,
         include_chunks: bool = False,
         max_chunk_tokens: int = 8192,
+        # None means "use the bank-resolved recall_decision_model_prune / _dedup", for every
+        # caller, internal ones included. Only a decision-model reranker acts on them.
+        prune: bool | None = None,
+        dedup: bool | None = None,
         include_source_facts: bool = False,
         max_source_facts_tokens: int = 4096,
         max_source_facts_tokens_per_observation: int = -1,
@@ -9339,6 +9386,11 @@ class MemoryEngine(MemoryEngineInterface):
                              Chunks are fetched in batches (estimated as (max_chunk_tokens // retain_chunk_size) * 2)
                              until the token budget is exhausted or all chunks are fetched.
                              This handles varying chunk sizes across documents.
+            prune: With a decision-model reranker, drop the candidates it judges no help.
+                   None resolves to the bank's recall_decision_model_prune config.
+            dedup: With a decision-model reranker, drop a candidate repeating a better-ranked
+                   one (one more decision-model request). None resolves to the bank's
+                   recall_decision_model_dedup config.
             tags: Optional list of tags for visibility filtering (OR matching - returns
                   memories that have at least one matching tag)
             created_after: Lower bound on the window, exclusive. Despite the name it bounds
@@ -9508,11 +9560,24 @@ class MemoryEngine(MemoryEngineInterface):
         reranking = _resolve_reranking(budget_config_dict, reranking)
         if prefer_observations is None:
             prefer_observations = bool(budget_config_dict.get("recall_prefer_observations", False))
+        if prune is None:
+            prune = bool(budget_config_dict.get("recall_decision_model_prune", False))
+        if dedup is None:
+            dedup = bool(budget_config_dict.get("recall_decision_model_dedup", False))
+
+        # One id for every log line of this recall, including a reranker failover
+        # warning, so concurrent recalls can be told apart (#6072). The uuid suffix
+        # keeps two recalls on the same bank within the same millisecond from
+        # colliding on the budgeted_operation key (`recall-{recall_id}`).
+        recall_id = f"{bank_id[:8]}-{int(time.time() * 1000) % 100000}-{uuid.uuid4().hex[:6]}"  # noqa: TID251
+        # Reset in the finally below: a reflect runs several recalls in one task, and a
+        # stale id would tag a later rerank with a recall that already finished.
+        recall_log_token = recall_log_id.set(recall_id)
 
         # Log recall start with tags if present (skip if quiet mode for internal operations)
         if not _quiet:
             tags_info = f", tags={tags} ({tags_match})" if tags else ""
-            logger.info(f"[RECALL {bank_id[:8]}] Starting recall for query: {query[:50]}...{tags_info}")
+            logger.info(f"[RECALL {recall_id}] Starting recall for query: {query[:50]}...{tags_info}")
 
         # Create parent span for recall operation
         from ..tracing import get_tracer
@@ -9560,6 +9625,8 @@ class MemoryEngine(MemoryEngineInterface):
                             request_context,
                             semaphore_wait=semaphore_wait,
                             prefer_observations=prefer_observations,
+                            prune=prune,
+                            dedup=dedup,
                             tags=tags,
                             tags_match=tags_match,
                             tag_groups=tag_groups,
@@ -9578,6 +9645,7 @@ class MemoryEngine(MemoryEngineInterface):
                             enable_text_search=enable_text_search,
                             enable_temporal_retrieval=enable_temporal_retrieval,
                             enable_graph_retrieval=enable_graph_retrieval,
+                            recall_id=recall_id,
                         )
                         get_metrics_collector().record_recall_phase(
                             "search_with_retries", time.perf_counter() - _t0_swr2, diagnostic=True
@@ -9715,6 +9783,32 @@ class MemoryEngine(MemoryEngineInterface):
             if recall_trace_token is not None:
                 reset_trace_context(recall_trace_token)
             recall_span_context.__exit__(None, None, None)
+            recall_log_id.reset(recall_log_token)
+
+    async def _candidate_embeddings(self, bank_id: str, unit_ids: list[str]) -> dict[str, np.ndarray] | None:
+        """The stored embeddings of ``unit_ids``, for recall's dedup to pick alike pairs.
+
+        ``None`` — the store keeps none here, or the read failed — makes dedup ask every pair:
+        it still works, at more questions, so a failure here never fails the recall.
+        """
+        from .memories import get_memories
+
+        try:
+            backend = await self._get_backend()
+            async with acquire_with_retry(backend) as conn:
+                rows = await get_memories().unit_embeddings(
+                    conn=conn, fq_table=fq_table, bank_id=bank_id, unit_ids=unit_ids
+                )
+            # pgvector text, "[0.1,0.2,...]". Parsed inside the try: a malformed row must not fail the recall.
+            vectors = {
+                row["id"]: np.array(row["embedding"][1:-1].split(","), dtype=np.float32)
+                for row in rows
+                if row["embedding"] is not None
+            }
+        except Exception:
+            logger.warning("recall dedup: embeddings unavailable, asking every pair", exc_info=True)
+            return None
+        return vectors or None
 
     async def _search_with_retries(
         self,
@@ -9732,6 +9826,8 @@ class MemoryEngine(MemoryEngineInterface):
         request_context: "RequestContext" = None,
         semaphore_wait: float = 0.0,
         prefer_observations: bool = False,
+        prune: bool = False,
+        dedup: bool = False,
         tags: list[str] | None = None,
         tags_match: TagsMatch = "any",
         tag_groups: list[TagGroup] | None = None,
@@ -9750,6 +9846,7 @@ class MemoryEngine(MemoryEngineInterface):
         enable_text_search: bool = True,
         enable_temporal_retrieval: bool = True,
         enable_graph_retrieval: bool = True,
+        recall_id: str = "",
     ) -> RecallResultModel:
         """
         Search implementation with modular retrieval and reranking.
@@ -9814,10 +9911,6 @@ class MemoryEngine(MemoryEngineInterface):
         recall_start = time.perf_counter()
 
         # Buffer logs for clean output in concurrent scenarios.
-        # Include a uuid suffix so two recalls on the same bank within the
-        # same millisecond don't collide on the budgeted_operation key
-        # (`recall-{recall_id}`), which would raise "Operation ... already exists".
-        recall_id = f"{bank_id[:8]}-{int(time.time() * 1000) % 100000}-{uuid.uuid4().hex[:6]}"  # noqa: TID251
         log_buffer = []
         tags_info = f", tags={tags}, tags_match={tags_match}" if tags else ""
         log_buffer.append(
@@ -10449,8 +10542,23 @@ class MemoryEngine(MemoryEngineInterface):
 
                     # Ensure reranker is initialized (for lazy initialization mode)
                     await reranker_instance.ensure_initialized()
+                    # Dedup asks only pairs whose stored embeddings are alike. The embeddings are
+                    # read while the ranking request runs, so they add no round trip: the reranker
+                    # awaits them only once the ranking answers are in.
+                    embeddings = None
+                    if dedup and getattr(reranker_instance.cross_encoder, "provider_name", None) == (
+                        DECISION_MODEL_RERANKER
+                    ):
+                        embeddings = asyncio.create_task(
+                            self._candidate_embeddings(bank_id, [mc.retrieval.id for mc in merged_candidates])
+                        )
                     reranked = await reranker_instance.rerank(
-                        query, merged_candidates, now=_recall_scoring_now(question_date)
+                        query,
+                        merged_candidates,
+                        now=_recall_scoring_now(question_date),
+                        prune=prune,
+                        dedup=dedup,
+                        embeddings=embeddings,
                     )
                     scored_results = reranked.results
                     # Copied off the call that produced these scores. Do not read
@@ -10580,6 +10688,8 @@ class MemoryEngine(MemoryEngineInterface):
                     for mc in merged_candidates
                 ]
                 tracer.add_reranked(results_dict, tracer_merged)
+            if get_config().recall_trace_reranker_provider:
+                tracer.reranker_provider = served_provider
             tracer.add_phase_metric(
                 "reranking",
                 step_duration,
@@ -11288,7 +11398,8 @@ class MemoryEngine(MemoryEngineInterface):
         request_context: "RequestContext",
     ) -> dict[str, int]:
         """
-        Delete a document and all its associated memory units and links.
+        Delete a document and all its associated memory units and links, plus its LLM request
+        history when ``HINDSIGHT_API_LLM_TRACE_DELETE_WITH_DOCUMENT`` is on.
 
         Args:
             document_id: Document ID to delete
@@ -11305,6 +11416,18 @@ class MemoryEngine(MemoryEngineInterface):
             )
             await self._validate_operation(self._operation_validator.validate_bank_write(ctx))
         await self._require_writable(bank_id, request_context, document_id=document_id)
+        # Opt-in (#6098): the prompts and answers that quote this document go with it instead of
+        # waiting for the retention sweep. PG-only table.
+        from .llm_trace import _llm_requests_persistable  # noqa: PLC0415
+
+        delete_traces = get_config().llm_trace_delete_with_document and _llm_requests_persistable()
+        if delete_traces:
+            # The recorder holds new rows for up to 0.5s before writing them: a retain answered just
+            # before this delete would otherwise land its row after the DELETE below and outlive the
+            # document. This only covers this process; a worker's in-flight calls can still land
+            # late, and the retention sweep removes those. The memory-id patches that follow a run
+            # need no fence: they UPDATE rows already written, so a late one finds nothing to patch.
+            await self._llm_recorder.flush()
         backend = await self._get_backend()
         invalidated_obs = 0
         async with acquire_with_retry(backend) as conn:
@@ -11360,6 +11483,25 @@ class MemoryEngine(MemoryEngineInterface):
                 )
                 deleted = _deleted_doc.deleted
                 file_storage_key = _deleted_doc.file_storage_key
+
+                # Its retain runs, and every run that created or consumed one of its memories,
+                # consolidation included.
+                if deleted and delete_traces:
+                    from .llm_trace import llm_requests_locked_in_id_order  # noqa: PLC0415
+
+                    _llm_table = fq_table("llm_requests")
+                    _traced = llm_requests_locked_in_id_order(
+                        _llm_table,
+                        "bank_id = $1 AND (metadata->>'document_id' = $2"
+                        " OR metadata->'memory_ids' ?| $3::text[]"
+                        " OR metadata->'source_memory_ids' ?| $3::text[])",
+                    )
+                    await conn.execute(
+                        f"{_traced} DELETE FROM {_llm_table} t USING target WHERE t.id = target.id",
+                        bank_id,
+                        document_id,
+                        [str(u) for u in unit_ids],
+                    )
 
                 # Invalidate observations referencing these (now-deleted) memories
                 if unit_ids:
@@ -12153,11 +12295,17 @@ class MemoryEngine(MemoryEngineInterface):
                             # The bank's request history holds its prompts and model output (memory
                             # text included) and has no FK to banks, so it goes with the bank rather
                             # than waiting for the retention sweep (#5839). PG-only table.
-                            from .llm_trace import _llm_requests_persistable  # noqa: PLC0415
+                            from .llm_trace import (  # noqa: PLC0415
+                                _llm_requests_persistable,
+                                llm_requests_locked_in_id_order,
+                            )
 
                             if _llm_requests_persistable():
+                                _llm_table = fq_table("llm_requests")
                                 await conn.execute(
-                                    f"DELETE FROM {fq_table('llm_requests')} WHERE bank_id = $1", bank_id
+                                    f"{llm_requests_locked_in_id_order(_llm_table, 'bank_id = $1')} "
+                                    f"DELETE FROM {_llm_table} t USING target WHERE t.id = target.id",
+                                    bank_id,
                                 )
                             # Delete the bank profile and retrieve internal_id for HNSW index cleanup
                             internal_id = await conn.fetchval(
@@ -12465,6 +12613,10 @@ class MemoryEngine(MemoryEngineInterface):
         Returns:
             Dictionary with count of deleted observations
         """
+        try:
+            memory_id = str(uuid.UUID(memory_id))
+        except ValueError:
+            raise ValueError(f"Invalid memory_id: '{memory_id}' is not a valid UUID") from None
         await self._authenticate_tenant(request_context)
         if self._operation_validator:
             ctx = BankWriteContext(
@@ -12900,6 +13052,12 @@ class MemoryEngine(MemoryEngineInterface):
 
                         # --- Apply edit (live rows only) ---
                         if edit_plan is not None and live2:
+                            # Sweep first, before the entity postings below are released: the
+                            # release locks this memory's row (#6229), and the sweep must take its
+                            # rows in its own id order with nothing of ours held, as every delete
+                            # path does (see delete_document). The sweep after the edit stays for
+                            # racing inserts.
+                            await self._delete_stale_observations_for_memories(conn, bank_id, [memory_id])
                             if edit_plan.entity_names_for_store is not None:
                                 # The store owns its entity registry: apply_edit below resolves + mints
                                 # these names and rewrites the memory's entity ids. There are no SQL
@@ -12930,6 +13088,11 @@ class MemoryEngine(MemoryEngineInterface):
                                         conn=conn,
                                         bank_id=bank_id,
                                     )
+                                    # Credit the new mentions and cooccurrences in this transaction.
+                                    # Nothing else ever flushed what Phase 1 resolution queued, so an
+                                    # edit's new postings were never counted; and a flush after commit
+                                    # would let a waiting edit release them first (#6229).
+                                    await self.entity_resolver.flush_pending_stats(conn=conn)
                                 edit_embedding = edit_plan.embedding
                             else:
                                 # Entities NOT changing: the precomputed embedding used the Phase-1
@@ -12951,9 +13114,6 @@ class MemoryEngine(MemoryEngineInterface):
                                     )
                                 else:
                                     edit_embedding = edit_plan.embedding
-                            # Sweep before this memory's row is written, in the sweep's lock order (see
-                            # delete_document); the sweep after the edit stays for racing inserts.
-                            await self._delete_stale_observations_for_memories(conn, bank_id, [memory_id])
                             # Capture relink victims before this memory's links change, then apply the
                             # field edit through the store: it resets consolidation, stamps the edit, and
                             # drops the derived links (rebuilt with victims — the edit leaves the unit
@@ -13060,6 +13220,9 @@ class MemoryEngine(MemoryEngineInterface):
 
                     phase2_committed = True
         finally:
+            # What Phase 1 resolution queued and Phase 2 did not flush (the edit did not apply)
+            # describes postings that were never written; drop it rather than leak it.
+            self.entity_resolver.discard_pending_stats()
             # Entities were resolved (and possibly autocommitted) in Phase 1 but the edit did not
             # durably apply (row concurrently invalidated → live2 None, or Phase 2 raised), so the
             # edit's own enqueues rolled back with it. Kick a job for whatever else the bank has
@@ -14150,6 +14313,14 @@ class MemoryEngine(MemoryEngineInterface):
             metadata=conn.parse_json(row["metadata"]) if row["metadata"] is not None else {},
         )
 
+    @staticmethod
+    def _llm_trace_retention_days() -> int | None:
+        """Days the maintenance sweep keeps LLM requests, or None when it never deletes them."""
+        cfg = get_config()
+        if cfg.retention_sweep_interval_seconds > 0 and cfg.llm_trace_enabled and cfg.llm_trace_retention_days > 0:
+            return cfg.llm_trace_retention_days
+        return None
+
     async def list_llm_requests(
         self,
         bank_id: str,
@@ -14191,7 +14362,14 @@ class MemoryEngine(MemoryEngineInterface):
             # llm_requests is PostgreSQL-only (its migration omits the Oracle slot;
             # LLMTraceRecorder skips writes on Oracle). There is nothing to read, so
             # return an empty page rather than querying a non-existent table (ORA-00942).
-            return LLMRequestListResponse(bank_id=bank_id, total=0, limit=limit, offset=offset, items=[])
+            return LLMRequestListResponse(
+                bank_id=bank_id,
+                total=0,
+                limit=limit,
+                offset=offset,
+                items=[],
+                retention_days=self._llm_trace_retention_days(),
+            )
 
         where_clauses = ["bank_id = $1"]
         params: list[Any] = [bank_id]
@@ -14289,7 +14467,14 @@ class MemoryEngine(MemoryEngineInterface):
 
             items = [self._llm_request_entry(conn, row) for row in rows]
 
-        return LLMRequestListResponse(bank_id=bank_id, total=total, limit=limit, offset=offset, items=items)
+        return LLMRequestListResponse(
+            bank_id=bank_id,
+            total=total,
+            limit=limit,
+            offset=offset,
+            items=items,
+            retention_days=self._llm_trace_retention_days(),
+        )
 
     async def llm_request_stats(
         self,
@@ -14299,8 +14484,9 @@ class MemoryEngine(MemoryEngineInterface):
         operation: str | None = None,
         call_type: str | None = None,
         period: str = "7d",
+        split_by: LLMStatsSplit | None = None,
     ) -> LLMRequestStatsResponse | None:
-        """LLM request counts and token sums grouped by day, for charting.
+        """LLM request counts and token sums by hour (1d) or by day (7d, 30d), for charting.
 
         Returns None when the bank does not exist (mapped to 404 by the HTTP
         layer). Auth/tenant resolution happen in ``get_bank_profile``.
@@ -14313,7 +14499,11 @@ class MemoryEngine(MemoryEngineInterface):
         now = datetime.now(timezone.utc)
         trunc = "day"
         if period == "1d":
-            start = now - timedelta(days=1)
+            # Last 24 hours by hour: with the default 1-day retention this is the
+            # only period that shows more than one point. Start on the hour so it
+            # is 24 buckets, not 25 with the first and last labelled the same.
+            trunc = "hour"
+            start = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=23)
         elif period == "30d":
             start = now - timedelta(days=30)
         else:  # 7d default
@@ -14322,7 +14512,12 @@ class MemoryEngine(MemoryEngineInterface):
         if _is_oracle():
             # llm_requests is PostgreSQL-only — no rows on Oracle (see list_llm_requests).
             return LLMRequestStatsResponse(
-                bank_id=bank_id, period=period, trunc=trunc, start=start.isoformat(), buckets=[]
+                bank_id=bank_id,
+                period=period,
+                trunc=trunc,
+                start=start.isoformat(),
+                buckets=[],
+                retention_days=self._llm_trace_retention_days(),
             )
 
         where_clauses = ["bank_id = $1", "started_at >= $2"]
@@ -14337,12 +14532,16 @@ class MemoryEngine(MemoryEngineInterface):
         where_sql = " AND ".join(where_clauses)
         table = fq_table("llm_requests")
 
+        # split_by is a Literal, so interpolating the column name is safe.
+        series_sql = f"COALESCE({split_by}, 'unknown')" if split_by else "''"
+
         backend = await self._get_backend()
         async with acquire_with_retry(backend) as conn:
             rows = await conn.fetch(
                 f"""
                 SELECT date_trunc('{trunc}', started_at) AS bucket,
                        status,
+                       {series_sql} AS series,
                        COUNT(*) AS count,
                        COALESCE(SUM(input_tokens), 0) AS input_tokens,
                        COALESCE(SUM(output_tokens), 0) AS output_tokens,
@@ -14351,7 +14550,7 @@ class MemoryEngine(MemoryEngineInterface):
                        COALESCE(SUM(total_tokens), 0) AS total_tokens
                 FROM {table}
                 WHERE {where_sql}
-                GROUP BY bucket, status
+                GROUP BY bucket, status, series
                 ORDER BY bucket ASC
                 """,
                 *params,
@@ -14362,14 +14561,21 @@ class MemoryEngine(MemoryEngineInterface):
         # typed models below.
         statuses_by_bucket: dict[str, dict[str, int]] = {}
         tokens_by_bucket: dict[str, dict[str, int]] = {}
+        series_by_bucket: dict[str, dict[str, LLMRequestSeriesSums]] = {}
         order: list[str] = []
         for row in rows:
             key = row["bucket"].isoformat()
             if key not in statuses_by_bucket:
                 statuses_by_bucket[key] = {}
                 tokens_by_bucket[key] = {"input": 0, "output": 0, "cached": 0, "thoughts": 0, "total": 0}
+                series_by_bucket[key] = {}
                 order.append(key)
-            statuses_by_bucket[key][row["status"]] = row["count"]
+            statuses = statuses_by_bucket[key]
+            statuses[row["status"]] = statuses.get(row["status"], 0) + row["count"]
+            if split_by:
+                sums = series_by_bucket[key].setdefault(row["series"], LLMRequestSeriesSums(calls=0, tokens=0))
+                sums.calls += row["count"]
+                sums.tokens += row["total_tokens"] + row["thoughts_tokens"]
             tok = tokens_by_bucket[key]
             tok["input"] += row["input_tokens"]
             tok["output"] += row["output_tokens"]
@@ -14382,12 +14588,14 @@ class MemoryEngine(MemoryEngineInterface):
             period=period,
             trunc=trunc,
             start=start.isoformat(),
+            retention_days=self._llm_trace_retention_days(),
             buckets=[
                 LLMRequestStatsBucket(
                     time=k,
                     statuses=statuses_by_bucket[k],
                     total=sum(statuses_by_bucket[k].values()),
                     tokens=LLMRequestTokenSums(**tokens_by_bucket[k]),
+                    series=series_by_bucket[k] if split_by else None,
                 )
                 for k in order
             ],
@@ -15594,18 +15802,18 @@ class MemoryEngine(MemoryEngineInterface):
         pool is shared across reflects. It is a TypeSafeCrossEncoder because pruning needs
         that class's rank-and-cut; the sufficiency question is one more call on it.
 
-        That client speaks only TypeSafe's System One endpoint, so another provider (cloudflare,
-        openai) leaves reflect on agent turns instead of failing every reflect's first round.
+        That client speaks only the System One endpoint (typesafe, hindsight), so another provider
+        (cloudflare, openai) leaves reflect on agent turns instead of failing every reflect's first round.
         """
         if self._reflect_decision_model_client is None:
             setup = get_config().decision_model_config("reflect")
             if setup is None:
                 return None
-            if setup.provider != "typesafe":
+            if setup.provider not in SYSTEM_ONE_DECISION_MODEL_PROVIDERS:
                 if not self._reflect_decision_model_unsupported_logged:
                     self._reflect_decision_model_unsupported_logged = True
                     logger.warning(
-                        "Reflect's decision model supports only the typesafe provider, not %r: "
+                        "Reflect's decision model supports only the typesafe and hindsight providers, not %r: "
                         "reflect keeps agent turns.",
                         setup.provider,
                     )
@@ -15623,6 +15831,11 @@ class MemoryEngine(MemoryEngineInterface):
                 shortlist=25,
                 min_keep=15,
             )
+            # Retried like the shared decision model (DecisionModel.ask): without it a single 429
+            # dropped the cut (every item kept) or the "is this enough?" verdict (an agent turn)
+            # for that round. On a shared endpoint under load it was 30% of reflects in a LoComo
+            # run, which then quietly answered like agent mode.
+            self._reflect_decision_model_client.retry_policy = RetryPolicy()
         return self._reflect_decision_model_client
 
     async def _prune_reflect_evidence(self, query: str, texts: list[str]) -> list[bool]:
@@ -17596,6 +17809,8 @@ class MemoryEngine(MemoryEngineInterface):
         Returns:
             The created pinned mental model dict
         """
+        if mental_model_id:
+            check_mental_model_id(mental_model_id)
         await self._authenticate_tenant(request_context)
         if self._operation_validator and not _nested_operation_authorized.get():
             if not self._consume_preauthorized_bank_write(
@@ -17783,8 +17998,9 @@ class MemoryEngine(MemoryEngineInterface):
         those reach the delta LLM call. None of them means no LLM call at all.
 
         None when the gate does not apply (the bank opted out, no decision model, a store
-        that cannot list, more memories than it is worth asking about) or a question failed:
-        the refresh then runs reflect as it always has.
+        that cannot list, more memories than HINDSIGHT_API_MENTAL_MODEL_DELTA_GATE_MAX_MEMORIES)
+        or a question failed before any answered: the refresh then runs reflect as it always
+        has. A question failing after that keeps its memory.
 
         Sibling pages are not offered, as reflect would: a sibling changes only when its
         own memories do, and the memories in this page's scope are already here.
@@ -17795,6 +18011,7 @@ class MemoryEngine(MemoryEngineInterface):
         resolved = await self._config_resolver.resolve_full_config(bank_id, request_context)
         if not resolved.mental_model_delta_use_decision_model:
             return None
+        max_memories = get_config().mental_model_delta_gate_max_memories
         from .memories import get_memories
 
         backend = await self._get_backend()
@@ -17805,29 +18022,49 @@ class MemoryEngine(MemoryEngineInterface):
                 bank_id=bank_id,
                 until=refresh_cutoff,
                 since=created_after,
-                limit=_DELTA_GATE_MAX_MEMORIES + 1,
+                limit=max_memories + 1,
                 fact_types=fact_types,
                 tags=tag_filtering.tags,
                 tags_match=tag_filtering.tags_match,
                 tag_groups=tag_filtering.tag_groups,
             )
-        if memories is None or len(memories) > _DELTA_GATE_MAX_MEMORIES:
+        if memories is None or len(memories) > max_memories:
             return None
+        slots = asyncio.Semaphore(_DELTA_GATE_MAX_CONCURRENT)
+        answered = False
+        failed = 0
+
+        async def ask(text: str) -> bool:
+            nonlocal answered, failed
+            async with slots:
+                try:
+                    verdict = await decision_model.could_change_page(source_query, current_content, text)
+                except Exception:
+                    # Nothing answered yet reads as the model being down: cancel the rest
+                    # and search. Once it has answered, a question that ran out of retries
+                    # is a "yes", as a doubt is: the memory goes to the LLM, the other
+                    # verdicts are kept.
+                    if not answered:
+                        raise
+                    failed += 1
+                    return True
+            answered = True
+            return verdict
+
         try:
-            # A TaskGroup, not gather: one failed question cancels the rest instead of
-            # letting up to 199 retry on their own for a result that is thrown away.
             # ponytail: these calls are not added to the refresh's usage or llm_calls, like
             # every other decision-model call; count them there if their cost needs watching.
             async with asyncio.TaskGroup() as group:
-                questions = [
-                    group.create_task(decision_model.could_change_page(source_query, current_content, m.text))
-                    for m in memories
-                ]
+                questions = [group.create_task(ask(m.text)) for m in memories]
             verdicts = [q.result() for q in questions]
         except Exception as exc:
             cause = exc.exceptions[0] if isinstance(exc, ExceptionGroup) else exc
             logger.warning(f"[MENTAL_MODELS] Delta gate failed ({cause!r}); searching instead")
             return None
+        if failed:
+            logger.warning(
+                f"[MENTAL_MODELS] Delta gate: {failed} of {len(memories)} questions failed; kept their memories"
+            )
         listed: dict[str, int] = {}
         kept: dict[str, list[MemoryFact]] = {}
         for memory, could_change in zip(memories, verdicts):
@@ -20920,72 +21157,63 @@ class MemoryEngine(MemoryEngineInterface):
         if scope is None:
             return True  # Never stamped with a watermark — nothing to be current with.
 
-        # The scoped existence check belongs to the store: it is a query over the
-        # memories, and the mental model's scope (tags, tag_groups, fact_types) is
-        # exactly what decides whether one of them changed since the last refresh.
-        # It is also the expensive half, so the bank-wide watermark is asked first
-        # and settles it outright whenever nothing has been written since this
-        # model read the memories — the same shortcut the batch variant takes, and
-        # the reason the cron loop and the consolidation flush, which come through
-        # here one model at a time, do not each pay for a scan.
-        from .memories import get_memories
-
-        if _may_need_refresh(scope.since, await self._bank_write_watermark(conn, bank_id)):
-            if await get_memories().any_memory_updated_since(
-                conn=conn,
-                fq_table=fq_table,
-                bank_id=bank_id,
-                since=scope.since,
-                fact_types=scope.fact_types,
-                tags=scope.tags,
-                tags_match=scope.tags_match,
-                tag_groups=scope.tag_groups,
-            ):
-                return True
-
-        # A memory that was *removed* raises no watermark — the row is simply not
-        # there — so the check above can never see one. That is why a page could
-        # keep stating a fact for as long as the bank stayed quiet: every staleness
-        # signal the system had was phrased over rows that still exist. Ask the
-        # complementary question too: does this document still cite anything that is
-        # gone? Deliberately second, so the common "already stale" answer costs
-        # nothing extra.
+        # Both halves are questions over the memories, so the store answers them in
+        # one call and may ask its parts concurrently:
         #
-        # Only the single-model path asks. The batch variant backs the polling
-        # display surfaces, where main made the whole set one round-trip; a
+        # - Has a memory in the model's scope (tags, tag_groups, fact_types) been
+        #   written since it last read the memories? The bank-wide watermark settles
+        #   this outright whenever nothing has been written at all, which is why the
+        #   cron loop and the consolidation flush, which come through here one model
+        #   at a time, do not each pay for a scan.
+        # - Does the document still cite anything that is gone? A memory that was
+        #   *removed* raises no watermark — the row is simply not there — so the
+        #   first question can never see one, and a page could keep stating a fact
+        #   for as long as the bank stayed quiet.
+        #
+        # Only the single-model path asks the second. The batch variant backs the
+        # polling display surfaces, where main made the whole set one round-trip; a
         # per-model grounding fetch would undo exactly that. The two refresh
         # triggers — the after-consolidation flush and the cron loop — both come
         # through here, so the refresh still fires; a page can briefly read
         # "up to date" in the list while a refresh for it is already queued.
-        return await self._has_retracted_grounding(conn, bank_id, _mm_row_field(mm_row, "id"))
-
-    async def _has_retracted_grounding(self, conn, bank_id: str, mental_model_id: Any) -> bool:
-        """Whether the model's stored grounding cites memories that no longer exist.
-
-        ``reflect_response`` is read here rather than being required on the row the
-        caller passed, so the staleness callers keep their narrow SELECTs and only a
-        model that already looks fresh pays for the extra fetch. Scope filters are
-        irrelevant: a fact this document was actually built on is in scope by
-        construction, whatever the model's tags say now.
-        """
         from .memories import get_memories
 
-        if mental_model_id is None:
-            return False
-        row = await conn.fetchrow(
-            f"SELECT reflect_response FROM {fq_table('mental_models')} WHERE bank_id = $1 AND id = $2",
-            bank_id,
-            mental_model_id,
+        cited_ids = await self._cited_fact_ids(conn, bank_id, mm_row)
+        return await get_memories().mental_model_is_stale(
+            conn=conn, fq_table=fq_table, bank_id=bank_id, scope=scope, cited_ids=cited_ids
         )
-        if row is None:
-            return False
-        reflect_response = row["reflect_response"]
+
+    async def _cited_fact_ids(self, conn, bank_id: str, mm_row: Any) -> list[str]:
+        """The memory ids the model's stored grounding cites.
+
+        Read off ``mm_row`` when the caller selected ``reflect_response`` (the full
+        read does), else fetched, so the staleness callers that keep a narrow SELECT
+        still work. Scope filters are irrelevant: a fact this document was actually
+        built on is in scope by construction, whatever the model's tags say now.
+        """
+        try:
+            reflect_response = mm_row["reflect_response"]
+        except (KeyError, IndexError, TypeError):
+            mental_model_id = _mm_row_field(mm_row, "id")
+            if mental_model_id is None:
+                return []
+            reflect_response = await conn.fetchval(
+                f"SELECT reflect_response FROM {fq_table('mental_models')} WHERE bank_id = $1 AND id = $2",
+                bank_id,
+                mental_model_id,
+            )
         if isinstance(reflect_response, str):
             try:
                 reflect_response = json.loads(reflect_response)
             except json.JSONDecodeError:
-                return False
-        cited_ids = based_on_fact_ids((reflect_response or {}).get("based_on"))
+                return []
+        return based_on_fact_ids((reflect_response or {}).get("based_on"))
+
+    async def _has_retracted_grounding(self, conn, bank_id: str, mental_model_id: Any) -> bool:
+        """Whether the model's stored grounding cites memories that no longer exist."""
+        from .memories import get_memories
+
+        cited_ids = await self._cited_fact_ids(conn, bank_id, {"id": mental_model_id})
         if not cited_ids:
             return False
         live_ids = await get_memories().live_memory_ids(
@@ -21515,6 +21743,10 @@ class MemoryEngine(MemoryEngineInterface):
         Returns:
             Directive dict or None if not found
         """
+        try:
+            directive_id = str(uuid.UUID(directive_id))
+        except ValueError:
+            raise ValueError(f"Invalid directive_id: '{directive_id}' is not a valid UUID") from None
         await self._authenticate_tenant(request_context)
         if self._operation_validator:
             ctx = BankReadContext(
@@ -21563,6 +21795,7 @@ class MemoryEngine(MemoryEngineInterface):
         Returns:
             The created directive dict
         """
+        _check_directive_priority(priority)
         await self._authenticate_tenant(request_context)
         if self._operation_validator:
             if not self._consume_preauthorized_bank_write(
@@ -21625,6 +21858,12 @@ class MemoryEngine(MemoryEngineInterface):
         Returns:
             Updated directive dict or None if not found
         """
+        if priority is not None:
+            _check_directive_priority(priority)
+        try:
+            directive_id = str(uuid.UUID(directive_id))
+        except ValueError:
+            raise ValueError(f"Invalid directive_id: '{directive_id}' is not a valid UUID") from None
         await self._authenticate_tenant(request_context)
         if self._operation_validator:
             if not self._consume_preauthorized_bank_write(
@@ -21705,6 +21944,10 @@ class MemoryEngine(MemoryEngineInterface):
         Returns:
             True if deleted, False if not found
         """
+        try:
+            directive_id = str(uuid.UUID(directive_id))
+        except ValueError:
+            raise ValueError(f"Invalid directive_id: '{directive_id}' is not a valid UUID") from None
         await self._authenticate_tenant(request_context)
         if self._operation_validator:
             ctx = BankWriteContext(
