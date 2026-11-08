@@ -556,6 +556,9 @@ class PostgresMemories(MemoriesExtension):
     async def consolidation_freshness(self, *, conn, fq_table, bank_id: str) -> dict[str, Any]:
         return await counts.consolidation_freshness(conn=conn, fq_table=fq_store_table, bank_id=bank_id)
 
+    async def has_pending_consolidation(self, *, conn, fq_table, bank_id: str) -> bool:
+        return await counts.has_pending_consolidation(conn=conn, fq_table=fq_store_table, bank_id=bank_id)
+
     async def document_memory_counts(self, *, conn, fq_table, bank_id: str, document_ids: list[str]) -> dict[str, int]:
         return await counts.document_memory_counts(
             conn=conn, fq_table=fq_store_table, bank_id=bank_id, document_ids=document_ids
@@ -954,10 +957,18 @@ class PostgresMemories(MemoriesExtension):
             conn=conn, ops=ops, fq_table=fq_store_table, bank_id=bank_id, document_id=document_id, unit_ids=unit_ids
         )
 
-    async def current_document_tags(self, *, conn, fq_table, bank_id: str, document_id: str) -> DocumentTags:
+    async def current_document_tags(
+        self, *, conn, fq_table, bank_id: str, document_id: str, for_update: bool = False
+    ) -> DocumentTags:
         return await documents.current_document_tags(
-            conn=conn, fq_table=fq_store_table, bank_id=bank_id, document_id=document_id
+            conn=conn, fq_table=fq_store_table, bank_id=bank_id, document_id=document_id, for_update=for_update
         )
+
+    async def existing_documents_tags(
+        self, *, conn, fq_table, bank_id: str, document_ids: list[str]
+    ) -> dict[str, list[str] | None]:
+        # A `documents` row always has tags (NULL reads as []), so found-without-tags never occurs.
+        return dict(await self.documents_tags(conn=conn, fq_table=fq_table, bank_id=bank_id, document_ids=document_ids))
 
     async def documents_tags(self, *, conn, fq_table, bank_id: str, document_ids: list[str]) -> dict[str, list[str]]:
         return await documents.documents_tags(
@@ -1211,9 +1222,11 @@ class PostgresMemories(MemoriesExtension):
             pool=backend, fq_table=fq_store_table, bank_id=bank_id, document_id=document_id, include_text=include_text
         )
 
-    async def load_existing_chunks(self, *, conn, fq_table, bank_id: str, document_id: str) -> list[ExistingChunk]:
+    async def load_existing_chunks(
+        self, *, conn, fq_table, bank_id: str, document_id: str, chunk_indices: list[int] | None = None
+    ) -> list[ExistingChunk]:
         return await pg_retain.load_existing_chunks(
-            conn=conn, fq_table=fq_store_table, bank_id=bank_id, document_id=document_id
+            conn=conn, fq_table=fq_store_table, bank_id=bank_id, document_id=document_id, chunk_indices=chunk_indices
         )
 
     async def current_document_hash(self, *, backend, fq_table, bank_id: str, document_id: str) -> str | None:

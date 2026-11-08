@@ -9,6 +9,16 @@ The Hindsight CLI provides command-line access to memory operations and bank man
 curl -fsSL https://hindsight.vectorize.io/get-cli | bash
 ```
 
+### Windows (x64)
+
+Each release ships `hindsight-windows-amd64.exe`. Download it from PowerShell, then move `hindsight.exe` to a folder on your `PATH`:
+
+```powershell
+Invoke-WebRequest https://github.com/vectorize-io/hindsight/releases/latest/download/hindsight-windows-amd64.exe -OutFile hindsight.exe
+```
+
+Configuration and profiles work the same as on Linux and macOS. `hindsight fs mount` works in the foreground; background mounts (`fs start`, `mount --detach`) are Unix-only. Windows ARM64 is not built.
+
 ## Configuration
 
 Configure the API URL:
@@ -246,6 +256,9 @@ hindsight document get my-cli-bank "$DOCUMENT_ID"
 
 # Replace a document's tags
 hindsight document update my-cli-bank "$DOCUMENT_ID" --tags project-x,meetings
+
+# Add or remove single tags, keeping the rest
+hindsight document update my-cli-bank "$DOCUMENT_ID" --add-tags team-c --remove-tags meetings
 
 # Delete document and its memories
 hindsight document delete my-cli-bank "$DOCUMENT_ID"

@@ -1392,9 +1392,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      HINDSIGHT_API_LLM_PROVIDER: vertexai
+      HINDSIGHT_API_LLM_PROVIDER: openai
+      HINDSIGHT_API_LLM_BASE_URL: https://inference.dev.hindsight.vectorize.io/v1
+      HINDSIGHT_API_LLM_API_KEY: ${{ secrets.HINDSIGHT_INFERENCE_DEV_API_KEY }}
+      HINDSIGHT_API_LLM_MODEL: gemma-4-26b-a4b
+      # One dev GPU serves all of CI: wait out "capacity is busy" (429) instead of failing.
+      HINDSIGHT_API_LLM_MAX_RETRIES: "8"
+      HINDSIGHT_API_LLM_INITIAL_BACKOFF: "2"
+      HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE: "false"
+      HINDSIGHT_API_VLM_PROVIDER: vertexai
+      HINDSIGHT_API_VLM_MODEL: google/gemini-2.5-flash-lite
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
-      HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
       HINDSIGHT_API_URL: http://localhost:8888
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -1506,6 +1514,13 @@ jobs:
         HINDSIGHT_API_LLM_MODEL=${{ env.HINDSIGHT_API_LLM_MODEL }}
         HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY=/tmp/gcp-credentials.json
         HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID
+        HINDSIGHT_API_LLM_BASE_URL=${{ env.HINDSIGHT_API_LLM_BASE_URL }}
+        HINDSIGHT_API_LLM_API_KEY=${{ env.HINDSIGHT_API_LLM_API_KEY }}
+        HINDSIGHT_API_LLM_MAX_RETRIES=${{ env.HINDSIGHT_API_LLM_MAX_RETRIES }}
+        HINDSIGHT_API_LLM_INITIAL_BACKOFF=${{ env.HINDSIGHT_API_LLM_INITIAL_BACKOFF }}
+        HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE=${{ env.HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE }}
+        HINDSIGHT_API_VLM_PROVIDER=${{ env.HINDSIGHT_API_VLM_PROVIDER }}
+        HINDSIGHT_API_VLM_MODEL=${{ env.HINDSIGHT_API_VLM_MODEL }}
         EOF
 
     - name: Start API server
@@ -1627,6 +1642,23 @@ jobs:
     - name: Run standalone start script tests
       run: bash docker/standalone/test-start-all.sh
 
+  test-setup-hooks-script:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.core == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Run setup-hooks script tests
+      run: ./scripts/test-setup-hooks.sh
+
   build-docker-images:
     needs: [detect-changes]
     if: >-
@@ -1724,13 +1756,29 @@ jobs:
     - name: Smoke test - verify container starts
       if: matrix.smoke
       env:
-        HINDSIGHT_API_LLM_PROVIDER: vertexai
-        HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
+        HINDSIGHT_API_LLM_PROVIDER: openai
+        HINDSIGHT_API_LLM_BASE_URL: https://inference.dev.hindsight.vectorize.io/v1
+        HINDSIGHT_API_LLM_API_KEY: ${{ secrets.HINDSIGHT_INFERENCE_DEV_API_KEY }}
+        HINDSIGHT_API_LLM_MODEL: gemma-4-26b-a4b
+        # One dev GPU serves all of CI: wait out "capacity is busy" (429) instead of failing.
+        HINDSIGHT_API_LLM_MAX_RETRIES: "8"
+        HINDSIGHT_API_LLM_INITIAL_BACKOFF: "2"
+        HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE: "false"
+        HINDSIGHT_API_VLM_PROVIDER: vertexai
+        HINDSIGHT_API_VLM_MODEL: google/gemini-2.5-flash-lite
         HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
         HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID: ${{ env.HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID }}
         HINDSIGHT_API_EMBEDDINGS_PROVIDER: cohere
         HINDSIGHT_API_RERANKER_PROVIDER: cohere
         HINDSIGHT_API_COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
+        # Cohere's edge sometimes 502s with "try again in 30 seconds"; the default 15s
+        # retry budget gives up before that (#6186). 0.5+1+2+4+8+16s of backoff covers it.
+        HINDSIGHT_API_EMBEDDINGS_MAX_RETRIES: "6"
+        HINDSIGHT_API_EMBEDDINGS_MAX_BACKOFF: "16"
+        HINDSIGHT_API_EMBEDDINGS_RETRY_BUDGET: "60"
+        HINDSIGHT_API_RERANKER_MAX_RETRIES: "6"
+        HINDSIGHT_API_RERANKER_MAX_BACKOFF: "16"
+        HINDSIGHT_API_RERANKER_RETRY_BUDGET: "60"
       run: ./docker/test-image.sh "hindsight-${{ matrix.name }}:test" "${{ matrix.target }}"
 
   test-api:
@@ -1752,9 +1800,17 @@ jobs:
         shard: [1, 2, 3]
     name: test-api (${{ matrix.shard }}/3)
     env:
-      HINDSIGHT_API_LLM_PROVIDER: vertexai
+      # No VLM slot here: the mock-LLM attachment tests assert that vision falls back
+      # to the retain LLM, and would otherwise send their fake images to Vertex.
+      HINDSIGHT_API_LLM_PROVIDER: openai
+      HINDSIGHT_API_LLM_BASE_URL: https://inference.dev.hindsight.vectorize.io/v1
+      HINDSIGHT_API_LLM_API_KEY: ${{ secrets.HINDSIGHT_INFERENCE_DEV_API_KEY }}
+      HINDSIGHT_API_LLM_MODEL: gemma-4-26b-a4b
+      HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE: "false"
+      # One dev GPU serves all of CI: wait out "capacity is busy" (429) instead of failing.
+      HINDSIGHT_API_LLM_MAX_RETRIES: "8"
+      HINDSIGHT_API_LLM_INITIAL_BACKOFF: "2"
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
-      HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
@@ -1870,21 +1926,24 @@ jobs:
     timeout-minutes: 30
     name: Core LLM tests
     env:
-      HINDSIGHT_API_LLM_PROVIDER: vertexai
-      HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
-      # gemini-3.1-flash-lite for this job only. Every test here asserts what the
-      # model chose to do, and 2.5-flash-lite is not reliable enough at the weakest
-      # of them to carry a gate: measured on this endpoint with the same prompt it
-      # kept a Japanese input in Japanese 3 times out of 10, against 10/10 for
-      # 3.1-flash-lite (test_retain_japanese_content, the largest single source of
-      # red runs here). The other jobs stay on 2.5-flash-lite — they exercise
-      # plumbing, not judgement.
-      #
-      # REGION: 3.1 is not served from us-central1 for this project (plain 404,
-      # "not found or your project does not have access"); the global endpoint
-      # serves it. us-east5 404s too, so this line is load-bearing.
-      HINDSIGHT_API_LLM_MODEL: google/gemini-3.1-flash-lite
+      # Main LLM: Gemma 4 on Hindsight Inference Dev, the model these judgement tests
+      # gate on (it replaced Vertex gemini-3.1-flash-lite). The judge stays on Gemini via
+      # GEMINI_API_KEY, so the model under test never grades itself.
+      HINDSIGHT_API_LLM_PROVIDER: openai
+      HINDSIGHT_API_LLM_BASE_URL: https://inference.dev.hindsight.vectorize.io/v1
+      HINDSIGHT_API_LLM_API_KEY: ${{ secrets.HINDSIGHT_INFERENCE_DEV_API_KEY }}
+      HINDSIGHT_API_LLM_MODEL: gemma-4-26b-a4b
+      # One dev GPU serves all of CI: wait out "capacity is busy" (429) instead of failing.
+      HINDSIGHT_API_LLM_MAX_RETRIES: "8"
+      HINDSIGHT_API_LLM_INITIAL_BACKOFF: "2"
+      # json_object mode makes Gemma open with an empty key ({"": "", "facts": []})
+      # about 1 time in 3; schema-in-prompt only was 20/20 on the temporal test.
+      HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE: "false"
+      # Attachments (images, PDFs) go to Gemini: the dev endpoint rejects 'file' parts.
+      HINDSIGHT_API_VLM_PROVIDER: vertexai
+      HINDSIGHT_API_VLM_MODEL: google/gemini-3.1-flash-lite
       HINDSIGHT_API_LLM_VERTEXAI_REGION: global
+      HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       # The real-LLM delta/retraction/cache evals gate on this flag *and* a key. The
       # key was already set here, so they sat skipped and the mental-model delta path —
@@ -2068,9 +2127,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      HINDSIGHT_API_LLM_PROVIDER: vertexai
+      # No VLM slot here: the mock-LLM attachment tests assert that vision falls back
+      # to the retain LLM, and would otherwise send their fake images to Vertex.
+      HINDSIGHT_API_LLM_PROVIDER: openai
+      HINDSIGHT_API_LLM_BASE_URL: https://inference.dev.hindsight.vectorize.io/v1
+      HINDSIGHT_API_LLM_API_KEY: ${{ secrets.HINDSIGHT_INFERENCE_DEV_API_KEY }}
+      HINDSIGHT_API_LLM_MODEL: gemma-4-26b-a4b
+      HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE: "false"
+      # One dev GPU serves all of CI: wait out "capacity is busy" (429) instead of failing.
+      HINDSIGHT_API_LLM_MAX_RETRIES: "8"
+      HINDSIGHT_API_LLM_INITIAL_BACKOFF: "2"
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
-      HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
@@ -2209,9 +2276,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      HINDSIGHT_API_LLM_PROVIDER: vertexai
+      HINDSIGHT_API_LLM_PROVIDER: openai
+      HINDSIGHT_API_LLM_BASE_URL: https://inference.dev.hindsight.vectorize.io/v1
+      HINDSIGHT_API_LLM_API_KEY: ${{ secrets.HINDSIGHT_INFERENCE_DEV_API_KEY }}
+      HINDSIGHT_API_LLM_MODEL: gemma-4-26b-a4b
+      # One dev GPU serves all of CI: wait out "capacity is busy" (429) instead of failing.
+      HINDSIGHT_API_LLM_MAX_RETRIES: "8"
+      HINDSIGHT_API_LLM_INITIAL_BACKOFF: "2"
+      HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE: "false"
+      HINDSIGHT_API_VLM_PROVIDER: vertexai
+      HINDSIGHT_API_VLM_MODEL: google/gemini-2.5-flash-lite
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
-      HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
       HINDSIGHT_API_URL: http://localhost:8888
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # Prefer CPU-only PyTorch in CI (but keep PyPI for everything else)
@@ -2281,6 +2356,13 @@ jobs:
         HINDSIGHT_API_LLM_MODEL=${{ env.HINDSIGHT_API_LLM_MODEL }}
         HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY=/tmp/gcp-credentials.json
         HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID
+        HINDSIGHT_API_LLM_BASE_URL=${{ env.HINDSIGHT_API_LLM_BASE_URL }}
+        HINDSIGHT_API_LLM_API_KEY=${{ env.HINDSIGHT_API_LLM_API_KEY }}
+        HINDSIGHT_API_LLM_MAX_RETRIES=${{ env.HINDSIGHT_API_LLM_MAX_RETRIES }}
+        HINDSIGHT_API_LLM_INITIAL_BACKOFF=${{ env.HINDSIGHT_API_LLM_INITIAL_BACKOFF }}
+        HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE=${{ env.HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE }}
+        HINDSIGHT_API_VLM_PROVIDER=${{ env.HINDSIGHT_API_VLM_PROVIDER }}
+        HINDSIGHT_API_VLM_MODEL=${{ env.HINDSIGHT_API_VLM_MODEL }}
         EOF
 
     - name: Start API server
@@ -2321,9 +2403,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      HINDSIGHT_API_LLM_PROVIDER: vertexai
+      HINDSIGHT_API_LLM_PROVIDER: openai
+      HINDSIGHT_API_LLM_BASE_URL: https://inference.dev.hindsight.vectorize.io/v1
+      HINDSIGHT_API_LLM_API_KEY: ${{ secrets.HINDSIGHT_INFERENCE_DEV_API_KEY }}
+      HINDSIGHT_API_LLM_MODEL: gemma-4-26b-a4b
+      # One dev GPU serves all of CI: wait out "capacity is busy" (429) instead of failing.
+      HINDSIGHT_API_LLM_MAX_RETRIES: "8"
+      HINDSIGHT_API_LLM_INITIAL_BACKOFF: "2"
+      HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE: "false"
+      HINDSIGHT_API_VLM_PROVIDER: vertexai
+      HINDSIGHT_API_VLM_MODEL: google/gemini-2.5-flash-lite
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
-      HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
       HINDSIGHT_API_URL: http://localhost:8888
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # Prefer CPU-only PyTorch in CI (but keep PyPI for everything else)
@@ -2398,6 +2488,13 @@ jobs:
         HINDSIGHT_API_LLM_MODEL=${{ env.HINDSIGHT_API_LLM_MODEL }}
         HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY=/tmp/gcp-credentials.json
         HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID
+        HINDSIGHT_API_LLM_BASE_URL=${{ env.HINDSIGHT_API_LLM_BASE_URL }}
+        HINDSIGHT_API_LLM_API_KEY=${{ env.HINDSIGHT_API_LLM_API_KEY }}
+        HINDSIGHT_API_LLM_MAX_RETRIES=${{ env.HINDSIGHT_API_LLM_MAX_RETRIES }}
+        HINDSIGHT_API_LLM_INITIAL_BACKOFF=${{ env.HINDSIGHT_API_LLM_INITIAL_BACKOFF }}
+        HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE=${{ env.HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE }}
+        HINDSIGHT_API_VLM_PROVIDER=${{ env.HINDSIGHT_API_VLM_PROVIDER }}
+        HINDSIGHT_API_VLM_MODEL=${{ env.HINDSIGHT_API_VLM_MODEL }}
         EOF
 
     - name: Start API server
@@ -2451,9 +2548,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      HINDSIGHT_API_LLM_PROVIDER: vertexai
+      HINDSIGHT_API_LLM_PROVIDER: openai
+      HINDSIGHT_API_LLM_BASE_URL: https://inference.dev.hindsight.vectorize.io/v1
+      HINDSIGHT_API_LLM_API_KEY: ${{ secrets.HINDSIGHT_INFERENCE_DEV_API_KEY }}
+      HINDSIGHT_API_LLM_MODEL: gemma-4-26b-a4b
+      # One dev GPU serves all of CI: wait out "capacity is busy" (429) instead of failing.
+      HINDSIGHT_API_LLM_MAX_RETRIES: "8"
+      HINDSIGHT_API_LLM_INITIAL_BACKOFF: "2"
+      HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE: "false"
+      HINDSIGHT_API_VLM_PROVIDER: vertexai
+      HINDSIGHT_API_VLM_MODEL: google/gemini-2.5-flash-lite
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
-      HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
       HINDSIGHT_API_URL: http://localhost:8888
       HINDSIGHT_API_DATABASE_BACKEND: oracle
       HINDSIGHT_API_DATABASE_URL: oracle+oracledb://hindsight_test:hindsight_test@localhost:1521/FREEPDB1
@@ -2587,6 +2692,13 @@ jobs:
         HINDSIGHT_API_LLM_MODEL=${{ env.HINDSIGHT_API_LLM_MODEL }}
         HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY=/tmp/gcp-credentials.json
         HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID
+        HINDSIGHT_API_LLM_BASE_URL=${{ env.HINDSIGHT_API_LLM_BASE_URL }}
+        HINDSIGHT_API_LLM_API_KEY=${{ env.HINDSIGHT_API_LLM_API_KEY }}
+        HINDSIGHT_API_LLM_MAX_RETRIES=${{ env.HINDSIGHT_API_LLM_MAX_RETRIES }}
+        HINDSIGHT_API_LLM_INITIAL_BACKOFF=${{ env.HINDSIGHT_API_LLM_INITIAL_BACKOFF }}
+        HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE=${{ env.HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE }}
+        HINDSIGHT_API_VLM_PROVIDER=${{ env.HINDSIGHT_API_VLM_PROVIDER }}
+        HINDSIGHT_API_VLM_MODEL=${{ env.HINDSIGHT_API_VLM_MODEL }}
         HINDSIGHT_API_DATABASE_BACKEND=${{ env.HINDSIGHT_API_DATABASE_BACKEND }}
         HINDSIGHT_API_DATABASE_URL=${{ env.HINDSIGHT_API_DATABASE_URL }}
         EOF
@@ -2632,9 +2744,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      HINDSIGHT_API_LLM_PROVIDER: vertexai
+      HINDSIGHT_API_LLM_PROVIDER: openai
+      HINDSIGHT_API_LLM_BASE_URL: https://inference.dev.hindsight.vectorize.io/v1
+      HINDSIGHT_API_LLM_API_KEY: ${{ secrets.HINDSIGHT_INFERENCE_DEV_API_KEY }}
+      HINDSIGHT_API_LLM_MODEL: gemma-4-26b-a4b
+      # One dev GPU serves all of CI: wait out "capacity is busy" (429) instead of failing.
+      HINDSIGHT_API_LLM_MAX_RETRIES: "8"
+      HINDSIGHT_API_LLM_INITIAL_BACKOFF: "2"
+      HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE: "false"
+      HINDSIGHT_API_VLM_PROVIDER: vertexai
+      HINDSIGHT_API_VLM_MODEL: google/gemini-2.5-flash-lite
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
-      HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
       HINDSIGHT_API_URL: http://localhost:8888
       HINDSIGHT_API_DATABASE_BACKEND: oracle
       HINDSIGHT_API_DATABASE_URL: oracle+oracledb://hindsight_test:hindsight_test@localhost:1521/FREEPDB1
@@ -2771,6 +2891,13 @@ jobs:
         HINDSIGHT_API_LLM_MODEL=${{ env.HINDSIGHT_API_LLM_MODEL }}
         HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY=/tmp/gcp-credentials.json
         HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID
+        HINDSIGHT_API_LLM_BASE_URL=${{ env.HINDSIGHT_API_LLM_BASE_URL }}
+        HINDSIGHT_API_LLM_API_KEY=${{ env.HINDSIGHT_API_LLM_API_KEY }}
+        HINDSIGHT_API_LLM_MAX_RETRIES=${{ env.HINDSIGHT_API_LLM_MAX_RETRIES }}
+        HINDSIGHT_API_LLM_INITIAL_BACKOFF=${{ env.HINDSIGHT_API_LLM_INITIAL_BACKOFF }}
+        HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE=${{ env.HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE }}
+        HINDSIGHT_API_VLM_PROVIDER=${{ env.HINDSIGHT_API_VLM_PROVIDER }}
+        HINDSIGHT_API_VLM_MODEL=${{ env.HINDSIGHT_API_VLM_MODEL }}
         HINDSIGHT_API_DATABASE_BACKEND=${{ env.HINDSIGHT_API_DATABASE_BACKEND }}
         HINDSIGHT_API_DATABASE_URL=${{ env.HINDSIGHT_API_DATABASE_URL }}
         EOF
@@ -2813,9 +2940,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      HINDSIGHT_API_LLM_PROVIDER: vertexai
+      HINDSIGHT_API_LLM_PROVIDER: openai
+      HINDSIGHT_API_LLM_BASE_URL: https://inference.dev.hindsight.vectorize.io/v1
+      HINDSIGHT_API_LLM_API_KEY: ${{ secrets.HINDSIGHT_INFERENCE_DEV_API_KEY }}
+      HINDSIGHT_API_LLM_MODEL: gemma-4-26b-a4b
+      # One dev GPU serves all of CI: wait out "capacity is busy" (429) instead of failing.
+      HINDSIGHT_API_LLM_MAX_RETRIES: "8"
+      HINDSIGHT_API_LLM_INITIAL_BACKOFF: "2"
+      HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE: "false"
+      HINDSIGHT_API_VLM_PROVIDER: vertexai
+      HINDSIGHT_API_VLM_MODEL: google/gemini-2.5-flash-lite
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
-      HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
       HINDSIGHT_API_URL: http://localhost:8888
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -2896,6 +3031,13 @@ jobs:
         HINDSIGHT_API_LLM_MODEL=${{ env.HINDSIGHT_API_LLM_MODEL }}
         HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY=/tmp/gcp-credentials.json
         HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID
+        HINDSIGHT_API_LLM_BASE_URL=${{ env.HINDSIGHT_API_LLM_BASE_URL }}
+        HINDSIGHT_API_LLM_API_KEY=${{ env.HINDSIGHT_API_LLM_API_KEY }}
+        HINDSIGHT_API_LLM_MAX_RETRIES=${{ env.HINDSIGHT_API_LLM_MAX_RETRIES }}
+        HINDSIGHT_API_LLM_INITIAL_BACKOFF=${{ env.HINDSIGHT_API_LLM_INITIAL_BACKOFF }}
+        HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE=${{ env.HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE }}
+        HINDSIGHT_API_VLM_PROVIDER=${{ env.HINDSIGHT_API_VLM_PROVIDER }}
+        HINDSIGHT_API_VLM_MODEL=${{ env.HINDSIGHT_API_VLM_MODEL }}
         EOF
 
     - name: Start API server
@@ -2957,6 +3099,48 @@ jobs:
       working-directory: hindsight-cli
       run: cargo build --release --target aarch64-unknown-linux-gnu
 
+  # Release ships a Windows CLI binary; build it on every CLI change so a
+  # Unix-only API surfaces here, not on release day. No server needed.
+  build-rust-cli-windows:
+    needs: [detect-changes]
+    if: >-
+      (github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.cli == 'true' ||
+      needs.detect-changes.outputs.ci == 'true')
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.event.pull_request.head.sha || '' }}
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo
+      uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          hindsight-cli/target
+        key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Build release binary
+      working-directory: hindsight-cli
+      run: cargo build --release
+
+    - name: Smoke-test the executable
+      shell: pwsh
+      run: |
+        $cli = './hindsight-cli/target/release/hindsight.exe'
+        & $cli --version
+        if ($LASTEXITCODE -ne 0) { throw '--version failed' }
+        foreach ($command in @('retain', 'recall', 'reflect')) {
+          & $cli memory $command --help
+          if ($LASTEXITCODE -ne 0) { throw "memory $command --help failed" }
+        }
+
   test-rust-client:
     needs: [detect-changes]
     if: >-
@@ -2968,9 +3152,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      HINDSIGHT_API_LLM_PROVIDER: vertexai
+      HINDSIGHT_API_LLM_PROVIDER: openai
+      HINDSIGHT_API_LLM_BASE_URL: https://inference.dev.hindsight.vectorize.io/v1
+      HINDSIGHT_API_LLM_API_KEY: ${{ secrets.HINDSIGHT_INFERENCE_DEV_API_KEY }}
+      HINDSIGHT_API_LLM_MODEL: gemma-4-26b-a4b
+      # One dev GPU serves all of CI: wait out "capacity is busy" (429) instead of failing.
+      HINDSIGHT_API_LLM_MAX_RETRIES: "8"
+      HINDSIGHT_API_LLM_INITIAL_BACKOFF: "2"
+      HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE: "false"
+      HINDSIGHT_API_VLM_PROVIDER: vertexai
+      HINDSIGHT_API_VLM_MODEL: google/gemini-2.5-flash-lite
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
-      HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
       HINDSIGHT_API_URL: http://localhost:8888
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # Prefer CPU-only PyTorch in CI (but keep PyPI for everything else)
@@ -3044,6 +3236,13 @@ jobs:
         HINDSIGHT_API_LLM_MODEL=${{ env.HINDSIGHT_API_LLM_MODEL }}
         HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY=/tmp/gcp-credentials.json
         HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID
+        HINDSIGHT_API_LLM_BASE_URL=${{ env.HINDSIGHT_API_LLM_BASE_URL }}
+        HINDSIGHT_API_LLM_API_KEY=${{ env.HINDSIGHT_API_LLM_API_KEY }}
+        HINDSIGHT_API_LLM_MAX_RETRIES=${{ env.HINDSIGHT_API_LLM_MAX_RETRIES }}
+        HINDSIGHT_API_LLM_INITIAL_BACKOFF=${{ env.HINDSIGHT_API_LLM_INITIAL_BACKOFF }}
+        HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE=${{ env.HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE }}
+        HINDSIGHT_API_VLM_PROVIDER=${{ env.HINDSIGHT_API_VLM_PROVIDER }}
+        HINDSIGHT_API_VLM_MODEL=${{ env.HINDSIGHT_API_VLM_MODEL }}
         EOF
 
     - name: Start API server
@@ -3084,9 +3283,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      HINDSIGHT_API_LLM_PROVIDER: vertexai
+      HINDSIGHT_API_LLM_PROVIDER: openai
+      HINDSIGHT_API_LLM_BASE_URL: https://inference.dev.hindsight.vectorize.io/v1
+      HINDSIGHT_API_LLM_API_KEY: ${{ secrets.HINDSIGHT_INFERENCE_DEV_API_KEY }}
+      HINDSIGHT_API_LLM_MODEL: gemma-4-26b-a4b
+      # One dev GPU serves all of CI: wait out "capacity is busy" (429) instead of failing.
+      HINDSIGHT_API_LLM_MAX_RETRIES: "8"
+      HINDSIGHT_API_LLM_INITIAL_BACKOFF: "2"
+      HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE: "false"
+      HINDSIGHT_API_VLM_PROVIDER: vertexai
+      HINDSIGHT_API_VLM_MODEL: google/gemini-2.5-flash-lite
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
-      HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
       HINDSIGHT_API_URL: http://localhost:8888
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # Prefer CPU-only PyTorch in CI (but keep PyPI for everything else)
@@ -3154,6 +3361,13 @@ jobs:
         HINDSIGHT_API_LLM_MODEL=${{ env.HINDSIGHT_API_LLM_MODEL }}
         HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY=/tmp/gcp-credentials.json
         HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID
+        HINDSIGHT_API_LLM_BASE_URL=${{ env.HINDSIGHT_API_LLM_BASE_URL }}
+        HINDSIGHT_API_LLM_API_KEY=${{ env.HINDSIGHT_API_LLM_API_KEY }}
+        HINDSIGHT_API_LLM_MAX_RETRIES=${{ env.HINDSIGHT_API_LLM_MAX_RETRIES }}
+        HINDSIGHT_API_LLM_INITIAL_BACKOFF=${{ env.HINDSIGHT_API_LLM_INITIAL_BACKOFF }}
+        HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE=${{ env.HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE }}
+        HINDSIGHT_API_VLM_PROVIDER=${{ env.HINDSIGHT_API_VLM_PROVIDER }}
+        HINDSIGHT_API_VLM_MODEL=${{ env.HINDSIGHT_API_VLM_MODEL }}
         EOF
 
     - name: Start API server
@@ -3199,9 +3413,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      HINDSIGHT_API_LLM_PROVIDER: vertexai
+      HINDSIGHT_API_LLM_PROVIDER: openai
+      HINDSIGHT_API_LLM_BASE_URL: https://inference.dev.hindsight.vectorize.io/v1
+      HINDSIGHT_API_LLM_API_KEY: ${{ secrets.HINDSIGHT_INFERENCE_DEV_API_KEY }}
+      HINDSIGHT_API_LLM_MODEL: gemma-4-26b-a4b
+      # One dev GPU serves all of CI: wait out "capacity is busy" (429) instead of failing.
+      HINDSIGHT_API_LLM_MAX_RETRIES: "8"
+      HINDSIGHT_API_LLM_INITIAL_BACKOFF: "2"
+      HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE: "false"
+      HINDSIGHT_API_VLM_PROVIDER: vertexai
+      HINDSIGHT_API_VLM_MODEL: google/gemini-2.5-flash-lite
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
-      HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
       HINDSIGHT_API_URL: http://localhost:8888
       HINDSIGHT_EMBED_PACKAGE_PATH: ${{ github.workspace }}/hindsight-embed
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -3289,6 +3511,13 @@ jobs:
         HINDSIGHT_API_LLM_MODEL=${{ env.HINDSIGHT_API_LLM_MODEL }}
         HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY=/tmp/gcp-credentials.json
         HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID
+        HINDSIGHT_API_LLM_BASE_URL=${{ env.HINDSIGHT_API_LLM_BASE_URL }}
+        HINDSIGHT_API_LLM_API_KEY=${{ env.HINDSIGHT_API_LLM_API_KEY }}
+        HINDSIGHT_API_LLM_MAX_RETRIES=${{ env.HINDSIGHT_API_LLM_MAX_RETRIES }}
+        HINDSIGHT_API_LLM_INITIAL_BACKOFF=${{ env.HINDSIGHT_API_LLM_INITIAL_BACKOFF }}
+        HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE=${{ env.HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE }}
+        HINDSIGHT_API_VLM_PROVIDER=${{ env.HINDSIGHT_API_VLM_PROVIDER }}
+        HINDSIGHT_API_VLM_MODEL=${{ env.HINDSIGHT_API_VLM_MODEL }}
         EOF
 
     - name: Start API server
@@ -3329,9 +3558,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      HINDSIGHT_API_LLM_PROVIDER: vertexai
+      HINDSIGHT_API_LLM_PROVIDER: openai
+      HINDSIGHT_API_LLM_BASE_URL: https://inference.dev.hindsight.vectorize.io/v1
+      HINDSIGHT_API_LLM_API_KEY: ${{ secrets.HINDSIGHT_INFERENCE_DEV_API_KEY }}
+      HINDSIGHT_API_LLM_MODEL: gemma-4-26b-a4b
+      # One dev GPU serves all of CI: wait out "capacity is busy" (429) instead of failing.
+      HINDSIGHT_API_LLM_MAX_RETRIES: "8"
+      HINDSIGHT_API_LLM_INITIAL_BACKOFF: "2"
+      HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE: "false"
+      HINDSIGHT_API_VLM_PROVIDER: vertexai
+      HINDSIGHT_API_VLM_MODEL: google/gemini-2.5-flash-lite
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
-      HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
       HINDSIGHT_API_URL: http://localhost:8888
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -3396,6 +3633,13 @@ jobs:
         HINDSIGHT_API_LLM_MODEL=${{ env.HINDSIGHT_API_LLM_MODEL }}
         HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY=/tmp/gcp-credentials.json
         HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID
+        HINDSIGHT_API_LLM_BASE_URL=${{ env.HINDSIGHT_API_LLM_BASE_URL }}
+        HINDSIGHT_API_LLM_API_KEY=${{ env.HINDSIGHT_API_LLM_API_KEY }}
+        HINDSIGHT_API_LLM_MAX_RETRIES=${{ env.HINDSIGHT_API_LLM_MAX_RETRIES }}
+        HINDSIGHT_API_LLM_INITIAL_BACKOFF=${{ env.HINDSIGHT_API_LLM_INITIAL_BACKOFF }}
+        HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE=${{ env.HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE }}
+        HINDSIGHT_API_VLM_PROVIDER=${{ env.HINDSIGHT_API_VLM_PROVIDER }}
+        HINDSIGHT_API_VLM_MODEL=${{ env.HINDSIGHT_API_VLM_MODEL }}
         EOF
 
     - name: Start API server
@@ -4527,9 +4771,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      HINDSIGHT_API_LLM_PROVIDER: vertexai
+      HINDSIGHT_API_LLM_PROVIDER: openai
+      HINDSIGHT_API_LLM_BASE_URL: https://inference.dev.hindsight.vectorize.io/v1
+      HINDSIGHT_API_LLM_API_KEY: ${{ secrets.HINDSIGHT_INFERENCE_DEV_API_KEY }}
+      HINDSIGHT_API_LLM_MODEL: gemma-4-26b-a4b
+      # One dev GPU serves all of CI: wait out "capacity is busy" (429) instead of failing.
+      HINDSIGHT_API_LLM_MAX_RETRIES: "8"
+      HINDSIGHT_API_LLM_INITIAL_BACKOFF: "2"
+      HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE: "false"
+      HINDSIGHT_API_VLM_PROVIDER: vertexai
+      HINDSIGHT_API_VLM_MODEL: google/gemini-2.5-flash-lite
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
-      HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
       HINDSIGHT_API_EMBEDDINGS_PROVIDER: cohere
       HINDSIGHT_API_RERANKER_PROVIDER: cohere
       HINDSIGHT_API_COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
@@ -4640,9 +4892,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      HINDSIGHT_API_LLM_PROVIDER: vertexai
+      HINDSIGHT_API_LLM_PROVIDER: openai
+      HINDSIGHT_API_LLM_BASE_URL: https://inference.dev.hindsight.vectorize.io/v1
+      HINDSIGHT_API_LLM_API_KEY: ${{ secrets.HINDSIGHT_INFERENCE_DEV_API_KEY }}
+      HINDSIGHT_API_LLM_MODEL: gemma-4-26b-a4b
+      # One dev GPU serves all of CI: wait out "capacity is busy" (429) instead of failing.
+      HINDSIGHT_API_LLM_MAX_RETRIES: "8"
+      HINDSIGHT_API_LLM_INITIAL_BACKOFF: "2"
+      HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE: "false"
+      HINDSIGHT_API_VLM_PROVIDER: vertexai
+      HINDSIGHT_API_VLM_MODEL: google/gemini-2.5-flash-lite
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
-      HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
       # Prefer CPU-only PyTorch in CI
 
     steps:
@@ -4708,9 +4968,17 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     env:
-      HINDSIGHT_API_LLM_PROVIDER: vertexai
+      HINDSIGHT_API_LLM_PROVIDER: openai
+      HINDSIGHT_API_LLM_BASE_URL: https://inference.dev.hindsight.vectorize.io/v1
+      HINDSIGHT_API_LLM_API_KEY: ${{ secrets.HINDSIGHT_INFERENCE_DEV_API_KEY }}
+      HINDSIGHT_API_LLM_MODEL: gemma-4-26b-a4b
+      # One dev GPU serves all of CI: wait out "capacity is busy" (429) instead of failing.
+      HINDSIGHT_API_LLM_MAX_RETRIES: "8"
+      HINDSIGHT_API_LLM_INITIAL_BACKOFF: "2"
+      HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE: "false"
+      HINDSIGHT_API_VLM_PROVIDER: vertexai
+      HINDSIGHT_API_VLM_MODEL: google/gemini-2.5-flash-lite
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: ${{ github.workspace }}/gcp-credentials.json
-      HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
       # Force UTF-8 I/O so the CLI's ✓/box-drawing output doesn't crash the
       # default Windows cp1252 codec. Also applied at runtime via
       # sys.stdout.reconfigure in cli.py; this belt-and-suspenders covers
@@ -4951,13 +5219,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      HINDSIGHT_API_LLM_PROVIDER: vertexai
+      HINDSIGHT_API_LLM_PROVIDER: openai
+      HINDSIGHT_API_LLM_BASE_URL: https://inference.dev.hindsight.vectorize.io/v1
+      HINDSIGHT_API_LLM_API_KEY: ${{ secrets.HINDSIGHT_INFERENCE_DEV_API_KEY }}
+      HINDSIGHT_API_LLM_MODEL: gemma-4-26b-a4b
+      # One dev GPU serves all of CI: wait out "capacity is busy" (429) instead of failing.
+      HINDSIGHT_API_LLM_MAX_RETRIES: "8"
+      HINDSIGHT_API_LLM_INITIAL_BACKOFF: "2"
+      HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE: "false"
+      HINDSIGHT_API_VLM_PROVIDER: vertexai
+      HINDSIGHT_API_VLM_MODEL: google/gemini-2.5-flash-lite
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
-      HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
       # For test_server_integration.py compatibility
-      HINDSIGHT_LLM_PROVIDER: vertexai
-      HINDSIGHT_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
-      HINDSIGHT_LLM_MODEL: google/gemini-2.5-flash-lite
+      HINDSIGHT_LLM_PROVIDER: openai
+      HINDSIGHT_LLM_BASE_URL: https://inference.dev.hindsight.vectorize.io/v1
+      HINDSIGHT_LLM_API_KEY: ${{ secrets.HINDSIGHT_INFERENCE_DEV_API_KEY }}
+      HINDSIGHT_LLM_MODEL: gemma-4-26b-a4b
       # Prefer CPU-only PyTorch in CI
 
     steps:
@@ -5051,9 +5328,17 @@ jobs:
         language: [python, node, cli, go]
     name: test-doc-examples (${{ matrix.language }})
     env:
-      HINDSIGHT_API_LLM_PROVIDER: vertexai
+      HINDSIGHT_API_LLM_PROVIDER: openai
+      HINDSIGHT_API_LLM_BASE_URL: https://inference.dev.hindsight.vectorize.io/v1
+      HINDSIGHT_API_LLM_API_KEY: ${{ secrets.HINDSIGHT_INFERENCE_DEV_API_KEY }}
+      HINDSIGHT_API_LLM_MODEL: gemma-4-26b-a4b
+      # One dev GPU serves all of CI: wait out "capacity is busy" (429) instead of failing.
+      HINDSIGHT_API_LLM_MAX_RETRIES: "8"
+      HINDSIGHT_API_LLM_INITIAL_BACKOFF: "2"
+      HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE: "false"
+      HINDSIGHT_API_VLM_PROVIDER: vertexai
+      HINDSIGHT_API_VLM_MODEL: google/gemini-2.5-flash-lite
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
-      HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
       HINDSIGHT_API_URL: http://localhost:8888
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -5152,6 +5437,13 @@ jobs:
         HINDSIGHT_API_LLM_MODEL=${{ env.HINDSIGHT_API_LLM_MODEL }}
         HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY=/tmp/gcp-credentials.json
         HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID
+        HINDSIGHT_API_LLM_BASE_URL=${{ env.HINDSIGHT_API_LLM_BASE_URL }}
+        HINDSIGHT_API_LLM_API_KEY=${{ env.HINDSIGHT_API_LLM_API_KEY }}
+        HINDSIGHT_API_LLM_MAX_RETRIES=${{ env.HINDSIGHT_API_LLM_MAX_RETRIES }}
+        HINDSIGHT_API_LLM_INITIAL_BACKOFF=${{ env.HINDSIGHT_API_LLM_INITIAL_BACKOFF }}
+        HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE=${{ env.HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE }}
+        HINDSIGHT_API_VLM_PROVIDER=${{ env.HINDSIGHT_API_VLM_PROVIDER }}
+        HINDSIGHT_API_VLM_MODEL=${{ env.HINDSIGHT_API_VLM_MODEL }}
         EOF
 
     - name: Start API server
@@ -5195,9 +5487,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      HINDSIGHT_API_LLM_PROVIDER: vertexai
+      HINDSIGHT_API_LLM_PROVIDER: openai
+      HINDSIGHT_API_LLM_BASE_URL: https://inference.dev.hindsight.vectorize.io/v1
+      HINDSIGHT_API_LLM_API_KEY: ${{ secrets.HINDSIGHT_INFERENCE_DEV_API_KEY }}
+      HINDSIGHT_API_LLM_MODEL: gemma-4-26b-a4b
+      # One dev GPU serves all of CI: wait out "capacity is busy" (429) instead of failing.
+      HINDSIGHT_API_LLM_MAX_RETRIES: "8"
+      HINDSIGHT_API_LLM_INITIAL_BACKOFF: "2"
+      HINDSIGHT_API_LLM_OPENAI_COMPATIBLE_JSON_MODE: "false"
+      HINDSIGHT_API_VLM_PROVIDER: vertexai
+      HINDSIGHT_API_VLM_MODEL: google/gemini-2.5-flash-lite
       HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
-      HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
@@ -5623,6 +5923,7 @@ jobs:
       - test-rust-cli
       - lint-helm-chart
       - test-standalone-start-script
+      - test-setup-hooks-script
       - build-docker-images
       - test-api
       - test-api-oracle
@@ -5632,6 +5933,7 @@ jobs:
       - test-typescript-client-oracle
       - test-typescript-client-deno
       - build-rust-cli-arm64
+      - build-rust-cli-windows
       - test-rust-client
       - test-go-client
       - test-openclaw-integration

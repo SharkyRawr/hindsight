@@ -347,11 +347,15 @@ async def delete_document_rows(
 
 
 async def current_document_tags(
-    *, conn, fq_table: Callable[[str], str], bank_id: str, document_id: str
+    *, conn, fq_table: Callable[[str], str], bank_id: str, document_id: str, for_update: bool = False
 ) -> DocumentTags:
-    """The tags the `documents` row carries; ``found=False`` when there is no row."""
+    """The tags the `documents` row carries; ``found=False`` when there is no row.
+
+    ``for_update`` row-locks the document until the caller's transaction ends.
+    """
+    _lock = " FOR UPDATE" if for_update else ""
     _doc_row = await conn.fetchrow(
-        f"SELECT tags FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2",
+        f"SELECT tags FROM {fq_table('documents')} WHERE id = $1 AND bank_id = $2{_lock}",
         document_id,
         bank_id,
     )
@@ -363,13 +367,18 @@ async def current_document_tags(
 async def documents_tags(
     *, conn, fq_table: Callable[[str], str], bank_id: str, document_ids: list[str]
 ) -> dict[str, list[str]]:
-    """document id -> its `documents.tags`, for the ids that have a row in this bank."""
-    rows = await conn.fetch(
-        f"SELECT id, tags FROM {fq_table('documents')} WHERE id = ANY($1) AND bank_id = $2",
-        document_ids,
-        bank_id,
-    )
-    return {row["id"]: list(row["tags"] or []) for row in rows}
+    """document id -> its `documents.tags`, for the ids that have a row in this bank.
+
+    Read in groups of 1,000: Oracle expands ``= ANY`` into an IN list, which caps at 1,000."""
+    out: dict[str, list[str]] = {}
+    for start in range(0, len(document_ids), 1000):
+        rows = await conn.fetch(
+            f"SELECT id, tags FROM {fq_table('documents')} WHERE id = ANY($1) AND bank_id = $2",
+            document_ids[start : start + 1000],
+            bank_id,
+        )
+        out.update({row["id"]: list(row["tags"] or []) for row in rows})
+    return out
 
 
 async def update_document_tags(

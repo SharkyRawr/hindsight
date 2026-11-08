@@ -340,6 +340,18 @@ def test_build_labels_prompt_section_generates_key_values():
     assert "multi" in result  # prompt mentions multi-value nature
 
 
+def test_build_labels_prompt_section_shows_an_open_vocabulary_example_only_for_free_text_groups():
+    """The example teaches filling a label that repeats an entity; closed value lists don't need it."""
+    from hindsight_api.engine.retain.fact_extraction import _build_labels_prompt_section
+
+    free_text = EntityLabelsConfig(attributes=[LabelGroup(key="name", type="multi-text", description="Names")])
+    closed = EntityLabelsConfig(attributes=[LabelGroup(key="topic", values=[LabelValue(value="math")])])
+
+    assert '["PostgreSQL", "Postgres", "PG"]' in _build_labels_prompt_section(free_text)
+    assert "PostgreSQL" not in _build_labels_prompt_section(closed)
+    assert "even when the same words are also in the fact text" in _build_labels_prompt_section(closed)
+
+
 def test_build_labels_prompt_section_free_form_true():
     from hindsight_api.engine.retain.fact_extraction import _build_labels_prompt_section
 
@@ -400,6 +412,19 @@ def test_augment_texts_with_entities():
     assert "user" in augmented[0]
     # Original fact text should be present
     assert "User attended workshop" in augmented[0]
+
+
+def test_augment_texts_entities_are_order_independent():
+    """Every embed path reads entity names in its own order; the embedded text must not care."""
+    from hindsight_api.engine.retain.embedding_processing import augment_texts_with_dates
+    from hindsight_api.engine.retain.types import ExtractedFact
+
+    def facts(names):
+        return [ExtractedFact(fact_text="Bob met Alice", fact_type="world", entities=names)]
+
+    a = augment_texts_with_dates(facts(["Bob", "Alice", "Bob"]), str)
+    b = augment_texts_with_dates(facts(["Alice", "Bob"]), str)
+    assert a == b == ["Bob met Alice [Alice, Bob]"]
 
 
 # ─── _inject_label_tags ───────────────────────────────────────────────────────
@@ -2094,9 +2119,9 @@ async def test_entity_resolution_does_not_merge_distinct_label_values(memory, re
     With the 0.6 merge threshold and temporal/co-occurrence boosts, the resolver
     might incorrectly merge them into a single entity.
     """
-    from hindsight_api.engine.schema import fq_store_table
     from hindsight_api.engine.retain.entity_processing import resolve_entities
     from hindsight_api.engine.retain.types import EntityRef, ProcessedFact
+    from hindsight_api.engine.schema import fq_store_table
 
     bank_id = f"test-1558-resolve-{uuid.uuid4().hex[:8]}"
     try:

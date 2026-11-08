@@ -1097,6 +1097,8 @@ class EntityResolverHandle(Protocol):
 
     def discard_pending_stats(self) -> None: ...
 
+    def forget_pending_mentions(self, entity_ids: list[str]) -> None: ...
+
     async def flush_pending_stats(self, conn: Any | None = None) -> None: ...
 
     async def reassert_entities_batch(self, bank_id: str, resolved_entities: list[Any], conn) -> None: ...
@@ -1519,10 +1521,18 @@ class MemoriesExtension(Extension, ABC):
         file_content_type: str = "",
         file_original_name: str = "",
         expect_content_hash: "str | None" = None,
+        keep_chunk_text: bool = True,
     ) -> None:
         """Store (or replace) a document's bodies: its extracted text, its ordered chunk texts, and
         optionally the original uploaded file. Idempotent by content — re-ingest re-uploads only
         what changed.
+
+        ``keep_chunk_text=False`` is a bank with ``store_document_text`` off: the store keeps each
+        chunk's hash, computed from the text passed here, but not the text, and every chunk reads
+        back as empty — what the SQL path stores. The hashes are what delta retain diffs a re-send
+        against, so they must be those of the real text. A caller restoring a prefix it cannot read
+        back (see ``_store_document_bodies``) passes those chunks as ``""``, and the store keeps
+        their hashes from the record being replaced.
 
         ``chunk_texts`` REPLACES the document's chunk list, so a caller holding only part of a
         document (a retain sub-batch) must send the whole list, not its slice — see
@@ -2332,6 +2342,11 @@ class MemoriesExtension(Extension, ABC):
         """
         raise NotImplementedError
 
+    async def has_pending_consolidation(self, *, conn, fq_table, bank_id: str) -> bool:
+        """Whether the bank has any facts that can still be consolidated."""
+        freshness = await self.consolidation_freshness(conn=conn, fq_table=fq_table, bank_id=bank_id)
+        return bool(freshness.get("pending"))
+
     async def document_memory_counts(self, *, conn, fq_table, bank_id: str, document_ids: list[str]) -> dict[str, int]:
         """Live memory count per document id, for the documents named. Absent = 0."""
         raise NotImplementedError
@@ -3075,8 +3090,15 @@ class MemoriesExtension(Extension, ABC):
         await self.delete_document_record(bank_id=bank_id, document_id=document_id)
         return DeletedDocument(deleted=_record is not None, file_storage_key=file_storage_key)
 
-    async def current_document_tags(self, *, conn, fq_table, bank_id: str, document_id: str) -> DocumentTags:
+    async def current_document_tags(
+        self, *, conn, fq_table, bank_id: str, document_id: str, for_update: bool = False
+    ) -> DocumentTags:
         """The tags a document carries now, read before a retag overwrites them.
+
+        ``for_update`` asks the store to hold the document until ``conn``'s transaction ends, so
+        a tag change decided from this read (a partial add/remove, or whether a full write must
+        retag the memories) is not undone by a concurrent one. The default record-based read
+        cannot lock and ignores it.
 
         Default: the store's record. A record that does not carry a "tags" key at all is
         unreadable for this purpose, not empty — collapsing it to [] would read a PATCH of []
@@ -3086,6 +3108,25 @@ class MemoriesExtension(Extension, ABC):
             found=_record is not None,
             tags=list(_record["tags"] or []) if _record is not None and "tags" in _record else None,
         )
+
+    async def existing_documents_tags(
+        self, *, conn, fq_table, bank_id: str, document_ids: list[str]
+    ) -> dict[str, list[str] | None]:
+        """document id -> its tags, for the ids that exist; ``None`` when the record exists but
+        carries no tags (same meaning as :meth:`current_document_tags`). Read to check a retain
+        batch's writes into existing documents, so an id left out is a new document.
+
+        Default: :meth:`current_document_tags` per id. Not :meth:`documents_tags`: that one
+        leaves out a record without a "tags" key, so a restricted writer's retain would read it
+        as a new document and be let through (#6327). Postgres reads all the rows at once."""
+        out: dict[str, list[str] | None] = {}
+        for document_id in document_ids:
+            current = await self.current_document_tags(
+                conn=conn, fq_table=fq_table, bank_id=bank_id, document_id=document_id
+            )
+            if current.found:
+                out[document_id] = current.tags
+        return out
 
     async def documents_tags(self, *, conn, fq_table, bank_id: str, document_ids: list[str]) -> dict[str, list[str]]:
         """document id -> the tags it carries, for the ids that exist. Read to decide whether a
@@ -3584,10 +3625,17 @@ class MemoriesExtension(Extension, ABC):
         record = await self.get_document_record(bank_id=bank_id, document_id=document_id, include_text=include_text)
         return document_chunk_state(record, bank_id=bank_id, document_id=document_id, include_text=include_text)
 
-    async def load_existing_chunks(self, *, conn, fq_table, bank_id: str, document_id: str) -> list[ExistingChunk]:
-        """The document's chunks (id, index, content hash), in chunk order."""
+    async def load_existing_chunks(
+        self, *, conn, fq_table, bank_id: str, document_id: str, chunk_indices: list[int] | None = None
+    ) -> list[ExistingChunk]:
+        """The document's chunks (id, index, content hash), in chunk order; ``chunk_indices`` limits
+        the result to those positions."""
         record = await self.get_document_record(bank_id=bank_id, document_id=document_id)
-        return document_chunk_state(record, bank_id=bank_id, document_id=document_id, include_text=False).chunks
+        chunks = document_chunk_state(record, bank_id=bank_id, document_id=document_id, include_text=False).chunks
+        if chunk_indices is None:
+            return chunks
+        wanted = set(chunk_indices)
+        return [c for c in chunks if c.chunk_index in wanted]
 
     async def current_document_hash(self, *, backend, fq_table, bank_id: str, document_id: str) -> str | None:
         """The document's content_hash now, for the delta's pre-extraction recheck. ``backend`` is

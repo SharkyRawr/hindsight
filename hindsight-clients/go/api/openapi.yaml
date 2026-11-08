@@ -2979,15 +2979,15 @@ paths:
       description: |-
         Update mutable fields on a document without re-processing its content.
 
-        **Tags** (`tags`): The array REPLACES the document's tags, it is not merged into them — send the complete set you want the document to end up with, and any tag you leave out is dropped. An empty array (`[]`) therefore clears every tag; only omitting the field entirely is rejected (422).
+        **Tags** (`tags`): The array REPLACES the document's tags, it is not merged into them — send the complete set you want the document to end up with, and any tag you leave out is dropped. An empty array (`[]`) therefore clears every tag.
+
+        **Partial tag change** (`add_tags`, `remove_tags`): adds or removes only the listed tags and keeps the rest, e.g. `{"add_tags": ["team-c"], "remove_tags": ["team-a"]}`. Removals apply first. Cannot be combined with `tags` (422). A request with none of `tags`, `add_tags`, `remove_tags` or `observation_scopes` is rejected (422).
 
         The new tags are propagated to all associated memory units.
 
         **Observation scopes** (`observation_scopes`): Replaces how the document's memories are scoped during consolidation, with the same values retain accepts. Use it to move a bank whose documents were retained under per-session tags to `shared` without re-extracting anything. It is also what a later reprocess of the document retains with.
 
         A memory is re-consolidated only when the change moves the observation scopes it resolves to: its observations are deleted and it is queued again, along with co-source memories from other documents that shared those observations. A change that resolves to the same scopes (a tag change under `shared`, `combined` over one tag vs `[[that tag]]`, re-sending the current values) keeps every observation and queues nothing.
-
-        At least one field must be provided.
       operationId: update_document
       parameters:
       - explode: false
@@ -6478,6 +6478,7 @@ components:
           fact: 100
           observation: 20
           preference: 30
+        paused_mental_models: 0
         pending_consolidation: 0
         pending_operations: 2
         total_documents: 10
@@ -6550,6 +6551,15 @@ components:
           default: 0
           description: Total number of observations
           title: Total Observations
+          type: integer
+        paused_mental_models:
+          default: 0
+          description: "Number of mental models whose last refresh failed, so the\
+            \ automatic triggers (`refresh_after_consolidation`, `refresh_cron`, `full_refresh_cron`)\
+            \ skip them until an explicit refresh succeeds. Their content stops updating,\
+            \ so alert on this being above 0. Each model's `last_refresh_failed_at`\
+            \ says which ones, and its history says why."
+          title: Paused Mental Models
           type: integer
       required:
       - bank_id
@@ -12887,6 +12897,7 @@ components:
           - refresh_failed_empty_candidate
           - refresh_failed_delta_not_applied
           - refresh_failed_structured_output
+          - refresh_failed_candidate_rejected
           - refresh_failed_error
           title: Outcome
           type: string
@@ -12898,6 +12909,7 @@ components:
           - delta_ops_all_skipped
           - delta_not_applied
           - structured_output_failed
+          - candidate_rejected
           - retrieval_failed
           - no_answer
           - unexpected_error
@@ -13489,6 +13501,16 @@ components:
         - team-b
       properties:
         tags:
+          items:
+            type: string
+          nullable: true
+          type: array
+        add_tags:
+          items:
+            type: string
+          nullable: true
+          type: array
+        remove_tags:
           items:
             type: string
           nullable: true

@@ -11,12 +11,15 @@ import json
 import logging
 import os
 import re
+import signal
+import threading
 import time
 import traceback
 import uuid
 from collections.abc import Awaitable, Iterator, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from types import FrameType
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 from urllib.parse import quote, unquote
 
@@ -65,6 +68,8 @@ from typing import Callable, Union, get_args, get_origin
 if TYPE_CHECKING:
     from opentelemetry.trace import Span
 
+    from hindsight_api.worker import WorkerPoller
+
 from fastapi.routing import APIRoute
 from pydantic import (
     BaseModel,
@@ -78,6 +83,7 @@ from pydantic import (
 
 from hindsight_api import MemoryEngine
 from hindsight_api.config_resolver import BankConfigPersistenceConflictError
+from hindsight_api.engine.retain.embedding_utils import EmbeddingsUnavailableError
 from hindsight_api.engine.retain.entity_labels import LabelGroup, migrate_entity_labels_input
 
 
@@ -189,6 +195,7 @@ from hindsight_api.engine.bank_templates import (
     apply_bank_template_manifest,
     validate_bank_template,
 )
+from hindsight_api.engine.embeddings import is_embedding_model_mismatch
 from hindsight_api.engine.memories.base import StoreWriteUnavailable
 from hindsight_api.engine.memory_engine import (
     KEEP_PARENT,
@@ -375,6 +382,9 @@ def _store_unavailable(exc: BaseException) -> HTTPException | None:
                 detail=str(cur),
                 headers={"Retry-After": str(cur.retry_after)},
             )
+        # This server is still on the embedding model a `hindsight-admin reembed` just replaced.
+        if is_embedding_model_mismatch(cur):
+            return HTTPException(status_code=503, detail=str(cur), headers={"Retry-After": "30"})
     return None
 
 
@@ -2829,7 +2839,18 @@ class UpdateDocumentRequest(BaseModel):
         default=None,
         description="The complete new set of tags for the document and its memory units — this "
         "REPLACES the existing tags rather than adding to them, so omitting a tag drops it and "
-        "`[]` clears them all. Triggers observation invalidation and re-consolidation.",
+        "`[]` clears them all. Triggers observation invalidation and re-consolidation. "
+        "To change only some tags, use `add_tags` / `remove_tags` instead.",
+    )
+    add_tags: list[str] | None = Field(
+        default=None,
+        description="Tags to add to the document, keeping the ones it has. Cannot be combined with `tags`.",
+    )
+    remove_tags: list[str] | None = Field(
+        default=None,
+        description="Tags to remove from the document, keeping the rest (applied before `add_tags`). "
+        "Cannot be combined with `tags`. Tags a memory carries from an entity label group with "
+        "`tag: true` stay on that memory.",
     )
     observation_scopes: Literal["per_tag", "combined", "all_combinations", "shared"] | list[list[str]] | None = Field(
         default=None,
@@ -3099,6 +3120,7 @@ class BankStatsResponse(BaseModel):
                 "pending_consolidation": 0,
                 "failed_consolidation": 0,
                 "total_observations": 45,
+                "paused_mental_models": 0,
             }
         }
     )
@@ -3141,6 +3163,15 @@ class BankStatsResponse(BaseModel):
         description="Number of source memories (world/experience) whose consolidation permanently failed and can be retried via the consolidation recovery endpoint.",
     )
     total_observations: int = Field(default=0, description="Total number of observations")
+    paused_mental_models: int = Field(
+        default=0,
+        description=(
+            "Number of mental models whose last refresh failed, so the automatic triggers "
+            "(`refresh_after_consolidation`, `refresh_cron`, `full_refresh_cron`) skip them until an "
+            "explicit refresh succeeds. Their content stops updating, so alert on this being above 0. "
+            "Each model's `last_refresh_failed_at` says which ones, and its history says why."
+        ),
+    )
 
 
 class LlmOperationHealth(BaseModel):
@@ -4276,6 +4307,28 @@ def _make_audited_http(audit_logger_getter: Callable[[], AuditLogger | None]):
     return audited
 
 
+def _stop_claiming_on_sigterm(poller: "WorkerPoller", loop: asyncio.AbstractEventLoop) -> None:
+    """Have SIGTERM stop the embedded poller's intake at once, then run the server's handler.
+
+    uvicorn reaches the lifespan teardown, where the poller is shut down, only after
+    its own HTTP drain. Until then the poller would keep claiming new work that must
+    fit into what is left of the grace period, and its drain would start late (#6021).
+    uvicorn installs its handler before the lifespan starts, so this one wraps it.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return  # signal handlers can only be set from the main thread (e.g. not under a test client)
+    server_handler = signal.getsignal(signal.SIGTERM)
+    if not callable(server_handler):
+        return  # no server handling SIGTERM: the default kills the process, there is no drain to start early
+
+    def _on_sigterm(signum: int, frame: FrameType | None) -> None:
+        # call_soon_threadsafe is the signal-safe way into the loop.
+        loop.call_soon_threadsafe(poller.begin_shutdown)
+        server_handler(signum, frame)
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
+
 def create_app(
     memory: MemoryEngine,
     initialize_memory: bool = True,
@@ -4413,6 +4466,7 @@ def create_app(
                 on_wall_timeout=memory.on_task_wall_timeout,
             )
             poller_task = asyncio.create_task(poller.run())
+            _stop_claiming_on_sigterm(poller, asyncio.get_running_loop())
             logging.info(f"Worker poller started (worker_id={worker_id})")
         elif config.worker_enabled and not memory._backend.supports_worker_poller:
             logging.warning(
@@ -4439,7 +4493,7 @@ def create_app(
 
         # Shutdown worker poller if running
         if poller is not None:
-            await poller.shutdown_graceful(timeout=30.0)
+            await poller.shutdown_graceful(timeout=config.worker_shutdown_drain_seconds)
             if poller_task is not None:
                 poller_task.cancel()
                 try:
@@ -5903,6 +5957,8 @@ def _register_routes(app: FastAPI):
                 pending_consolidation=stats["pending_consolidation"],
                 failed_consolidation=stats.get("failed_consolidation", 0),
                 total_observations=stats["total_observations"],
+                # .get(): a row cached by an older build has no paused count.
+                paused_mental_models=stats.get("paused_mental_models", 0),
             )
         except OperationValidationError as e:
             raise HTTPException(status_code=e.status_code, detail=e.reason)
@@ -7441,8 +7497,11 @@ def _register_routes(app: FastAPI):
         description="Update mutable fields on a document without re-processing its content.\n\n"
         "**Tags** (`tags`): The array REPLACES the document's tags, it is not merged into them — "
         "send the complete set you want the document to end up with, and any tag you leave out is "
-        "dropped. An empty array (`[]`) therefore clears every tag; only omitting the field "
-        "entirely is rejected (422).\n\n"
+        "dropped. An empty array (`[]`) therefore clears every tag.\n\n"
+        "**Partial tag change** (`add_tags`, `remove_tags`): adds or removes only the listed tags and "
+        'keeps the rest, e.g. `{"add_tags": ["team-c"], "remove_tags": ["team-a"]}`. '
+        "Removals apply first. Cannot be combined with `tags` (422). A request with none of `tags`, "
+        "`add_tags`, `remove_tags` or `observation_scopes` is rejected (422).\n\n"
         "The new tags are propagated to all associated memory units.\n\n"
         "**Observation scopes** (`observation_scopes`): Replaces how the document's memories are "
         "scoped during consolidation, with the same values retain accepts. Use it to move a bank "
@@ -7452,8 +7511,7 @@ def _register_routes(app: FastAPI):
         "to: its observations are deleted and it is queued again, along with co-source memories from "
         "other documents that shared those observations. A change that resolves to the same scopes "
         "(a tag change under `shared`, `combined` over one tag vs `[[that tag]]`, re-sending the "
-        "current values) keeps every observation and queues nothing.\n\n"
-        "At least one field must be provided.",
+        "current values) keeps every observation and queues nothing.",
         operation_id="update_document",
         tags=["Documents"],
     )
@@ -7470,17 +7528,20 @@ def _register_routes(app: FastAPI):
         Args:
             bank_id: Memory Bank ID (from path)
             document_id: Document ID (from path)
-            body: Fields to update (tags, observation_scopes)
+            body: Fields to update (tags, add_tags, remove_tags, observation_scopes)
         """
-        if body.tags is None and body.observation_scopes is None:
+        if body.tags is None and body.add_tags is None and body.remove_tags is None and body.observation_scopes is None:
             raise HTTPException(
-                status_code=422, detail="At least one field (tags, observation_scopes) must be provided"
+                status_code=422,
+                detail="At least one field (tags, add_tags, remove_tags, observation_scopes) must be provided",
             )
         try:
             result = await app.state.memory.update_document(
                 document_id,
                 bank_id,
                 tags=body.tags,
+                add_tags=body.add_tags,
+                remove_tags=body.remove_tags,
                 observation_scopes=body.observation_scopes,
                 request_context=request_context,
             )
@@ -9646,6 +9707,10 @@ def _register_routes(app: FastAPI):
             # The request is well-formed; the server's retain LLM cannot read the
             # images it carries. 422 rather than 400 for that distinction.
             raise HTTPException(status_code=422, detail=str(e))
+        except EmbeddingsUnavailableError as e:
+            # Stopped before extraction because the embeddings backend is down (#5999):
+            # retryable, not a server fault in the request.
+            raise HTTPException(status_code=503, detail=str(e), headers={"Retry-After": "60"})
         except (AuthenticationError, HTTPException):
             raise
         except ValueError as e:

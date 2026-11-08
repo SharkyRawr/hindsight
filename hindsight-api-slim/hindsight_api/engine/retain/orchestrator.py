@@ -24,8 +24,14 @@ from ...extensions.memory_defense import (
     apply_redaction,
     parse_policy,
 )
+from ...extensions.operation_validator import (
+    RetainFactsContext,
+    ReviewedFact,
+    resolve_reviews,
+)
 from ...metrics import get_metrics_collector
 from ...worker.stage import set_stage
+from ..bank_life import assert_job_bank_alive_on_pool
 from ..chunk_ids import build_chunk_id
 from ..db_utils import acquire_with_retry, retry_with_backoff
 from ..document_history import (
@@ -40,6 +46,9 @@ from ..memory_engine import count_tokens
 from ..schema import fq_table
 
 if TYPE_CHECKING:
+    from ...extensions.operation_validator import OperationValidatorExtension
+    from ...models import RequestContext
+    from ..memories.base import EntityResolverHandle
     from .attachment_store import RetainAttachmentLoader
 
 
@@ -236,6 +245,13 @@ def join_document_parts(texts: list[str]) -> str:
     """The single definition of how a document's content parts become its stored body."""
     merged = merge_json_array_parts(texts)
     return merged if merged is not None else "\n".join(texts)
+
+
+def _same_fields_but_content(items: "list[RetainContentDict]") -> bool:
+    """Whether the items differ only in their content, i.e. one caller item plus the stored body
+    prepended as a copy of it. Attachment names describe each part's own text, so they don't count."""
+    rest = [{k: v for k, v in item.items() if k not in ("content", "attachment_filenames")} for item in items]
+    return all(r == rest[0] for r in rest[1:])
 
 
 def append_document_body(existing_text: str, incoming_text: str) -> str:
@@ -497,6 +513,7 @@ from ..stored_dates import is_placeholder_date
 from . import (
     chunk_storage,
     embedding_processing,
+    embedding_utils,
     entity_processing,
     fact_extraction,
     fact_storage,
@@ -796,6 +813,53 @@ def _remap_phase1_results(
     ]
 
     return remapped_entity_to_unit, remapped_unit_to_entity_ids, remapped_semantic
+
+
+def _drop_committed_chunks(
+    dropped: set[int],
+    chunk_meta: list[ChunkMetadata],
+    extracted: list[ExtractedFact],
+    processed: list[ProcessedFact],
+    phase1: Phase1Result,
+    entity_resolver: "EntityResolverHandle",
+) -> Phase1Result:
+    """Remove the chunks in ``dropped`` and their facts from a batch, in place.
+
+    Phase 1 ran before the write lock and keys its result by fact position (placeholder unit
+    id ``str(i)``), and causal relations point at facts by position too, so the kept facts are
+    renumbered and both are rebuilt to match. The mention counts phase 1 queued for the dropped
+    facts are un-queued, or the entities they name would be counted twice.
+    """
+    keep = [i for i, fact in enumerate(extracted) if fact.chunk_index not in dropped]
+    retained_index_by_original: list[int | None] = [None] * len(extracted)
+    for new, old in enumerate(keep):
+        retained_index_by_original[old] = new
+    new_pos = {str(old): str(new) for new, old in enumerate(keep)}
+
+    ents = phase1.entities
+    pairs = [
+        (entity, (new_pos.get(unit_id), local_idx, fact_date))
+        for entity, (unit_id, local_idx, fact_date) in zip(ents.resolved_entities, ents.entity_to_unit, strict=True)
+    ]
+    entity_resolver.forget_pending_mentions([str(entity.entity_id) for entity, (unit, _, _) in pairs if unit is None])
+    pairs = [pair for pair in pairs if pair[1][0] is not None]
+
+    relations = _remap_causal_relations([fact.causal_relations for fact in extracted], retained_index_by_original)
+    chunk_meta[:] = [cm for cm in chunk_meta if cm.chunk_index not in dropped]
+    extracted[:] = [extracted[i] for i in keep]
+    processed[:] = [processed[i] for i in keep]
+    for extracted_fact, processed_fact, causal_relations in zip(extracted, processed, relations, strict=True):
+        extracted_fact.causal_relations = causal_relations
+        processed_fact.causal_relations = causal_relations
+
+    return Phase1Result(
+        entities=EntityResolutionResult(
+            resolved_entities=[entity for entity, _ in pairs],
+            entity_to_unit=[link for _, link in pairs],
+            unit_to_entity_ids={new_pos[k]: v for k, v in ents.unit_to_entity_ids.items() if k in new_pos},
+        ),
+        semantic_ann_links=[(new_pos[lnk[0]], *lnk[1:]) for lnk in phase1.semantic_ann_links if lnk[0] in new_pos],
+    )
 
 
 def _attachment_filenames_for(contents: "list[RetainContent]") -> dict[str, str]:
@@ -1371,7 +1435,9 @@ async def _extract_and_embed(
     operation_id: str | None = None,
     schema: str | None = None,
     attachment_loader: "RetainAttachmentLoader | None" = None,
+    fact_filter: "RetainFactFilter | None" = None,
     vlm_config: "LLMConfig | None" = None,
+    document_id: str | None = None,
 ) -> _EmbeddedExtraction:
     """Shared pipeline: extract facts from contents and generate embeddings."""
     set_stage("retain.extract_and_embed")
@@ -1407,6 +1473,13 @@ async def _extract_and_embed(
         for fact in extracted_facts:
             fact.fact_type = fact_type_override
 
+    # Reviewed before embedding, so a dropped memory costs no embedding and every later step
+    # (entities, links, observations) sees only what the extension kept.
+    if fact_filter is not None:
+        extracted_facts = await fact_filter.review(extracted_facts, document_id)
+        if not extracted_facts:
+            return _EmbeddedExtraction(extracted_facts, [], chunks, usage)
+
     step_start = time.perf_counter()
     augmented_texts = embedding_processing.augment_texts_with_dates(extracted_facts, format_date_fn)
     async with _timing.timed("embed"):
@@ -1416,6 +1489,48 @@ async def _extract_and_embed(
     fact_batch = _process_extracted_facts(extracted_facts, embeddings)
 
     return _EmbeddedExtraction(fact_batch.extracted_facts, fact_batch.processed_facts, chunks, usage)
+
+
+@dataclass(frozen=True)
+class RetainFactFilter:
+    """The extension that reviews this retain's extracted memories (``filter_retain_facts``)."""
+
+    validator: "OperationValidatorExtension"
+    bank_id: str
+    request_context: "RequestContext"
+
+    async def review(self, facts: list[ExtractedFact], document_id: str | None) -> list[ExtractedFact]:
+        """The facts the extension keeps, with the tags it gave them."""
+        ctx = RetainFactsContext(
+            bank_id=self.bank_id,
+            document_id=document_id,
+            request_context=self.request_context,
+            facts=[
+                ReviewedFact(text=f.fact_text, fact_type=f.fact_type, tags=list(f.tags), entities=list(f.entities))
+                for f in facts
+            ],
+        )
+        reviews = resolve_reviews(await self.validator.filter_retain_facts(ctx), len(facts), "filter_retain_facts")
+        kept: list[ExtractedFact] = []
+        retained_index_by_original: list[int | None] = []
+        for fact, review in zip(facts, reviews, strict=True):
+            if not review.keep:
+                retained_index_by_original.append(None)
+                continue
+            if review.tags is not None:
+                fact.tags = list(review.tags)
+            retained_index_by_original.append(len(kept))
+            kept.append(fact)
+        if len(kept) < len(facts):
+            # Causal relations point at fact ordinals: drop the ones into a dropped fact and
+            # renumber the rest, as _process_extracted_facts does for degenerate facts.
+            for fact, relations in zip(
+                kept,
+                _remap_causal_relations([f.causal_relations for f in facts], retained_index_by_original),
+                strict=True,
+            ):
+                fact.causal_relations = relations
+        return kept
 
 
 def _remap_causal_relations(
@@ -1528,6 +1643,7 @@ async def retain_batch(
     memory_defense_extension: "MemoryDefenseExtension | None" = None,
     audit_logger: Any = None,
     attachment_loader: "RetainAttachmentLoader | None" = None,
+    fact_filter: "RetainFactFilter | None" = None,
     vlm_config: "LLMConfig | None" = None,
 ) -> RetainBatchResult:
     """
@@ -1561,6 +1677,15 @@ async def retain_batch(
     from ..memories import get_memories
 
     await get_memories().assert_writable(bank_id)
+    # A retain job whose bank was deleted since it started stops here, before its writes would
+    # recreate the bank's storage (#6344).
+    # ponytail: one check per pass. A delete landing mid-pass still fails the SQL writes on their
+    # foreign keys, but a store that owns its storage can take that pass's writes; check per
+    # document write if that window shows up.
+    await assert_job_bank_alive_on_pool(pool, bank_id)
+    # Before extraction: an embeddings outage found after the LLM pass wastes the whole
+    # extraction bill, on every retry (issue #5999). Free unless the last embedding call failed.
+    await embedding_utils.ensure_embeddings_reachable(embeddings_model)
 
     start_time = time.time()  # noqa: TID251
     # start_time stays a wall-clock stamp: the stale-request check below compares it with the document's
@@ -1684,6 +1809,7 @@ async def retain_batch(
                     # resolving inline attachment placeholders into prompt blocks (leaving raw
                     # placeholders in the prompt) and dropping multimodal vision routing.
                     attachment_loader=attachment_loader,
+                    fact_filter=fact_filter,
                     vlm_config=vlm_config,
                 )
                 # Returned rather than merged in place: the groups may run concurrently, and the
@@ -1898,13 +2024,22 @@ async def retain_batch(
                 existing_content["attachment_filenames"] = prior_filenames
             contents_dicts = [existing_content, *contents_dicts]
         if len(contents_dicts) > 1:
-            # Collapse to the merged array when every part is one, so `original_text` stays valid
-            # JSON (#2409). `merge_json_array_parts` is the same function the splitter predicts an
-            # oversized append's body with, so the two cannot disagree about what this produces.
+            # Collapse the parts into ONE item. A JSON array when every part is one, so
+            # `original_text` stays valid JSON (#2409). `merge_json_array_parts` is the same function
+            # the splitter predicts an oversized append's body with, so the two cannot disagree
+            # about what this produces.
             # Runs with no stored body too: queued appends to a document that does not exist yet
             # are folded into this one call (`engine/retain/fold.py`); without merging here
             # their parts were newline-joined into `[...]\n[...]`.
-            _merged_text = merge_json_array_parts([_item.get("content", "") for _item in contents_dicts])
+            _parts = [_item.get("content", "") for _item in contents_dicts]
+            _merged_text = merge_json_array_parts(_parts)
+            if _merged_text is None and _same_fields_but_content(contents_dicts):
+                # Plain text and JSONL too (#6293): ONE item with the very body join_document_parts
+                # stores, so this append is chunked the way the next append re-chunks the stored
+                # body. As two items, the new text started its own chunks apart from the stored
+                # tail, and the next append shifted all their boundaries and re-extracted them.
+                # Items whose other fields differ (tags, metadata, timestamps) keep their own.
+                _merged_text = join_document_parts(_parts)
             if _merged_text is not None:
                 merged_item = cast(RetainContentDict, {**first, "content": _merged_text})
                 merged_filenames: dict[str, str] = {}
@@ -2036,6 +2171,7 @@ async def retain_batch(
                 document_body_hash=document_body_hash,
                 append_base_hash=append_base_hash,
                 attachment_loader=attachment_loader,
+                fact_filter=fact_filter,
                 vlm_config=vlm_config,
             )
         if delta_result is not None:
@@ -2124,6 +2260,7 @@ async def retain_batch(
             append_base_hash=append_base_hash,
             force_reextract=force_reextract,
             attachment_loader=attachment_loader,
+            fact_filter=fact_filter,
             vlm_config=vlm_config,
         )
     await _record_retain_event(
@@ -2307,10 +2444,12 @@ async def _store_document_bodies(
             bank_id=bank_id,
             document_id=document_id,
             content_hash=content_hash,
-            # Honour store_document_text: when a deployment opts out of keeping the full text,
-            # only the chunk texts (needed for citation) go to the store, not the whole body.
+            # Honour the bank's store_document_text on the body AND the chunks, as the SQL path
+            # does: a bank that keeps no text keeps none, and the store still records each chunk's
+            # hash so delta retain can diff a re-send against it (#6249).
             original_text=combined_content if config.store_document_text else None,
             chunk_texts=list(chunk_texts),
+            keep_chunk_text=config.store_document_text,
             tags=list(merged_tags or []),
             metadata=document_record_metadata(retain_params, attachment_filenames),
             expect_content_hash=expect_content_hash,
@@ -2502,6 +2641,7 @@ async def flush_document_bodies(body_accum: dict[str, DocumentBodyAccumulator]) 
                     "content_hash": a["content_hash"] or "",
                     "original_text": (a["combined_content"] if a["config"].store_document_text else None),
                     "chunk_texts": a["chunk_texts"],
+                    "keep_chunk_text": a["config"].store_document_text,
                     "tags": list(a["merged_tags"] or []),
                     "metadata": document_record_metadata(a["retain_params"], a["attachment_filenames"]),
                 }
@@ -2548,6 +2688,7 @@ async def _streaming_retain_batch(
     append_base_hash: str | None = None,
     force_reextract: bool = False,
     attachment_loader: "RetainAttachmentLoader | None" = None,
+    fact_filter: "RetainFactFilter | None" = None,
     vlm_config: "LLMConfig | None" = None,
 ) -> RetainBatchResult:
     """
@@ -2869,7 +3010,9 @@ async def _streaming_retain_batch(
                     operation_id,
                     schema,
                     attachment_loader=attachment_loader,
+                    fact_filter=fact_filter,
                     vlm_config=vlm_config,
+                    document_id=effective_doc_id,
                 )
             finally:
                 reset_call_metadata(meta_token)
@@ -3341,6 +3484,8 @@ async def _streaming_retain_batch(
                         document_id=effective_doc_id,
                     )
 
+                    # True once this transaction has cleared the document: then nothing is committed yet.
+                    document_cleared = False
                     if not doc_tracking_done[0]:
                         # Append compare-and-swap, under the row lock and before any write: an
                         # append that lost its read-modify-write race must abort here rather than
@@ -3377,6 +3522,7 @@ async def _streaming_retain_batch(
                                 attachment_filenames=_attachment_filenames_for(contents),
                             )
                             log_buffer.append(f"[streaming] Document {effective_doc_id} tracked (full content)")
+                            document_cleared = True
                         doc_tracking_done[0] = True
                         # Memory: combined_content is no longer needed after
                         # this first-batch tracking call. Release it so the
@@ -3404,6 +3550,39 @@ async def _streaming_retain_batch(
                             # Signal the consumer to stop processing further batches
                             pipeline_aborted[0] = True
                             return
+
+                    # --- Same content, written by another run: store each chunk once ---
+                    # A second retain of this exact content (a client retry, a task run again
+                    # while the first is still writing) passes the hash check above, so the two
+                    # interleave. A chunk commits in the same transaction as its facts, so a chunk
+                    # already stored with our text already has its facts: drop it from this batch.
+                    # Whichever run reaches a chunk first writes it, so the document ends complete
+                    # once the run that last cleared it finishes (#6337). Only this Postgres write
+                    # needs it: a store-owned bank writes a retain in one atomic call.
+                    if batch_chunk_meta and not document_cleared:
+                        committed = {
+                            c.chunk_index: c.content_hash
+                            for c in await _ext_provider.load_existing_chunks(
+                                conn=conn,
+                                fq_table=fq_table,
+                                bank_id=bank_id,
+                                document_id=effective_doc_id,
+                                chunk_indices=[cm.chunk_index for cm in batch_chunk_meta],
+                            )
+                        }
+                        dropped = {
+                            cm.chunk_index
+                            for cm in batch_chunk_meta
+                            if committed.get(cm.chunk_index) == chunk_storage.compute_chunk_hash(cm.chunk_text)
+                        }
+                        if dropped:
+                            phase1 = _drop_committed_chunks(
+                                dropped, batch_chunk_meta, batch_extracted, batch_processed, phase1, entity_resolver
+                            )
+                            log_buffer.append(
+                                f"[streaming] {len(dropped)} chunks already stored by a concurrent retain "
+                                f"of the same content — skipped with their facts"
+                            )
 
                     # Store chunks with correct global indices
                     step_start = time.perf_counter()
@@ -3810,6 +3989,7 @@ async def _try_delta_retain(
     document_body_hash: str | None = None,
     append_base_hash: str | None = None,
     attachment_loader: "RetainAttachmentLoader | None" = None,
+    fact_filter: "RetainFactFilter | None" = None,
     vlm_config: "LLMConfig | None" = None,
 ) -> RetainBatchResult | None:
     """
@@ -4114,7 +4294,9 @@ async def _try_delta_retain(
             operation_id,
             schema,
             attachment_loader=attachment_loader,
+            fact_filter=fact_filter,
             vlm_config=vlm_config,
+            document_id=effective_doc_id,
         )
     finally:
         reset_call_metadata(meta_token)
@@ -4201,6 +4383,37 @@ async def _try_delta_retain(
                     # an append) verifies the base this content was built on.
                     return False
 
+                # Same content, written by another run since the load above: the hash check
+                # passes, so drop the chunks already stored with our text, and their facts —
+                # the same guard the streaming batches apply (#6337).
+                stored_hashes = {
+                    c.chunk_index: c.content_hash
+                    for c in await _delta_store.load_existing_chunks(
+                        conn=conn,
+                        fq_table=fq_table,
+                        bank_id=bank_id,
+                        document_id=effective_doc_id,
+                        chunk_indices=[
+                            delta_chunk_map.get(cm.chunk_index, cm.chunk_index) for cm in new_chunk_metadata
+                        ],
+                    )
+                }
+                already_stored = {
+                    cm.chunk_index
+                    for cm in new_chunk_metadata
+                    if stored_hashes.get(delta_chunk_map.get(cm.chunk_index, cm.chunk_index))
+                    == chunk_storage.compute_chunk_hash(cm.chunk_text)
+                }
+                if already_stored:
+                    phase1 = _drop_committed_chunks(
+                        already_stored, new_chunk_metadata, extracted_facts, processed_facts, phase1, entity_resolver
+                    )
+                    log_buffer.append(
+                        f"  {len(already_stored)} chunks already stored by a concurrent retain "
+                        f"of the same content — skipped with their facts"
+                    )
+                kept_indices = {delta_chunk_map.get(i, i) for i in already_stored}
+
                 # Update document metadata (no delete)
                 step_start = time.perf_counter()
                 # When this sub-batch is one slice of an oversized item
@@ -4242,7 +4455,7 @@ async def _try_delta_retain(
                 chunks_to_delete = [
                     existing_by_index[idx].chunk_id
                     for idx in changed_indices + removed_indices
-                    if idx in existing_by_index
+                    if idx in existing_by_index and idx not in kept_indices
                 ]
                 invalidated_obs = await chunk_storage.delete_chunks_by_ids(
                     conn, chunks_to_delete, bank_id, ops=pool.ops
@@ -4412,8 +4625,9 @@ async def _delta_metadata_only(
             bank_id=bank_id,
             document_id=document_id,
             content_hash=current_content_hash or "",
-            original_text=combined_content,
+            original_text=combined_content if config.store_document_text else None,
             chunk_texts=chunk_texts,
+            keep_chunk_text=config.store_document_text,
             tags=merged_tags,
             # The same map every other write path produces. This path used to pass the params dict
             # itself, which the store flattened key by key: the record then carried no

@@ -327,6 +327,7 @@ export type RefreshFailureReason =
   | "delta_ops_all_skipped"
   | "delta_not_applied"
   | "structured_output_failed"
+  | "candidate_rejected"
   | "retrieval_failed"
   | "no_answer"
   | "unexpected_error";
@@ -1148,6 +1149,8 @@ export class ControlPlaneClient {
     bankId: string,
     update: {
       tags?: string[];
+      add_tags?: string[];
+      remove_tags?: string[];
       observation_scopes?: "per_tag" | "combined" | "all_combinations" | "shared" | string[][];
     }
   ) {
