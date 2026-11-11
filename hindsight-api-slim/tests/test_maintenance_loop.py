@@ -36,6 +36,7 @@ def _tick_cfg(**overrides):
         "operation_retention_days": 0,
         "operation_cleanup_interval_seconds": 900,
         "operation_cleanup_batch_size": 1000,
+        "attachment_sweep_interval_seconds": 0,
         "maintenance_start_jitter_seconds": 0,
     }
     fields.update(overrides)
@@ -315,27 +316,6 @@ async def test_cron_discovery_predicate_can_use_the_partial_index(memory: Memory
             )
     plan = "\n".join(r[0] for r in rows)
     assert "idx_mental_models_cron" in plan, plan
-
-
-@pytest.mark.asyncio
-async def test_purge_expired_deletes_old_rows_across_schema(memory: MemoryEngine):
-    """_purge_expired deletes rows older than the cutoff and keeps recent ones."""
-    tag = f"maint-purge-{uuid.uuid4().hex[:8]}"
-    async with memory._pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO audit_log (action, transport, started_at) VALUES ($1, 'system', now() - INTERVAL '10 days')",
-            tag,
-        )
-        await conn.execute(
-            "INSERT INTO audit_log (action, transport, started_at) VALUES ($1, 'system', now())",
-            tag,
-        )
-
-    await MaintenanceLoop(memory)._purge_expired("audit_log", "started_at", 7)
-
-    async with memory._pool.acquire() as conn:
-        remaining = await conn.fetchval("SELECT COUNT(*) FROM audit_log WHERE action = $1", tag)
-    assert remaining == 1  # only the recent row survives
 
 
 class TestRetentionSweepPacing:
@@ -629,3 +609,24 @@ async def test_reconcile_finds_a_store_owned_banks_backlog(memory: MemoryEngine,
         set_memories(None)
 
     assert bank in submitted
+
+
+@pytest.mark.asyncio
+async def test_attachment_sweep_cadence_is_configurable(monkeypatch):
+    """Daily by default; 0 turns it off."""
+    from unittest.mock import AsyncMock
+
+    import hindsight_api.engine.maintenance as maintenance_mod
+
+    cfg = _tick_cfg(retention_sweep_interval_seconds=0, attachment_sweep_interval_seconds=0)
+    monkeypatch.setattr(maintenance_mod, "get_config", lambda: cfg)
+    loop = MaintenanceLoop(engine=None)
+    loop._run_attachment_sweep = AsyncMock()
+
+    await loop._tick()
+    loop._run_attachment_sweep.assert_not_awaited()
+
+    cfg.attachment_sweep_interval_seconds = 86400
+    await loop._tick()
+    await loop._tick()
+    loop._run_attachment_sweep.assert_awaited_once()

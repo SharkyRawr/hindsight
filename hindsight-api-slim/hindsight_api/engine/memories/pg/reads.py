@@ -423,6 +423,12 @@ async def count_unconsolidated(
     fact_type), with the scopes OR'd as ``tags @> scope`` containment. ``id`` is the PK so each row
     counts once; the inner ``LIMIT`` floors the count at ``limit`` exactly as walking that many rows
     would, so a huge backlog stays a single index count instead of a 17-column fetch.
+
+    The inner ``ORDER BY created_at`` does not change the count — any ``limit`` rows count the
+    same — but it is what makes Postgres use ``idx_memory_units_unconsolidated (bank_id,
+    created_at)``. Without it the planner overestimates the pending rows, expects a seq scan to hit
+    ``limit`` early, and reads the whole table when nothing is pending: 756 ms vs 2.5 ms on a
+    354k-row bank (#6415). ``find_unconsolidated`` orders the same way and gets the same index.
     """
     where = ["bank_id = $1", "consolidated_at IS NULL", "consolidation_failed_at IS NULL"]
     params: list[Any] = [bank_id]
@@ -444,6 +450,7 @@ async def count_unconsolidated(
         SELECT COUNT(*) AS c FROM (
             SELECT 1 FROM {fq_table("memory_units")}
             WHERE {" AND ".join(where)}
+            ORDER BY created_at
             LIMIT ${len(params)}
         ) sub
         """,
@@ -740,7 +747,7 @@ async def any_memory_updated_since_batch(
 ) -> dict[str, bool]:
     """:func:`any_memory_updated_since` for many scopes, in one query per scope *shape*.
 
-    The knowledge tree and the mental-model list ask this for every model in the
+    The page tree and the mental-model list ask this for every model in the
     bank on a poll, and one round-trip each is what made the exact answer look
     expensive. Scopes are grouped by the tag clause they generate and the query
     shape it implies (a bank's pages almost always share both), each group is
