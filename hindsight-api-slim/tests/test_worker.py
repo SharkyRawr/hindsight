@@ -581,6 +581,53 @@ class TestWorkerPoller:
         assert run.task_id == my_claims[0].operation_id and run.queued_at == my_claims[0].queued_at
 
     @pytest.mark.asyncio
+    async def test_claimed_task_takes_its_bank_and_operation_from_the_row(self, pool, backend, clean_operations):
+        """The job runs for the bank, operation and schema its row was claimed from.
+
+        The row is the one source of truth; the payload only carries the task's arguments.
+        """
+        from hindsight_api.worker import WorkerPoller
+        from hindsight_api.worker.poller import ClaimedTask
+
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        await _ensure_bank(pool, bank_id)
+        op_id = uuid.uuid4()
+        payload = {
+            "type": "test_task",
+            "bank_id": "some-other-bank",
+            "operation_id": str(uuid.uuid4()),
+            "_schema": "some_other_schema",
+        }
+        await pool.execute(
+            """
+            INSERT INTO async_operations (operation_id, bank_id, operation_type, status, task_payload)
+            VALUES ($1, $2, 'test', 'pending', $3::jsonb)
+            """,
+            op_id,
+            bank_id,
+            json.dumps(payload),
+        )
+
+        executed: list[dict] = []
+
+        async def executor(task_dict):
+            executed.append(dict(task_dict))
+
+        poller = WorkerPoller(backend=backend, worker_id="test-worker-row", executor=executor)
+        claimed = [c for c in await poller.claim_batch() if c.operation_id == str(op_id)]
+        assert len(claimed) == 1
+        assert claimed[0].task_dict["bank_id"] == bank_id
+        assert claimed[0].task_dict["operation_id"] == str(op_id)
+
+        # A task claimed from the default schema (None) runs without the payload's schema.
+        await poller._execute_task_inner(
+            ClaimedTask(operation_id=str(op_id), task_dict=claimed[0].task_dict, schema=None)
+        )
+        assert len(executed) == 1
+        assert "_schema" not in executed[0]
+        assert executed[0]["bank_id"] == bank_id
+
+    @pytest.mark.asyncio
     async def test_claim_batch_cannot_see_rows_outside_this_files_schema(self, pool, clean_operations):
         """Rows in ``public`` are invisible here, so they can never crowd out our claims (#3963).
 
@@ -1024,6 +1071,74 @@ class TestWorkerPoller:
             if isinstance(metadata, str):
                 metadata = json.loads(metadata)
             assert metadata["append_conflict_defers"] == expected_count
+
+    @pytest.mark.asyncio
+    async def test_a_store_shed_defers_counts_up_and_fails_at_the_cap(
+        self, pool, backend, clean_operations, monkeypatch
+    ):
+        """A retain the store sheds stays pending with its retries untouched (#6528) — until the
+        store has refused it so many times it is stuck, not busy, and then it fails saying so (#6529).
+        """
+        from hindsight_api.worker import WorkerPoller, poller as poller_module
+        from hindsight_api.worker.poller import ClaimedTask
+
+        monkeypatch.setattr(poller_module, "_STORE_BACKPRESSURE_MAX_DEFERS", 2)
+        bank_id = f"test-worker-{uuid.uuid4().hex[:8]}"
+        op_id = uuid.uuid4()
+        payload = json.dumps({"type": "batch_retain", "operation_id": str(op_id), "bank_id": bank_id})
+        await _ensure_bank(pool, bank_id)
+
+        async def shedding_executor(task_dict):
+            raise RuntimeError("StatusCode.UNAVAILABLE: writes are shed while the fold catches up")
+
+        notified: list[str] = []
+
+        async def on_failure_the_engine_never_saw(task_dict, schema, message, stage):
+            notified.append(stage)
+
+        poller = WorkerPoller(
+            backend=backend,
+            worker_id="test-worker-1",
+            executor=shedding_executor,
+            on_wall_timeout=on_failure_the_engine_never_saw,
+        )
+
+        async def run_once():
+            await pool.execute(
+                """
+                INSERT INTO async_operations
+                    (operation_id, bank_id, operation_type, status, task_payload, worker_id, claimed_at, retry_count)
+                VALUES ($1, $2, 'retain', 'processing', $3::jsonb, 'test-worker-1', now(), 0)
+                ON CONFLICT (operation_id) DO UPDATE
+                    SET status = 'processing', worker_id = 'test-worker-1', claimed_at = now()
+                """,
+                op_id,
+                bank_id,
+                payload,
+            )
+            await poller.execute_task(ClaimedTask(operation_id=str(op_id), task_dict=json.loads(payload), schema=None))
+            assert await poller.wait_for_active_tasks(timeout=5.0), "Task did not complete within timeout"
+            return await pool.fetchrow(
+                "SELECT status, retry_count, error_message, result_metadata FROM async_operations "
+                "WHERE operation_id = $1",
+                op_id,
+            )
+
+        for expected_count in (1, 2):
+            row = await run_once()
+            assert row["status"] == "pending", "a store shed must be deferred, not failed"
+            assert row["retry_count"] == 0, "a store shed must not spend a retry"
+            metadata = row["result_metadata"]
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
+            assert metadata["store_backpressure_defers"] == expected_count
+
+        row = await run_once()
+        assert row["status"] == "failed", "a store that never accepts the write must fail the task"
+        assert "kept shedding" in row["error_message"]
+        # The engine never saw the failure, so its notifications (consolidation webhook, failed
+        # refresh record) fire from here — once, and as a temporary failure that pauses nothing.
+        assert notified == ["store_backpressure.backoff"]
 
     @pytest.mark.asyncio
     async def test_deferred_task_not_picked_up_until_exec_date(self, pool, backend, clean_operations):

@@ -38,11 +38,12 @@ from hindsight_api.engine.llm_interface import (
     LLMInterface,
     ProviderRateLimitResetError,
     ProviderUnavailableError,
+    merge_extra_body,
 )
 from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usage
 from hindsight_api.engine.llm_transport import build_aiohttp_timeout
 from hindsight_api.engine.providers.llm_debug import dump_request_on_4xx
-from hindsight_api.engine.providers.openai_compatible_llm import _strip_code_fences
+from hindsight_api.engine.providers.openai_compatible_llm import _strip_code_fences, record_retried_attempt
 from hindsight_api.engine.providers.openai_responses_llm import _reply_message_index, _to_responses_content
 from hindsight_api.engine.response_models import TokenUsage
 from hindsight_api.engine.structured_output import provider_json_schema, strict_json_schema
@@ -630,8 +631,6 @@ class CodexLLM(LLMInterface):
             "stream": True,  # SSE streaming
             "prompt_cache_key": _prompt_cache_key(messages),
         }
-        payload.update(self._extra_body)
-
         if strict_schema and schema is not None:
             payload["text"] = {
                 "format": {
@@ -641,6 +640,9 @@ class CodexLLM(LLMInterface):
                     "strict": True,
                 }
             }
+        # Merged, not replaced: a configured {"text": {"verbosity": ...}} or
+        # {"reasoning": {"summary": ...}} keeps the schema and effort Hindsight set (#6640).
+        payload.update(merge_extra_body(payload, self._extra_body))
 
         headers = self._build_request_headers()
         # The ChatGPT backend routes Responses cache affinity on ``session-id``, not on
@@ -656,6 +658,7 @@ class CodexLLM(LLMInterface):
         # separate auth-recovery attempt that shouldn't compete with backoff.
         attempt = 0
         while True:
+            attempt_started = time.perf_counter()
             try:
                 async with attempt_context() if attempt_context is not None else nullcontext():
                     set_stage(f"llm.codex.{scope}.attempt={attempt + 1}/{max_retries + 1}")
@@ -832,6 +835,14 @@ class CodexLLM(LLMInterface):
                 if attempt < max_retries:
                     backoff = min(initial_backoff * (2**attempt), max_backoff)
                     logger.warning(f"Codex connection error (attempt {attempt + 1}/{max_retries + 1}): {e}")
+                    record_retried_attempt(
+                        provider=self.provider,
+                        model=self.model,
+                        scope=scope,
+                        messages=messages,
+                        error=e,
+                        started=attempt_started,
+                    )
                     await asyncio.sleep(backoff)
                     attempt += 1
                     continue

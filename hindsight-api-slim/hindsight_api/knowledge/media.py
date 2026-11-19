@@ -1,27 +1,28 @@
 """Multimodal chunking: a file becomes passages that are embedded as they are, never OCR'd.
 
 * PDF   -> one rendered page image per passage; its text layer is kept for display and embedded
-           alongside (the page text and its units, see ``KnowledgeService._vectors_to_embed``)
+           alongside (its units and sentences, see ``KnowledgeService._vectors_to_embed``)
 * image -> the image itself
 * audio -> fixed windows (m4a), with a small overlap
 * video -> fixed windows (mp4, picture + soundtrack), with a small overlap
 * text  -> token-sized text passages; Office/HTML files are read for their text layer first
 
-Audio and video go through the ``ffmpeg`` binary, which must be on PATH.
+Audio and video go through PyAV, whose wheel carries its own ffmpeg libraries. This used to shell out to
+the ``ffmpeg``/``ffprobe`` binaries, which every install then had to provide on PATH (an apt package in
+the Docker image, a CI step); PyAV keeps the work in-process and needs nothing on the system.
 """
 
 from __future__ import annotations
 
+import collections
 import io
-import json
 import math
 import re
-import shutil
-import subprocess
 import tempfile
 import threading
 from collections import Counter
 from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -69,6 +70,16 @@ class PassageDraft:
     bands: tuple[bytes, ...] = ()
     # A PDF page's text layer as embedded: ``text`` without the running headers and footers.
     embed_text: str | None = None
+    # A text passage's window: the stretch of text around it it is also found by (``split_text``).
+    window_text: str | None = None
+
+    def __post_init__(self) -> None:
+        # Postgres text cannot hold NUL, and one NUL failed every document in the same ingest
+        # batch (BRIGHT-Pro economics lost 100). Every passage is built here, so strip it once.
+        for name in ("text", "embed_text", "window_text"):
+            value = getattr(self, name)
+            if value and "\x00" in value:
+                object.__setattr__(self, name, value.replace("\x00", ""))
 
     @property
     def extension(self) -> str:
@@ -126,8 +137,12 @@ def sniff_image_mime(data: bytes) -> str:
 
 
 def _png(image) -> bytes:
+    """Lossless, at zlib's default level. ``optimize=True`` (every filter tried, then level 9) cost
+    ~150-190 ms per 1536px page and was 80% of a PDF's ingest, for a file 2% smaller (468 vs 480 KB
+    on ViDoRe HR); the default level is the same pixels in ~25 ms. Level 1 was barely faster (22 ms)
+    and 33% bigger, which every file write and every embed request then pays for."""
     out = io.BytesIO()
-    image.save(out, format="PNG", optimize=True)
+    image.save(out, format="PNG")
     return out.getvalue()
 
 
@@ -193,6 +208,22 @@ PDF_TEXT_UNIT_TOKENS = 128
 _PDF_BANDS = ((0.0, 0.5), (0.25, 0.75), (0.5, 1.0))
 
 
+_PDF_LOOKAHEAD = 4
+_PNG_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="kb-png")
+
+
+def _page_png(sharp: Any, page_pixels: int, bands: bool) -> bytes:
+    image = sharp.copy() if bands else sharp  # with bands the full-size render is still being cropped
+    image.thumbnail((page_pixels, page_pixels))
+    return _png(image)
+
+
+def _band_pngs(sharp: Any) -> tuple[bytes, ...]:
+    return tuple(
+        _png(sharp.crop((0, int(a * sharp.height), sharp.width, int(b * sharp.height)))) for a, b in _PDF_BANDS
+    )
+
+
 def split_pdf(data: bytes, *, page_pixels: int, max_pages: int, bands: bool = False) -> Iterator[PassageDraft]:
     """One PNG per page, the longest side rendered at ``page_pixels``."""
     import pypdfium2 as pdfium
@@ -210,27 +241,33 @@ def split_pdf(data: bytes, *, page_pixels: int, max_pages: int, bands: bool = Fa
         # scored on it too (whole page and 128-token units), and it is what a reader gets back.
         texts = [_page_text(pdf, number) for number in range(page_count)]
         embed_texts = strip_repeated_lines(texts)
-        for number in range(page_count):
-            with _PDFIUM_LOCK:
-                page = pdf[number]
-                width, height = page.get_size()
-                scale = (max(page_pixels, PDF_BAND_PIXELS) if bands else page_pixels) / max(width, height, 1)
-                sharp = page.render(scale=scale).to_pil().convert("RGB")
-                page.close()
-            text = texts[number]
-            image = sharp.copy()
-            image.thumbnail((page_pixels, page_pixels))
-            crops = tuple(
-                _png(sharp.crop((0, int(a * sharp.height), sharp.width, int(b * sharp.height)))) for a, b in _PDF_BANDS
-            )
+        # Rendering goes through pdfium, one page at a time under its lock; encoding the PNGs does not
+        # (Pillow lets go of the GIL), so it runs on a few threads while the next pages render. Page by
+        # page in order it was half of a PDF's ingest; up to _PDF_LOOKAHEAD pages are held at once.
+        pending: collections.deque[tuple[int, Future[bytes], Future[tuple[bytes, ...]] | None]] = collections.deque()
+        number = 0
+        while number < page_count or pending:
+            while number < page_count and len(pending) < _PDF_LOOKAHEAD:
+                with _PDFIUM_LOCK:
+                    page = pdf[number]
+                    width, height = page.get_size()
+                    scale = (max(page_pixels, PDF_BAND_PIXELS) if bands else page_pixels) / max(width, height, 1)
+                    sharp = page.render(scale=scale).to_pil().convert("RGB")
+                    page.close()
+                # Bands only when asked: they used to be cut and encoded for every page and then dropped,
+                # three PNGs per page for nothing (half of a PDF's ingest time with bands off).
+                crops = _PNG_POOL.submit(_band_pngs, sharp) if bands else None
+                pending.append((number, _PNG_POOL.submit(_page_png, sharp, page_pixels, bands), crops))
+                number += 1
+            done, page_png, crops = pending.popleft()
             yield PassageDraft(
                 modality="image",
-                text=text,
-                data=_png(image),
+                text=texts[done],
+                data=page_png.result(),
                 mime="image/png",
-                page=number + 1,
-                bands=crops if bands else (),
-                embed_text=embed_texts[number],
+                page=done + 1,
+                bands=crops.result() if crops is not None else (),
+                embed_text=embed_texts[done],
             )
     finally:
         with _PDFIUM_LOCK:
@@ -241,7 +278,9 @@ def _page_text(pdf: Any, number: int) -> str | None:
     with _PDFIUM_LOCK:
         page = pdf[number]
         textpage = page.get_textpage()
-        text = textpage.get_text_range().strip() or None
+        # PDFium returns a soft hyphen as U+FFFE inside the word ("employ\ufffement"): 40% of ViDoRe hr
+        # pages had one, and every such word was lost to keyword search.
+        text = textpage.get_text_range().replace("\ufffe", "").strip() or None
         textpage.close()
         page.close()
     return text
@@ -281,6 +320,30 @@ def read_text(data: bytes, filename: str | None) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+_SENTENCE_END = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9(\u201c\"])")
+#: A sentence shorter than this joins the next one: a heading or a figure label alone matches everything.
+_MIN_SENTENCE_WORDS = 8
+
+
+def sentences(text: str) -> list[str]:
+    """A page's text layer as sentences: line breaks of print joined (and words hyphenated across them),
+    split after ., ! or ? before a capital or a digit, short pieces merged forward."""
+    flat = re.sub(r"\s*\n\s*", " ", re.sub(r"-\n(?=[a-z])", "", text))
+    out: list[str] = []
+    current = ""
+    for part in _SENTENCE_END.split(flat):
+        current = f"{current} {part}".strip() if current else part.strip()
+        if len(current.split()) >= _MIN_SENTENCE_WORDS:
+            out.append(current)
+            current = ""
+    if current:
+        if out:
+            out[-1] = f"{out[-1]} {current}"
+        else:
+            out.append(current)
+    return out
+
+
 def pack_lines(text: str, *, tokens: int) -> list[str]:
     """A PDF page's text layer as pieces of whole lines, packed greedily up to ``tokens``, no overlap;
     a line longer than that is cut by words. What PDF_GEMMA.md benchmarked: a page's text is one line
@@ -314,27 +377,55 @@ def pack_lines(text: str, *, tokens: int) -> list[str]:
     return out
 
 
+#: A text passage is also found by its window: the consecutive passages around it, up to this many tokens,
+#: embedded once as one more vector of each. A small passage alone lost what its page says about it (a
+#: table's rows without the table's title, or the company named only in the footer); the window keeps it,
+#: and results stay the small passages. ViDoRe V3 markdown (own language, EmbeddingGemma 2), nDCG@10 on
+#: hr / finance_en / industrial / pharmaceuticals: no window 60.03 / 54.12 / 50.73 / 61.71, 1024 tokens
+#: 61.12 / 59.74 / 51.64 / 62.18, 2048 tokens 61.08 / 60.95 / 51.64 / 62.24 (a dense table page outgrew 1024).
+TEXT_WINDOW_TOKENS = 2048
+
+
 def split_text(text: str, *, tokens: int) -> list[PassageDraft]:
+    from ..engine.token_encoding import count_tokens
     from .text_passages import split_into_passages
 
-    return [PassageDraft(modality="text", text=chunk) for chunk in split_into_passages(text, passage_size=tokens)]
+    chunks = split_into_passages(text, passage_size=tokens)
+    drafts: list[PassageDraft] = []
+    window: list[str] = []
+    window_tokens = 0
+
+    def close() -> None:
+        # A window of one passage is that passage: no second vector.
+        joined = "\n\n".join(window) if len(window) > 1 else None
+        drafts.extend(PassageDraft(modality="text", text=chunk, window_text=joined) for chunk in window)
+        window.clear()
+
+    for chunk in chunks:
+        n = count_tokens(chunk)
+        if window and window_tokens + n > TEXT_WINDOW_TOKENS:
+            close()
+            window_tokens = 0
+        window.append(chunk)
+        window_tokens += n
+    close()
+    return drafts
 
 
 # --- audio / video -----------------------------------------------------------------------------
+# PyAV carries its own ffmpeg libraries inside the wheel: nothing runs as a separate program and
+# nothing is needed on the system.
 
 
-def _ffmpeg() -> str:
-    path = shutil.which("ffmpeg")
-    if not path:
-        raise MediaError("audio and video need ffmpeg on the server's PATH")
-    return path
-
-
-def _run(args: list[str], *, stdin: bytes | None = None) -> bytes:
-    proc = subprocess.run(args, input=stdin, capture_output=True, check=False)
-    if proc.returncode != 0:
-        raise MediaError(f"ffmpeg failed: {proc.stderr.decode(errors='replace')[-400:]}")
-    return proc.stdout
+def _open(data: bytes) -> Any:
+    try:
+        import av
+    except ImportError as exc:
+        raise MediaError("audio and video need the local-ml extra (PyAV)") from exc
+    try:
+        return av.open(io.BytesIO(data))
+    except av.FFmpegError as exc:
+        raise MediaError(f"unreadable media: {exc}") from exc
 
 
 @dataclass(frozen=True)
@@ -350,17 +441,18 @@ class Window:
     end: float
 
 
-def probe(path: str) -> MediaInfo:
+def probe(data: bytes) -> MediaInfo:
     """Duration and tracks of a media file."""
-    ffprobe = shutil.which("ffprobe") or _ffmpeg().replace("ffmpeg", "ffprobe")
-    out = _run([ffprobe, "-v", "error", "-show_entries", "format=duration:stream=codec_type", "-of", "json", path])
-    info = json.loads(out or b"{}")
-    kinds = {s.get("codec_type") for s in info.get("streams", [])}
-    try:
-        duration = float(info.get("format", {}).get("duration") or 0)
-    except ValueError:
-        duration = 0.0
-    return MediaInfo(duration=duration, has_video="video" in kinds, has_audio="audio" in kinds)
+    with _open(data) as container:
+        duration = container.duration / 1_000_000 if container.duration else 0.0
+        if not duration:
+            duration = max(
+                (float(s.duration * s.time_base) for s in container.streams if s.duration and s.time_base),
+                default=0.0,
+            )
+        return MediaInfo(
+            duration=duration, has_video=bool(container.streams.video), has_audio=bool(container.streams.audio)
+        )
 
 
 def windows(duration: float, window: float, overlap: float) -> list[Window]:
@@ -383,75 +475,167 @@ def split_media(
     data: bytes,
     kind: Literal["audio", "video"],
     *,
-    filename: str | None,
     window_seconds: int,
     overlap_seconds: int,
     max_seconds: int,
 ) -> Iterator[PassageDraft]:
     """Cut audio into m4a windows and video into mp4 windows (480p, with sound)."""
-    ffmpeg = _ffmpeg()
+    info = probe(data)
+    if info.duration <= 0:
+        raise MediaError("could not read the media duration")
+    if info.duration > max_seconds:
+        raise MediaError(f"media is {info.duration:.0f}s long; the limit is {max_seconds}s")
+    if kind == "video" and not info.has_video:
+        kind = "audio"
+    if kind == "audio" and not info.has_audio:
+        raise MediaError("the file has no audio track")
+    for w in windows(info.duration, window_seconds, min(overlap_seconds, window_seconds - 1)):
+        yield PassageDraft(
+            modality=kind,
+            data=_cut(data, w, video=kind == "video", audio=info.has_audio),
+            mime="video/mp4" if kind == "video" else "audio/mp4",
+            start_ms=int(w.start * 1000),
+            end_ms=int(w.end * 1000),
+        )
+
+
+def _cut(data: bytes, w: Window, *, video: bool, audio: bool) -> bytes:
+    """One window re-encoded as mp4: H.264 at most 480p high, and/or mono 64 kb/s AAC."""
+    # A temp file, not a buffer: "+faststart" moves the index to the front by re-reading the file by name.
     with tempfile.TemporaryDirectory(prefix="hs-kb-") as tmp:
-        source = str(Path(tmp) / f"source{Path(filename or '').suffix.lower() or '.bin'}")
-        Path(source).write_bytes(data)
-        info = probe(source)
-        duration, has_video, has_audio = info.duration, info.has_video, info.has_audio
-        if duration <= 0:
-            raise MediaError("could not read the media duration")
-        if duration > max_seconds:
-            raise MediaError(f"media is {duration:.0f}s long; the limit is {max_seconds}s")
-        if kind == "video" and not has_video:
-            kind = "audio"
-        if kind == "audio" and not has_audio:
-            raise MediaError("the file has no audio track")
-        for w in windows(duration, window_seconds, min(overlap_seconds, window_seconds - 1)):
-            start, end = w.start, w.end
-            out = str(Path(tmp) / f"w.{'mp4' if kind == 'video' else 'm4a'}")
-            args = [ffmpeg, "-loglevel", "error", "-y", "-ss", f"{start:.3f}", "-t", f"{end - start:.3f}", "-i", source]
-            if kind == "video":
-                args += ["-vf", "scale=-2:'min(480,ih)'", "-c:v", "libx264", "-preset", "veryfast", "-crf", "28"]
-                args += ["-pix_fmt", "yuv420p"]
-                args += ["-c:a", "aac", "-b:a", "64k", "-ac", "1"] if has_audio else ["-an"]
-            else:
-                args += ["-vn", "-c:a", "aac", "-b:a", "64k", "-ac", "1"]
-            _run([*args, "-movflags", "+faststart", out])
-            yield PassageDraft(
-                modality=kind,
-                data=Path(out).read_bytes(),
-                mime="video/mp4" if kind == "video" else "audio/mp4",
-                start_ms=int(start * 1000),
-                end_ms=int(end * 1000),
-            )
+        out = str(Path(tmp) / "clip.mp4")
+        _encode_window(data, w, out, video=video, audio=audio)
+        return Path(out).read_bytes()
 
 
-def _with_temp_file(data: bytes, suffix: str, args_for: list[str]) -> bytes:
-    with tempfile.NamedTemporaryFile(suffix=suffix) as f:
-        f.write(data)
-        f.flush()
-        return _run([_ffmpeg(), "-loglevel", "error", "-i", f.name, *args_for, "-"])
+def _encode_window(data: bytes, w: Window, out: str, *, video: bool, audio: bool) -> None:
+    from fractions import Fraction
+
+    import av
+
+    with _open(data) as src, av.open(out, "w", format="mp4", options={"movflags": "+faststart"}) as dst:
+        streams: list[Any] = []
+        v_out = a_out = None
+        if video:
+            v_in = src.streams.video[0]
+            # Even, as the width below: H.264 in yuv420p refuses an odd size ("avcodec_open2 libx264"), and a
+            # source 359 pixels high failed every window of its video.
+            height = min(480, v_in.codec_context.height) // 2 * 2
+            rate = Fraction(v_in.average_rate or 25)
+            v_out = dst.add_stream("libx264", rate=rate)
+            v_out.codec_context.time_base = 1 / rate
+            v_out.height = height
+            v_out.width = round(v_in.codec_context.width * height / v_in.codec_context.height / 2) * 2
+            v_out.pix_fmt = "yuv420p"
+            v_out.options = {"preset": "veryfast", "crf": "28"}
+            streams.append(v_in)
+        if audio:
+            a_in = src.streams.audio[0]
+            a_out = dst.add_stream("aac", rate=a_in.codec_context.sample_rate or 44100, layout="mono")
+            a_out.bit_rate = 64_000
+            streams.append(a_in)
+        resampler = (
+            av.AudioResampler(format="fltp", layout="mono", rate=a_out.rate, frame_size=1024)  # AAC frame size
+            if a_out
+            else None
+        )
+        audio_samples, video_frames, finished = 0, 0, set()
+        src.seek(int(w.start * 1_000_000), any_frame=False)
+        for frame in src.decode(*streams):
+            t = frame.time
+            if t is None or t < w.start:
+                continue
+            if t >= w.end:
+                finished.add(type(frame))
+                if len(finished) == len(streams):
+                    break
+                continue
+            if isinstance(frame, av.VideoFrame) and v_out is not None:
+                scaled = frame.reformat(width=v_out.width, height=v_out.height, format="yuv420p")
+                # Numbered at the output frame rate: source timestamps can repeat or jump.
+                scaled.pts, scaled.time_base, video_frames = video_frames, 1 / rate, video_frames + 1
+                dst.mux(v_out.encode(scaled))
+            elif isinstance(frame, av.AudioFrame) and a_out is not None and resampler is not None:
+                frame.pts = None
+                for chunk in resampler.resample(frame):
+                    chunk.pts, audio_samples = audio_samples, audio_samples + chunk.samples
+                    dst.mux(a_out.encode(chunk))
+        if a_out is not None and resampler is not None:
+            for chunk in resampler.resample(None):
+                chunk.pts, audio_samples = audio_samples, audio_samples + chunk.samples
+                dst.mux(a_out.encode(chunk))
+        for s in (v_out, a_out):
+            if s is not None:
+                dst.mux(s.encode(None))
 
 
 def decode_audio_pcm(data: bytes, *, required: bool = True) -> np.ndarray | None:
     """Mono 16 kHz float32 samples of a clip's soundtrack."""
-    try:
-        raw = _with_temp_file(data, ".mp4", ["-vn", "-ac", "1", "-ar", str(PCM_RATE), "-f", "f32le"])
-    except MediaError:
-        if required:
-            raise
-        return None
-    return np.frombuffer(raw, np.float32).copy()
+    import av
+
+    with _open(data) as container:
+        if not container.streams.audio:
+            if required:
+                raise MediaError("the file has no audio track")
+            return None
+        resampler = av.AudioResampler(format="flt", layout="mono", rate=PCM_RATE)
+        chunks = [
+            out.to_ndarray().reshape(-1) for frame in container.decode(audio=0) for out in resampler.resample(frame)
+        ]
+        chunks += [out.to_ndarray().reshape(-1) for out in resampler.resample(None)]
+    return np.concatenate(chunks) if chunks else np.zeros(0, np.float32)
 
 
 def decode_video_frames(data: bytes, *, fps: int = 1, side: int = 448) -> np.ndarray:
     """(T, H, W, 3) uint8 frames at ``fps``, scaled to a ``side`` x ``side`` square."""
-    raw = _with_temp_file(
-        data, ".mp4", ["-vf", f"fps={fps},scale={side}:{side}", "-f", "rawvideo", "-pix_fmt", "rgb24"]
-    )
-    frames = np.frombuffer(raw, np.uint8)
-    if frames.size == 0:
+    frames, next_time = [], 0.0
+    with _open(data) as container:
+        if not container.streams.video:
+            raise MediaError("the video has no frames")
+        for frame in container.decode(video=0):
+            if frame.time is not None and frame.time + 1e-6 < next_time:
+                continue
+            frames.append(frame.reformat(width=side, height=side, format="rgb24").to_ndarray())
+            next_time = (frame.time or next_time) + 1 / fps
+    if not frames:
         raise MediaError("the video has no frames")
-    return frames.reshape(-1, side, side, 3)
+    return np.stack(frames)
 
 
 def l2_normalize(vector: list[float]) -> list[float]:
     norm = math.sqrt(sum(v * v for v in vector)) or 1.0
     return [v / norm for v in vector]
+
+
+#: Longest side of the picture a decision model judges a hit by: the size ViDoRe V3 was measured at.
+#: System One takes up to 1568 (``JEV_IMAGE_SIDE``); a smaller picture is also a cheaper request.
+JUDGE_SIDE = 1024
+
+
+def query_picture(data: bytes, low: int, high: int) -> bytes | None:
+    """:func:`judge_picture` of a search's query image, enlarged (aspect kept) so its short side is ``low``
+    when smaller, as one picture costs nothing to enlarge; None when its long side would pass ``high``."""
+    from PIL import Image
+
+    image = Image.open(io.BytesIO(judge_picture(data)))
+    short = min(image.size)
+    if short < low:
+        scale = low / short
+        size = (max(low, round(image.width * scale)), max(low, round(image.height * scale)))
+        if max(size) > high:
+            return None
+        image = image.resize(size, Image.Resampling.LANCZOS)
+    out = io.BytesIO()
+    image.save(out, format="JPEG", quality=85)
+    return out.getvalue()
+
+
+def judge_picture(data: bytes) -> bytes:
+    """A JPEG a decision model judges an image or PDF page hit by, at most ``JUDGE_SIDE`` a side."""
+    from PIL import Image
+
+    image = Image.open(io.BytesIO(data)).convert("RGB")
+    image.thumbnail((JUDGE_SIDE, JUDGE_SIDE))
+    out = io.BytesIO()
+    image.save(out, format="JPEG", quality=85)
+    return out.getvalue()

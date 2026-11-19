@@ -505,7 +505,9 @@ export class HindsightClient {
     }
     if (!r.ok && r.status !== 404 && !tolerate.includes(r.status))
       throw new Error(
-        `${method} ${url} -> ${r.status} ${await r.text()}${this.authHint(r.status)}`
+        // Query dropped: an encoded search query filled the 200-char error cap and pushed the
+        // status and the server's reason out of the tool error (#6341).
+        `${method} ${url.split("?")[0]} -> ${r.status} ${await r.text()}${this.authHint(r.status)}`
       );
     return r;
   }
@@ -685,6 +687,23 @@ export class HindsightClient {
       await this.req("DELETE", this.bankUrl());
       this.log(`[bank] reset ${this.bank}`);
     }
+    await this.configureBankSettings(opts);
+    await this.seedPages(opts.pageTrigger, opts.pages, opts.customPages);
+  }
+
+  /** The config half of `configureBank` (missions, retain strategies, entity labels), without
+   *  seeding pages. Session start calls it directly when the deepen engine — the usual caller of
+   *  `configureBank` — will not run (`autoSeed: false`, or a directory with no git history):
+   *  without it such a bank never got the `conversation` strategy, and every session write-back
+   *  was extracted with the server's generic rules instead of the plugin's mission. */
+  async configureBankSettings(
+    opts: {
+      reset?: boolean;
+      manage?: boolean;
+      extractionMode?: RetainExtractionMode;
+      defaults?: Record<string, unknown>;
+    } = {}
+  ): Promise<void> {
     if (opts.manage === false) {
       this.log(`[bank] manageBankConfig: false — leaving ${this.bank}'s configuration alone`);
     } else {
@@ -704,7 +723,6 @@ export class HindsightClient {
         this.log(`[bank] applied to ${this.bank}: ${Object.keys(manifest.bank).sort().join(", ")}`);
       }
     }
-    await this.seedPages(opts.pageTrigger, opts.pages, opts.customPages);
   }
 
   /**

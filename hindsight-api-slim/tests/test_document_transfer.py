@@ -1779,6 +1779,57 @@ async def test_clone_reports_nothing_as_imported(memory, request_context):
 
 
 @pytest.mark.asyncio
+# Cuts the clone's connections through Postgres's own session view.
+@pytest.mark.memory_backend_incompatible
+async def test_clone_survives_a_pooler_cutting_a_long_held_connection(memory, request_context, monkeypatch):
+    """A clone holds no transaction open across its reads, so a pooler cutting one fails nothing (#6666).
+
+    It used to read the whole source under one transaction. On a large bank that ran for
+    tens of minutes, a pooler or proxy with a connection-lifetime limit closed it, and every
+    retry failed the same way. Here, late in the read, every connection the clone has read
+    through is cut if it is still holding a transaction open — what such a pooler does.
+    """
+    from hindsight_api.engine.transfer import export as export_mod
+
+    source = _unique_bank("clone_cut_src")
+    target = _unique_bank("clone_cut_dst")
+    await _retain(memory, source, "Alice works at Google.", request_context, "doc-1")
+
+    read_pids: set[int] = set()
+    real_dump_bank_rows = export_mod._dump_bank_rows
+    real_load_pages = export_mod._load_pages
+
+    async def recording_dump_bank_rows(conn, table, bank_id):
+        read_pids.add(await conn.fetchval("SELECT pg_backend_pid()"))
+        return await real_dump_bank_rows(conn, table, bank_id)
+
+    async def cut_then_load_pages(conn, bank_id):
+        backend = await memory._get_backend()
+        async with acquire_with_retry(backend) as pooler:
+            await pooler.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE pid = ANY($1::int[]) AND state = 'idle in transaction'",
+                list(read_pids),
+            )
+        return await real_load_pages(conn, bank_id)
+
+    monkeypatch.setattr(export_mod, "_dump_bank_rows", recording_dump_bank_rows)
+    monkeypatch.setattr(export_mod, "_load_pages", cut_then_load_pages)
+    try:
+        submission = await memory.submit_bank_clone_async(source, target, request_context)
+        status = await memory.get_operation_status(source, submission["operation_id"], request_context=request_context)
+        assert status["status"] == "completed", status
+        assert read_pids, "the clone never read the bank's own rows"
+        source_facts = await memory.list_memory_units(source, limit=100, request_context=request_context)
+        clone_facts = await memory.list_memory_units(target, limit=100, request_context=request_context)
+        assert source_facts["total"] > 0
+        assert sorted(u["text"] for u in clone_facts["items"]) == sorted(u["text"] for u in source_facts["items"])
+    finally:
+        await memory.delete_bank(source, request_context=request_context)
+        await memory.delete_bank(target, request_context=request_context)
+
+
+@pytest.mark.asyncio
 async def test_import_gate_sees_the_archive_and_can_refuse_a_document_import(memory, request_context):
     """The gate runs at submission with the archive's documents; a refusal reaches the
     caller and nothing is queued or written."""
@@ -2984,6 +3035,55 @@ async def test_restored_operations_log_cannot_re_run_the_source_bank_work(memory
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("renamed", [False, True])
+async def test_restored_failed_operation_keeps_its_record_but_not_its_task(memory, request_context, renamed):
+    """A failed operation restores as history only: its task is not carried, so it cannot be retried.
+
+    Its ``task_payload`` is the task the source bank ran. Retrying it in the copy would
+    re-run the source's work there, like the in-flight rows the restore already drops.
+    Covers a restore under the archive's own bank id (operation ids kept) and a renamed one.
+    """
+    from hindsight_api.engine.transfer import export_bank
+
+    source = _unique_bank("ops_failed_src")
+    target = _unique_bank("ops_failed_dst") if renamed else source
+    try:
+        await _retain(memory, source, "Frank plays the cello.", request_context, "doc-1")
+        backend = await memory._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            await conn.execute(
+                f"INSERT INTO {fq_store_table('async_operations')} "
+                f"(operation_id, bank_id, operation_type, status, task_payload) "
+                f"VALUES ($1, $2, 'export_bank', 'failed', $3::jsonb)",
+                uuid.uuid4(),
+                source,
+                json.dumps({"type": "export_bank", "bank_id": "some-other-bank", "_schema": "public"}),
+            )
+            archive = await export_bank(conn, source, file_storage=memory._file_storage)
+        if not renamed:
+            await memory.delete_bank(source, request_context=request_context)
+
+        await memory.import_bank_async(archive, request_context, target_bank_id=target)
+
+        async with acquire_with_retry(backend) as conn:
+            row = await conn.fetchrow(
+                f"SELECT operation_id, task_payload FROM {fq_store_table('async_operations')} "
+                f"WHERE bank_id = $1 AND operation_type = 'export_bank' AND status = 'failed'",
+                target,
+            )
+        assert row is not None, "the failed operation is kept as the copy's history"
+        assert row["task_payload"] is None
+
+        with pytest.raises(OperationValidationError) as exc:
+            await memory.retry_operation(target, str(row["operation_id"]), request_context=request_context)
+        assert exc.value.status_code == 409
+    finally:
+        await memory.delete_bank(source, request_context=request_context)
+        if renamed:
+            await memory.delete_bank(target, request_context=request_context)
+
+
+@pytest.mark.asyncio
 # Seeds the attachment link with a raw INSERT that needs the document's SQL row.
 @pytest.mark.memory_backend_incompatible
 async def test_attachment_bytes_travel_with_the_bank(memory, request_context):
@@ -3085,58 +3185,13 @@ def _archive_entries(archive: bytes) -> dict[str, Any]:
 @pytest.mark.asyncio
 # Seeds the attachment link with a raw INSERT that needs the document's SQL row.
 @pytest.mark.memory_backend_incompatible
-async def test_streamed_bank_archive_matches_the_built_one(memory, request_context):
-    """The streamed export and the clone's in-memory builder write the same archive.
-
-    They are two implementations of one format — the export streams, the clone
-    reads under one transaction and builds — so nothing else stops a section
-    added to one from being forgotten in the other.
-    """
-    from hindsight_api.engine.transfer import TransferScope, build_bank_archive, load_bank_export, stream_export_bank
-
-    bank = _unique_bank("parity")
-    try:
-        await _retain(memory, bank, "Grace shared a diagram of the Paris office.", request_context, "doc-1")
-        await _retain(memory, bank, "Alan moved to Berlin in 2021.", request_context, "doc-2")
-        await _seed_attachment(memory, bank, b"\x89PNG-parity", "b" * 64)
-        # Retain returns before its LLM trace and audit rows are written (they are
-        # fire-and-forget). Let them land, or one arrives between the two exports
-        # and the history sections differ for a reason that is not the format.
-        await drain_traces(memory)
-        await memory._audit_logger.drain()
-        backend = await memory._get_backend()
-        scope = TransferScope(data=True, bank_config=True, history=True)
-        streamed = b"".join(
-            [
-                chunk
-                async for chunk in stream_export_bank(
-                    backend, bank, scope=scope, file_storage=memory._file_storage, batch_size=1
-                )
-            ]
-        )
-        async with acquire_with_retry(backend) as conn:
-            payload = await load_bank_export(conn, bank, scope=scope, file_storage=memory._file_storage)
-        built = await build_bank_archive(payload)
-
-        streamed_entries = _archive_entries(streamed)
-        assert streamed_entries == _archive_entries(built)
-        assert streamed_entries["manifest.json"]["document_count"] == 2
-        assert streamed_entries["manifest.json"]["attachment_count"] == 1
-        assert streamed_entries["blobs/000000.bin"] == b"\x89PNG-parity"
-    finally:
-        await memory.delete_bank(bank, request_context=request_context)
-
-
-@pytest.mark.asyncio
-# Seeds the attachment link with a raw INSERT that needs the document's SQL row.
-@pytest.mark.memory_backend_incompatible
-async def test_an_attachment_whose_bytes_are_gone_is_left_out_of_both_archives(memory, request_context):
+async def test_an_attachment_whose_bytes_are_gone_is_left_out_of_the_archive(memory, request_context):
     """A row that outlived its blob is dropped with a warning; the rest of the bank still exports.
 
     Before, the missing blob raised out of storage and failed the whole export —
     one lost file made a bank impossible to move.
     """
-    from hindsight_api.engine.transfer import TransferScope, build_bank_archive, load_bank_export, stream_export_bank
+    from hindsight_api.engine.transfer import stream_export_bank
 
     bank = _unique_bank("att_gone")
     try:
@@ -3150,16 +3205,11 @@ async def test_an_attachment_whose_bytes_are_gone_is_left_out_of_both_archives(m
         streamed = b"".join(
             [chunk async for chunk in stream_export_bank(backend, bank, file_storage=memory._file_storage)]
         )
-        async with acquire_with_retry(backend) as conn:
-            built = await build_bank_archive(
-                await load_bank_export(conn, bank, scope=TransferScope(), file_storage=memory._file_storage)
-            )
-        for archive in (streamed, built):
-            entries = _archive_entries(archive)
-            assert entries["manifest.json"]["attachment_count"] == 1
-            assert [a["attachment_hash"] for a in entries["attachments.json"]] == ["c" * 64]
-            assert entries[entries["attachments.json"][0]["entry"]] == b"kept-bytes"
-            assert entries["manifest.json"]["document_count"] == 1
+        entries = _archive_entries(streamed)
+        assert entries["manifest.json"]["attachment_count"] == 1
+        assert [a["attachment_hash"] for a in entries["attachments.json"]] == ["c" * 64]
+        assert entries[entries["attachments.json"][0]["entry"]] == b"kept-bytes"
+        assert entries["manifest.json"]["document_count"] == 1
     finally:
         await memory.delete_bank(bank, request_context=request_context)
 
@@ -3443,105 +3493,6 @@ async def test_a_copy_keeps_a_name_someone_chose(api_client, memory, request_con
         await memory.delete_bank(target, request_context=request_context)
 
 
-def test_archive_assembly_is_confined_to_threadable_builders():
-    """Every non-streamed ZIP is written by a plain function whose name starts with `_build_`.
-
-    Those are the ones the async wrappers hand to a worker thread. Both document
-    and whole-bank external exports stream directly via ZipStreamer, while internal
-    whole-bank archive assembly for clone_bank runs off the event loop via
-    _build_bank_archive_bytes under a single-transaction read snapshot.
-    """
-    import ast
-    from pathlib import Path
-
-    from hindsight_api.engine.transfer import export as export_module
-
-    source = Path(export_module.__file__).read_text()
-    tree = ast.parse(source)
-
-    offenders = []
-    builders = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        if node.name.startswith("_build_"):
-            builders.add(node.name)
-            # A builder has to be callable from a thread, so it must not be async.
-            assert isinstance(node, ast.FunctionDef), f"{node.name} must be a plain def to run in a thread"
-            continue
-        body = ast.get_source_segment(source, node) or ""
-        if "zipfile.ZipFile(" in body:
-            offenders.append(node.name)
-
-    assert offenders == [], f"archive written outside a threadable builder: {offenders}"
-    assert {"_build_bank_archive_bytes"} <= builders
-
-
-def test_the_engine_never_compresses_inside_a_read_transaction():
-    """No archive is built while a transaction is open.
-
-    Splitting load from build only helps if the callers keep them apart: moving
-    the build back inside the `async with conn.transaction()` block would pin a
-    pooled connection for the whole compression again, and would look perfectly
-    reasonable in review — which is why this is asserted structurally rather than
-    left to the next reader to notice.
-    """
-    import ast
-    from pathlib import Path
-
-    from hindsight_api.engine import memory_engine
-
-    source = Path(memory_engine.__file__).read_text()
-    tree = ast.parse(source)
-
-    def builds_an_archive(node: ast.AST) -> bool:
-        return any(
-            isinstance(inner, ast.Call) and getattr(inner.func, "id", "") == "build_bank_archive"
-            for inner in ast.walk(node)
-        )
-
-    offenders = []
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.With, ast.AsyncWith)):
-            continue
-        header = (ast.get_source_segment(source, node) or "").splitlines()[:1]
-        if header and ".transaction(" in header[0] and builds_an_archive(node):
-            offenders.append(f"line {node.lineno}: {header[0].strip()}")
-
-    assert offenders == [], f"archive built inside a transaction: {offenders}"
-
-
-@pytest.mark.asyncio
-async def test_bank_archive_builds_without_the_connection_that_read_it(memory, request_context):
-    """The compression runs after the read transaction is closed.
-
-    Loading and building are separate calls precisely so a pooled connection is
-    not held for the length of a whole-bank DEFLATE. Building from a payload with
-    no connection in scope is what proves the two halves are actually independent.
-    """
-    from hindsight_api.engine.transfer import build_bank_archive, load_bank_export
-
-    bank = _unique_bank("export_seam")
-    try:
-        await _retain(memory, bank, "Rosa sails dinghies.", request_context, "doc-1")
-        backend = await memory._get_backend()
-        async with acquire_with_retry(backend) as conn:
-            async with conn.transaction():
-                payload = await load_bank_export(bank_id=bank, conn=conn, file_storage=memory._file_storage)
-
-        # The connection is back in the pool here.
-        archive = await build_bank_archive(payload)
-
-        with zipfile.ZipFile(io.BytesIO(archive)) as zf:
-            names = set(zf.namelist())
-            manifest = TransferManifest.model_validate_json(zf.read("manifest.json"))
-        assert any(n.startswith("documents/") for n in names)
-        assert manifest.source_bank_id == bank
-        assert manifest.document_count == 1
-    finally:
-        await memory.delete_bank(bank, request_context=request_context)
-
-
 @pytest.mark.asyncio
 async def test_a_big_operation_log_moves_without_being_held_whole(memory, request_context):
     """Export and import stream the operation log a page at a time (#5737).
@@ -3693,3 +3644,101 @@ async def test_a_big_mental_model_history_moves_without_being_held_whole(memory,
     finally:
         await memory.delete_bank(source, request_context=request_context)
         await memory.delete_bank(target, request_context=request_context)
+
+
+@pytest.mark.asyncio
+async def test_bank_import_checks_the_key_before_reading_the_archive(memory, request_context, monkeypatch):
+    """A caller whose key is refused gets nothing read out of their upload, not even the manifest."""
+    from hindsight_api.extensions.tenant import AuthenticationError
+
+    class _CountingArchive(io.BytesIO):
+        reads = 0
+
+        def read(self, *args):
+            type(self).reads += 1
+            return super().read(*args)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("manifest.json", b"{}")
+
+    async def refuse(_ctx):
+        raise AuthenticationError("bad key")
+
+    monkeypatch.setattr(memory, "_authenticate_tenant", refuse)
+    archive = _CountingArchive(buf.getvalue())
+    with pytest.raises(AuthenticationError):
+        await memory.submit_bank_import_async("any-bank", archive, request_context)
+    assert _CountingArchive.reads == 0
+
+
+def test_an_oversized_manifest_is_refused_without_unzipping_it():
+    """The manifest is a handful of counts: one that claims megabytes is not a transfer archive."""
+    from hindsight_api.engine.transfer.importer import read_bank_manifest
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("manifest.json", b"{" + b" " * (2 * 1024 * 1024) + b"}")
+    with pytest.raises(ValueError, match="manifest.json is larger than"):
+        read_bank_manifest(buf.getvalue())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("renamed", [False, True])
+async def test_restored_rows_land_in_the_restored_bank_whatever_the_archive_says(memory, request_context, renamed):
+    """Every restored row belongs to the bank being restored, under its own id or a new one.
+
+    The archive's rows are given other ``bank_id`` values (another bank, none) to show
+    the restore sets the bank itself rather than carrying it.
+    """
+    from hindsight_api.engine.transfer import export_bank
+
+    source = _unique_bank("rows_src")
+    other = _unique_bank("rows_other")
+    target = _unique_bank("rows_dst") if renamed else source
+    hook_url = "https://hooks.example.invalid/restored"
+    try:
+        await _retain(memory, other, "Grace keeps bees.", request_context, "doc-other")
+        await _retain(memory, source, "Frank plays the cello.", request_context, "doc-1")
+        await memory.create_directive(source, "kept", "Kept with its bank.", request_context=request_context)
+        await memory.create_webhook(
+            source,
+            webhook_id=uuid.uuid4(),
+            url=hook_url,
+            secret=None,
+            event_types=["retain.completed"],
+            enabled=True,
+            http_config_json="{}",
+            request_context=request_context,
+        )
+        backend = await memory._get_backend()
+        async with acquire_with_retry(backend) as conn:
+            archive = await export_bank(conn, source, file_storage=memory._file_storage)
+        await memory.delete_bank(source, request_context=request_context)
+
+        src = zipfile.ZipFile(io.BytesIO(archive))
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w") as dst:
+            for name in src.namelist():
+                data = src.read(name)
+                if name in ("directives.json", "webhooks.json"):
+                    rows = json.loads(data)
+                    for row in rows:
+                        row["bank_id"] = other if name == "directives.json" else None
+                    data = json.dumps(rows).encode()
+                dst.writestr(name, data)
+
+        await memory.import_bank_async(out.getvalue(), request_context, target_bank_id=target)
+
+        restored = await memory.list_directives(target, request_context=request_context)
+        elsewhere = await memory.list_directives(other, request_context=request_context)
+        assert [d["name"] for d in restored.items] == ["kept"]
+        assert elsewhere.items == []
+        hooks = await memory.list_webhooks(target, request_context=request_context)
+        assert [h["url"] for h in hooks["items"]] == [hook_url]
+        async with acquire_with_retry(backend) as conn:
+            for_other = await backend.ops.get_webhooks_for_dispatch(conn, fq_store_table("webhooks"), other)
+        assert all(r["url"] != hook_url for r in for_other)
+    finally:
+        for bank in {source, target, other}:
+            await memory.delete_bank(bank, request_context=request_context)

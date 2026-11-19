@@ -37,6 +37,7 @@ from ..engine.vector_index_health import (
 from ..extensions import TenantExtension, load_extension
 from ..pg0 import parse_pg0_url, resolve_database_url
 from ..schema_context import _current_schema
+from ..utils import configure_stdio
 from .reembed import SchemaReembed, finish_schema, reembed_schema
 
 # Setup logging
@@ -86,6 +87,8 @@ BACKUP_TABLES = [
     "kb_documents",
     "kb_passages",
     "kb_passage_vectors",
+    "kb_staged_passages",
+    "kb_staged_passage_vectors",
     "audit_log",
     "llm_requests",
     "graph_maintenance_queue",
@@ -1902,6 +1905,7 @@ def cloud(ctx: typer.Context):
 
 
 def main():
+    configure_stdio()
     load_dotenv_for_entrypoint()
     app()
 

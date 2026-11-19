@@ -101,6 +101,13 @@ class StubbedReply:
     retry_after_seconds: int | None = None
     """Sent as the error's ``Retry-After`` header: when a rate-limited provider says it resets."""
 
+    native: bool = False
+    """Send a tool call as a native call even on a schema turn, as gpt-oss does (#6520).
+
+    Off, the stub answers a schema turn the way a schema-following model does: the call's
+    JSON as the reply text. On, the call stays in ``tool_calls`` with empty content.
+    """
+
 
 @dataclass(frozen=True)
 class ToolCall:
@@ -194,7 +201,7 @@ class RuleBuilder:
         """
         return self._register(lambda request: _assistant_message(build(request).model_dump_json()))
 
-    def returns_tool_call(self, tool_name: str, **arguments: Any) -> LLMStub:
+    def returns_tool_call(self, tool_name: str, *, native: bool = False, **arguments: Any) -> LLMStub:
         """Answer by calling one named tool with specific arguments.
 
         Needed where the arguments matter — `done` carries the reflect answer in
@@ -203,11 +210,11 @@ class RuleBuilder:
         """
 
         def respond(_request: ChatRequest) -> StubbedReply:
-            return _tool_call(tool_name, arguments)
+            return _tool_call(tool_name, arguments, native=native)
 
         return self._register(respond, requires_tools=True)
 
-    def answers_with_tool_call(self, build: Callable[[ChatRequest], ToolCall]) -> LLMStub:
+    def answers_with_tool_call(self, build: Callable[[ChatRequest], ToolCall], *, native: bool = False) -> LLMStub:
         """Compute the tool call from the request that triggered it.
 
         For a turn whose right answer depends on what already happened in the loop —
@@ -217,11 +224,11 @@ class RuleBuilder:
 
         def respond(request: ChatRequest) -> StubbedReply:
             call = build(request)
-            return _tool_call(call.name, call.arguments)
+            return _tool_call(call.name, call.arguments, native=native)
 
         return self._register(respond, requires_tools=True)
 
-    def calls_the_offered_tool(self, **arguments: Any) -> LLMStub:
+    def calls_the_offered_tool(self, *, native: bool = False, **arguments: Any) -> LLMStub:
         """Answer a forced-tool turn by calling whichever tool it was offered.
 
         The reflect prelude walks a fixed ladder of searches, offering one tool per
@@ -232,7 +239,7 @@ class RuleBuilder:
         """
 
         def respond(request: ChatRequest) -> StubbedReply:
-            return _tool_call(request.tools[0], arguments)
+            return _tool_call(request.tools[0], arguments, native=native)
 
         return self._register(respond, requires_tools=True)
 
@@ -243,7 +250,7 @@ class RuleBuilder:
         return self._stub
 
 
-def _tool_call(tool_name: str, arguments: dict[str, Any]) -> StubbedReply:
+def _tool_call(tool_name: str, arguments: dict[str, Any], *, native: bool = False) -> StubbedReply:
     return StubbedReply(
         message={
             "role": "assistant",
@@ -257,6 +264,7 @@ def _tool_call(tool_name: str, arguments: dict[str, Any]) -> StubbedReply:
             ],
         },
         finish_reason="tool_calls",
+        native=native,
     )
 
 
@@ -497,6 +505,10 @@ class RerankStub:
     #: retrieval order, which is not stable enough to pin.
     verdicts: dict[str, float]
 
+    #: What the Cohere-shaped /rerank scores a document, keyed by text it contains, for
+    #: the stories about a reranker's order (knowledge search's). Others are scored lexically.
+    rerank_scores: dict[str, float]
+
     #: The state each of those questions arrived with, so a story can see what the
     #: model was told besides the memory.
     states: list[str]
@@ -508,15 +520,24 @@ class RerankStub:
     #: The candidates of every ranking question, as the decision model read them.
     ranked: list[str]
 
+    #: The image formats each decision-model request carried, by placeholder (empty: no images).
+    assets: list[dict[str, str]]
+
     #: Answer every decision-model request with this provider error instead, for the
     #: stories about a recall whose decision model fails. The /rerank endpoint ignores it.
     fail_with_status: int | None = None
 
+    #: Answer every /rerank request with this provider error instead, for the stories
+    #: about a reranker that is down while something searches.
+    rerank_fail_with_status: int | None = None
+
     def __init__(self) -> None:
         self.verdicts = {}
+        self.rerank_scores = {}
         self.states = []
         self.repeats = set()
         self.ranked = []
+        self.assets = []
 
     def repeat(self, memory_a: str, memory_b: str) -> float:
         return 0.9 if any(a in memory_a and b in memory_b for a, b in self.repeats) else 0.1
@@ -524,6 +545,10 @@ class RerankStub:
     def verdict(self, state: str, memory: str) -> float:
         scripted = next((score for text, score in self.verdicts.items() if text in memory), None)
         return self.score(state, memory) if scripted is None else scripted
+
+    def reranked(self, query: str, document: str) -> float:
+        scripted = next((score for text, score in self.rerank_scores.items() if text in document), None)
+        return self.score(query, document) if scripted is None else scripted
 
     def score(self, query: str, document: str) -> float:
         from .lexical import lexical_relevance
@@ -606,9 +631,12 @@ class Stubs:
         self.embeddings.calls.clear()
         self.rerank.cut_level = RerankStub.cut_level
         self.rerank.verdicts = {}
+        self.rerank.rerank_scores = {}
         self.rerank.states = []
         self.rerank.repeats = set()
+        self.rerank.assets = []
         self.rerank.fail_with_status = None
+        self.rerank.rerank_fail_with_status = None
         self.triage.reset()
         self.rejected_requests.clear()
         self.webhooks.clear()

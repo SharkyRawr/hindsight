@@ -25,16 +25,19 @@ def table(paths: list[Path]) -> str:
         columns.append((label, by_category([EvalRecord.model_validate(item) for item in data["items"]])))
 
     rows = sorted({(op, cat) for _, ops in columns for op, cats in ops.items() for cat in cats})
-    lines = [
-        "| operation | category | " + " | ".join(label for label, _ in columns) + " |",
-        "|---|---|" + "---|" * len(columns),
-    ]
+    lines = []
+    if rows:
+        lines += [
+            "| operation | category | " + " | ".join(label for label, _ in columns) + " |",
+            "|---|---|" + "---|" * len(columns),
+        ]
     for op, cat in rows:
         cells = []
         for _, ops in columns:
             summary = ops.get(op, {}).get(cat)
             cells.append(f"{summary.correct}/{summary.total}" if summary else "–")
         lines.append(f"| {op} | {cat} | " + " | ".join(cells) + " |")
+
     return "\n".join(lines)
 
 

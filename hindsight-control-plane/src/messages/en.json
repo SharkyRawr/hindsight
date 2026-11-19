@@ -48,7 +48,7 @@
     "darkMode": "Switch to dark mode",
     "lightMode": "Switch to light mode",
     "bank": {
-      "select": "Select a memory bank...",
+      "select": "Select a bank...",
       "allBanks": "All memory banks",
       "search": "Search memory banks...",
       "empty": "No memory banks yet.",
@@ -185,7 +185,9 @@
     "cloneIncludeBankConfigHint": "Config overrides, directives and webhooks — the copy will call the same webhook endpoints.",
     "cloneIncludeHistory": "History",
     "cloneIncludeHistoryHint": "Audit log and LLM request traces.",
-    "cloneNothingSelected": "Choose at least one thing to copy."
+    "cloneNothingSelected": "Choose at least one thing to copy.",
+    "observationTree": "Observations",
+    "observationTreeDescription": "Everything this bank has learned, as a folder of markdown files you can browse, search and export — the same files an agent can list and grep. Each topic file holds all of its observations; each folder's index.md gives an overview."
   },
   "bankProfile": {
     "noBankSelected": "No Bank Selected",
@@ -476,6 +478,9 @@
     "clientsTitle": "Memory Bank",
     "clientsDescription": "Bank-wide settings: its aliases, its timezone, and what apps and agents can reach.",
     "mcpFailedToSave": "Failed to save MCP settings",
+    "knowledgeSectionTitle": "Knowledge Banks",
+    "knowledgeSectionDescription": "The knowledge banks reflect on this bank also searches, and how it searches them.",
+    "knowledgeFailedToSave": "Failed to save knowledge bank settings",
     "auditEnabledLabel": "Enable Audit Logging",
     "auditEnabledDescription": "Record retain, recall and reflect operations for this bank. Overrides the server default for this bank only.",
     "auditServerDefault": "Server Default ({state})",
@@ -690,7 +695,18 @@
         "retain_mission": "Would be prepended here, taking priority over the general extraction rules.",
         "retain_optional_fact_dimensions": "Would let the model leave \"when\", \"where\", \"who\" and \"why\" empty instead of writing \"N/A\"."
       }
-    }
+    },
+    "linkedKnowledgeBanksLabel": "Linked banks",
+    "linkedKnowledgeBanksDescription": "Reflect on this bank also searches the linked knowledge banks, and treats their documents as the authority over conflicting memories. Recall and mental models don't read them.",
+    "kbSearchMediaTypesLabel": "Document types reflect reads",
+    "kbSearchMediaTypesDescription": "The kinds of linked documents reflect's search may return. All ticked means no limit.",
+    "kbSearchApplyTagsLabel": "Filter by the reflect's tags",
+    "kbSearchApplyTagsDescription": "A reflect with tags only reads linked documents those tags allow, with the same rules as its memories. Off: tags filter memories only.",
+    "kbMediaType_document": "PDF & Office",
+    "kbMediaType_image": "Images",
+    "kbMediaType_audio": "Audio",
+    "kbMediaType_video": "Video",
+    "kbMediaType_text": "Text"
   },
   "bankOperations": {
     "title": "Background Operations",
@@ -729,7 +745,8 @@
       "importDocuments": "Import Documents",
       "exportBank": "Export Bank",
       "importBank": "Import Bank",
-      "cloneBank": "Clone Bank"
+      "cloneBank": "Clone Bank",
+      "knowledgeIngest": "Knowledge ingest"
     },
     "table": {
       "id": "Operation ID",
@@ -1240,6 +1257,28 @@
     "executingToolsPlural": "Executing {count} tools",
     "toolInputLabel": "Input:",
     "toolOutputLabel": "Output:",
+    "traceAgentFailed": "Agent call failed",
+    "traceAgentFailedDetail": "The LLM call errored; the turn was retried",
+    "traceAgentDone": "Agent has enough",
+    "traceAgentDoneDetail": "Called done: no more searching",
+    "traceRoundQuery": "Wrote the search query",
+    "traceRoundQueryDetail": "Rewrote the request into one search query",
+    "traceSufficiency": "Is the evidence enough?",
+    "traceSufficiencyDetail": "Decision model judged the evidence so far",
+    "tracePagesSufficiency": "Do the pages answer it?",
+    "tracePagesSufficiencyDetail": "Decision model judged the mental models alone",
+    "tracePrune": "Pruned the evidence",
+    "tracePruneDetail": "Decision model kept what bears on the question",
+    "traceClosingDoneDetail": "Asked for done with the full evidence",
+    "traceFinalDetail": "Synthesized from all gathered evidence",
+    "traceFinalMap": "Summarized evidence part {part}",
+    "traceFinalMapDetail": "Evidence too big: summarized in parts",
+    "traceRewrite": "Shortened the answer",
+    "traceRewriteDetail": "Rewrote to fit the length budget",
+    "traceStructured": "Built the structured answer",
+    "traceStructuredDetail": "Filled the response schema",
+    "traceOtherCall": "LLM call",
+    "traceOtherCallDetail": "{scope}",
     "basedOnTitle": "Based On",
     "basedOnDescription": "{count} items used",
     "notIncludedBasedOn": "Not included",
@@ -1251,6 +1290,7 @@
     "tabObservations": "Observations",
     "tabWorld": "World",
     "tabExperience": "Experience",
+    "tabKnowledgeBanks": "Knowledge Banks",
     "noTabItems": "No {tab} items",
     "rawResponseTitle": "Raw Response",
     "readyToReflect": "Ready to Reflect",
@@ -2213,6 +2253,9 @@
         "updateNode": "Failed to update node",
         "deleteNode": "Failed to delete node",
         "search": "Failed to search pages"
+      },
+      "request": {
+        "tooLarge": "Request too large. Upload fewer or smaller files (limit: HINDSIGHT_CP_MAX_UPLOAD_SIZE)."
       }
     }
   },
@@ -2330,8 +2373,6 @@
     "traceResults": "{count} results",
     "executionTraceTitle": "Execution Trace",
     "noOperations": "No operations",
-    "responseGenerated": "Response generated",
-    "agentDecided": "Agent decided",
     "toolInputLabel": "Input:",
     "executionTraceDescription": "{iterations} LLM calls • {totalMs}ms total",
     "executingTools": "Tools called: {count}",
@@ -2415,7 +2456,6 @@
       "columnBank": "Bank",
       "columnDocuments": "Documents",
       "columnPassages": "Passages",
-      "columnSize": "Size",
       "columnKinds": "Kinds",
       "columnStatus": "Ingestion",
       "columnCreated": "Created",
@@ -2455,10 +2495,10 @@
       "documentsTitle": "Documents",
       "documentsDescription": "Files and text in this bank. Each is split into passages and embedded; drop files anywhere here to upload them.",
       "searchTitle": "Search",
-      "searchDescription": "Find passages by meaning, with a text query, an image, or both."
+      "searchDescription": "Find passages with text, an image or a video clip, alone or together, in one ranked list."
     },
     "documents": {
-      "filterPlaceholder": "Filter by name, title or id…",
+      "filterPlaceholder": "Filter by file name or id…",
       "kindFilter": "Filter by kind",
       "statusFilter": "Filter by status",
       "allKinds": "All kinds",
@@ -2467,7 +2507,6 @@
       "upload": "Upload files",
       "dropToUpload": "Drop files to upload them",
       "columnDocument": "Document",
-      "columnStatus": "Status",
       "columnPassages": "Passages",
       "columnSize": "Size",
       "columnTags": "Tags",
@@ -2483,7 +2522,8 @@
       "noMatchesBody": "Try another name, kind or status.",
       "layout": "Layout",
       "viewList": "List",
-      "viewGrid": "Grid"
+      "viewGrid": "Grid",
+      "viewConstellation": "Constellation"
     },
     "detail": {
       "download": "Download original",
@@ -2514,59 +2554,54 @@
       "originalUnsupported": "This file type cannot be previewed in the browser."
     },
     "search": {
-      "placeholder": "Search by meaning, e.g. how do I rotate an API key?",
-      "addImage": "Image",
-      "imageHint": "Paste, drop or choose an image to search with it, alone or with text.",
-      "modeMeaning": "By meaning",
-      "modeExact": "Exact text",
-      "modeHelp": "Exact text finds passages that contain the words as written (codes, ids, names). It reads text only: text files and the PDF text layer.",
+      "placeholder": "Search, e.g. how do I rotate an API key?",
+      "addMedia": "Image / video",
+      "mediaHint": "Paste, drop or choose an image or an MP4 clip to search with, alone or with text.",
       "imageQuery": "Searching with this image",
-      "removeImage": "Remove image",
-      "notAnImage": "Only images can be used as a search query",
-      "pastedImage": "Pasted image",
-      "topK": "Results",
+      "videoQuery": "Searching with this video",
+      "removeMedia": "Remove",
+      "notMedia": "Only an image or an MP4 video can be a search query",
+      "pastedMedia": "Pasted file",
+      "maxTokens": "Max tokens",
+      "maxTokensHelp": "How much text comes back in all: the best passages, and as much around them as fits.",
+      "budget": "Budget",
+      "budgetHelp": "How deep the search ranks: low is fastest, high looks furthest.",
+      "budgetLow": "Low",
+      "budgetMid": "Mid",
+      "budgetHigh": "High",
       "submit": "Search",
-      "filters": "Filters",
+      "options": "Options",
       "tags": "Tags",
       "tagsMatch": "Tag match",
-      "tagsAny": "Any",
-      "tagsAll": "All",
+      "tagGroups": "Tag groups (JSON)",
+      "tagGroupsHelp": "Boolean tag filters, AND-ed together, as memory recall takes them. A leaf can set \"resolve\": \"fuzzy\".",
+      "tagGroupsInvalid": "Tag groups must be valid JSON.",
       "noResults": "No passages match this search.",
-      "idle": "Search the passages of this bank by text or by an image.",
-      "scoreHelp": "Cosine similarity between the query and the passage",
+      "idle": "Search this bank by text, an image, a video clip, or any mix of them.",
       "openPassage": "Open in document",
       "failed": "Search failed",
       "mediaTypes": "Media types",
       "mediaTypesHelp": "None checked searches every media type.",
-      "context": "Context",
-      "contextHelp": "Passages around each text hit to include as its context",
-      "showContext": "Show context",
-      "hideContext": "Hide context"
+      "showMore": "Show more",
+      "showLess": "Show less"
     },
     "linked": {
       "title": "Knowledge banks",
-      "description": "Reflect on this bank also searches the linked knowledge banks, and treats their documents as the authority over conflicting memories. Recall and mental models don't read them.",
       "none": "There are no knowledge banks yet.",
-      "createOne": "Create a knowledge bank",
-      "counts": "{documents, plural, one {# doc} other {# docs}} · {passages, plural, one {# passage} other {# passages}}",
-      "open": "Open",
-      "missing": "No longer exists",
-      "save": "Save links",
-      "saved": "Linked knowledge banks saved"
+      "noneLinked": "None linked",
+      "search": "Search knowledge banks…",
+      "missing": "No longer exists"
     },
     "selector": {
-      "select": "Select a knowledge bank...",
       "search": "Search knowledge banks...",
       "empty": "No knowledge banks yet.",
       "noSearchResults": "No knowledge banks match your search.",
       "create": "New knowledge bank",
-      "countsLegend": "docs · passages"
+      "emptyBank": "empty"
     },
     "home": {
-      "embedder": "Embedded with {model} ({dimension} dimensions)",
       "documents": "Documents",
       "passages": "Passages",
-      "size": "Size",
       "kindsTitle": "Documents by kind",
       "recentTitle": "Recently updated",
       "title": "Home",
@@ -2576,34 +2611,28 @@
       "noneInPeriod": "No documents added in this period",
       "noDocuments": "No documents yet",
       "pending": "{count} in progress",
-      "failed": "{count} failed"
+      "failed": "{count} failed",
+      "constellationTitle": "Constellation",
+      "viewAll": "View all",
+      "failedNotice": "{count, plural, one {# document failed to ingest} other {# documents failed to ingest}}. See why"
     },
     "settings": {
       "title": "Settings",
-      "description": "Manage this knowledge bank and see how its documents are embedded.",
-      "generalTitle": "General",
-      "generalDescription": "How the bank is named and identified.",
+      "description": "This bank's overview, ingest operations and how it splits files into passages.",
+      "tabGeneral": "General",
+      "tabConfiguration": "Configuration",
+      "generalIntro": "What the bank holds, and the uploads it is working through.",
+      "aboutTitle": "About",
+      "aboutDescription": "How the bank is named and identified.",
       "bankId": "Bank id",
       "created": "Created",
-      "embedderTitle": "Embedder and limits",
-      "embedderDescription": "Set on the server for every knowledge bank. Shown here for reference.",
-      "provider": "Provider",
-      "model": "Model",
-      "dimension": "Dimensions",
-      "maxFile": "Largest file",
-      "maxMedia": "Longest audio or video",
-      "maxPdfPages": "Most PDF pages",
-      "audioWindow": "Audio window",
-      "videoWindow": "Video window",
-      "overlap": "Window overlap",
-      "pdfPixels": "PDF page size (longest side)",
-      "textTokens": "Text passage size (tokens)",
-      "seconds": "{count, plural, one {# second} other {# seconds}}",
       "linkTitle": "Memory banks",
-      "linkDescription": "Memory banks that link this bank get its passages back from recall, as the authority.",
+      "linkDescription": "Reflect on a memory bank that links this bank also searches it, and treats its documents as the authority.",
       "linkHowTo": "Link it from a memory bank: open the memory bank, then Bank Configuration → Configuration → Knowledge banks.",
       "delete": "Delete bank",
-      "mediaTypes": "Media types it can write"
+      "resetConfig": "Reset configuration",
+      "resetConfigTitle": "Reset configuration?",
+      "resetConfigPrompt": "Every setting of {bankId} goes back to the server's default. Files already ingested keep their passages until they are uploaded again."
     },
     "addDocument": {
       "dialogSubtitle": "Add a new document to knowledge bank: ",
@@ -2612,16 +2641,163 @@
       "tagsHelp": "Comma-separated. Search can filter on them.",
       "filenameLabel": "File name",
       "filenamePlaceholder": "Defaults to the document id + .md",
-      "uploadHint": "PDF pages and images are embedded as pictures, audio in {audio}s windows, video in {video}s windows. Up to {max} per file.",
+      "uploadHint": "PDF pages and images are embedded as pictures, audio and video in short windows. A file the server can't take shows its reason here.",
       "allTagsLabel": "Tags for all files",
       "applyToAll": "Apply to all",
-      "tooLarge": "Too large: the limit is {max}",
       "editFile": "Edit tags and id for this file",
       "remove": "Remove {name}",
       "tagsFor": "Tags for {name}",
       "uploaded": "{count, plural, one {# file uploaded} other {# files uploaded}}. Search finds it once ingestion is done.",
       "someFailed": "{count, plural, one {# file failed} other {# files failed}} to upload",
-      "written": "Document added. It becomes searchable once it is ready."
+      "written": "Document added and searchable.",
+      "unchanged": "{count, plural, one {# file} other {# files}} unchanged: already ingested as is.",
+      "writtenUnchanged": "Unchanged: this document is already ingested as is."
+    },
+    "constellation": {
+      "empty": "No passages to show yet",
+      "hudStats": "{documents} documents · {passages} passages · {visible} visible · {labels} labels · {links} links · zoom {zoom}x"
+    },
+    "config": {
+      "intro": "How this bank splits its files into passages. A change applies to files ingested from now on; upload a file again to split it with the new settings.",
+      "loadFailed": "Could not load this bank's settings.",
+      "saveFailed": "Could not save.",
+      "serverDefault": "Server default",
+      "serverDefaultValue": "Server default ({value})",
+      "on": "On",
+      "off": "Off",
+      "overridden": "Set for this bank",
+      "useServerDefault": "Use server default",
+      "serverOff": "Turned off on the server for every bank.",
+      "accept": "Accept {kind} files",
+      "sections": {
+        "text": {
+          "title": "Text",
+          "description": "How text, and the text in documents, is cut into passages."
+        },
+        "pdf": {
+          "title": "PDF",
+          "description": "How PDF pages are read."
+        },
+        "images": {
+          "title": "Images",
+          "description": "How images are read."
+        },
+        "media": {
+          "title": "Audio & video",
+          "description": "How audio and video are cut into timed passages."
+        },
+        "types": {
+          "title": "Media types",
+          "description": "Which kinds of file this bank takes. It can turn off more kinds than the server does, never fewer."
+        }
+      },
+      "fields": {
+        "text_passage_tokens": {
+          "label": "Passage size (tokens)",
+          "description": "How much text goes into one passage: smaller finds more exact spots, larger keeps more context together."
+        },
+        "pdf_page_pixels": {
+          "label": "Page size (pixels)",
+          "description": "How large each PDF page is drawn, on its longest side, before it is read."
+        },
+        "pdf_bands": {
+          "label": "Page strips",
+          "description": "Also reads each PDF page as three horizontal strips, which finds small print better but makes ingest about twice as slow."
+        },
+        "max_pdf_pages": {
+          "label": "Most pages",
+          "description": "A PDF with more pages than this is refused; it can only be lower than the server's limit."
+        },
+        "image_tokens": {
+          "label": "Image detail (tokens)",
+          "description": "How many tokens each image is read as, from 70 to 1120: more sees finer detail but is slower."
+        },
+        "audio_window_seconds": {
+          "label": "Audio passage length (seconds)",
+          "description": "How many seconds of audio go into one passage."
+        },
+        "video_window_seconds": {
+          "label": "Video passage length (seconds)",
+          "description": "How many seconds of video go into one passage."
+        },
+        "media_overlap_seconds": {
+          "label": "Overlap (seconds)",
+          "description": "How many seconds each passage shares with the next, so nothing on a cut is lost; it must be shorter than both lengths."
+        },
+        "max_media_seconds": {
+          "label": "Longest file (seconds)",
+          "description": "Audio or video longer than this is refused; it can only be lower than the server's limit."
+        }
+      }
+    },
+    "trace": {
+      "parallelSearches": "Candidate searches, in parallel",
+      "arm_vector": "Meaning: main vectors",
+      "arm_vector_help": "The passages closest in meaning to the query, by their main vector.",
+      "arm_extra_vectors": "Meaning: extra vectors",
+      "arm_extra_vectors_help": "A PDF page's bands, text and text units, searched the same way.",
+      "arm_keyword": "Keywords",
+      "arm_keyword_help": "Full-text matches of the query's rarer words, in every document and language.",
+      "armScore": "Score in this search",
+      "meaningTitle": "Meaning score",
+      "meaningHelp": "Each of the {count} candidates, scored from all its vectors, then averaged with its document's best passage.",
+      "similarity": "main",
+      "passageScore": "passage",
+      "withDocument": "with document",
+      "meaning": "meaning",
+      "keyword": "keyword",
+      "score": "final",
+      "rankingTitle": "Keyword mix: the final ranking",
+      "rankingHelp": "Meaning and keywords scaled 0-1 and mixed, keywords {weight}%. Words used, with their rarity:",
+      "noKeywords": "No keyword search for this query.",
+      "idfHelp": "How rare the word is in this bank (IDF): rarer words count more.",
+      "referencePage": "reference list, pushed down",
+      "depthTitle": "Depth cut (budget {budget})",
+      "depthHelp": "Keeps the top {depth} of {total} for the token budget.",
+      "budgetTitle": "Filling max_tokens",
+      "budgetHelp": "{used} of {max} tokens, best hit first",
+      "action_window": "window",
+      "action_window_help": "A text hit with its free neighbours (a passage each side no result holds yet).",
+      "action_alone": "alone",
+      "action_alone_help": "A text hit with no room for its neighbours.",
+      "action_media": "media",
+      "action_media_help": "An image, page or clip: a fixed cost plus its text.",
+      "action_merged": "in result #{rank}",
+      "action_merged_help": "Already inside a better hit's result: it comes back there, nothing grows.",
+      "action_widened": "widened",
+      "action_widened_help": "Leftover budget added one passage to a side of the result (5 passages at most).",
+      "action_skipped": "skipped",
+      "action_skipped_help": "Nothing of it fit in what was left.",
+      "candidateRank": "candidate #{rank}",
+      "passages": "passages {first}–{last}",
+      "total": "{total} / {max}",
+      "resultsTitle": "Results",
+      "page": "p. {page}",
+      "viewAll": "View all {count}",
+      "showLess": "Show less"
     }
+  },
+  "observationTree": {
+    "empty": "No observations in this bank yet.",
+    "pickFile": "Pick a file on the left.",
+    "findPlaceholder": "Find in memories (text or regex)",
+    "showRaw": "Raw .md",
+    "exportZip": "Export .zip",
+    "recencyLegend": "recency · mentioned",
+    "showRendered": "Rendered",
+    "clearFind": "Clear",
+    "noMatches": "No matches.",
+    "matchSummary": "{matches, plural, one {# match} other {# matches}} in {files, plural, one {# file} other {# files}}",
+    "matchesInFile": "{shown} of {total} match",
+    "observationCount": "{count, plural, one {# observation} other {# observations}}",
+    "sources": "{count, plural, one {# source} other {# sources}}",
+    "updated": "updated {when}",
+    "related": "Related:",
+    "topics": "Topics",
+    "bestSupported": "Best supported",
+    "observations": "Observations",
+    "filesMode": "Files",
+    "constellationMode": "Constellation",
+    "sourcesLegend": "sources"
   }
 }

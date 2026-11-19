@@ -18,7 +18,7 @@ import pytest
 from hindsight_api.engine.llm_interface import ProviderContentPolicyError, ProviderRateLimitResetError
 from hindsight_api.engine.maintenance import MaintenanceLoop
 from hindsight_api.engine.memories import get_memories
-from hindsight_api.engine.memory_engine import MemoryEngine
+from hindsight_api.engine.memory_engine import MemoryEngine, MentalModelRefreshError
 from hindsight_api.engine.reflect import ReflectToolExecutionError
 from hindsight_api.engine.response_models import MentalModelTrigger
 from tests.store_seed import store_write_facts
@@ -459,6 +459,35 @@ async def test_a_temporary_provider_failure_does_not_pause_automatic_refresh(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cause", "paused"),
+    [(TimeoutError("Timeout on reading data from socket"), False), (_ProviderStatusError(400), True)],
+    ids=["reranker-timeout", "reranker-bad-request"],
+)
+async def test_a_failed_search_inside_the_real_refresh_pauses_only_when_permanent(
+    memory: MemoryEngine, request_context, monkeypatch, cause, paused
+):
+    """#6582: the tests above fake ``refresh_mental_model`` itself, so they skipped the
+    place a failed reflect search is recorded — and that place paused on every failure.
+    Here only the reflect run is faked; the refresh and its handler are real."""
+    bank = await _make_bank(memory, request_context)
+    async with memory._pool.acquire() as conn:
+        mm_id = await _insert_mm(conn, bank, refresh_cron="*/5 * * * *", last_refreshed_offset="1 day")
+
+    # How the TEI reranker reports a call that ran out of retries, under reflect's search.
+    tei_error = RuntimeError(f"TEI rerank request failed: {cause}")
+    tei_error.__cause__ = cause
+
+    async def _fail(*args, **kwargs):
+        raise _reflect_tool_failure(tei_error)
+
+    monkeypatch.setattr(memory, "_execute_mental_model_refresh", _fail)
+    with pytest.raises(MentalModelRefreshError):
+        await memory._handle_refresh_mental_model({"bank_id": bank, "mental_model_id": mm_id})
+    assert await memory._automatic_refresh_paused(bank, mm_id) is paused
+
+
+@pytest.mark.asyncio
 async def test_a_deterministic_refresh_failure_still_pauses(memory: MemoryEngine, request_context, monkeypatch):
     """#4532 holds for failures that would repeat on the same prompt."""
     bank = await _make_bank(memory, request_context)
@@ -779,3 +808,32 @@ async def test_a_stop_ends_the_pass_between_models(memory: MemoryEngine, request
     # Discovery spans every schema, so under a parallel run the first model reached may be
     # another test's; what matters is that nothing after it was.
     assert len(submitted) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_cron_shared_by_many_models_is_parsed_once(memory: MemoryEngine, request_context, monkeypatch):
+    """Parsing a cron runs on the event loop, and per row it stalled the loop for seconds on a
+    few thousand models (#6667). Models sharing an expression share its parse — and each is
+    still refreshed."""
+    import croniter as croniter_module
+
+    cron = "*/7 * * * *"  # unused by the other tests, so their models don't add parses
+    parsed: list[str] = []
+    real = croniter_module.croniter
+
+    def counting(expr, *args, **kwargs):
+        parsed.append(expr)
+        return real(expr, *args, **kwargs)
+
+    monkeypatch.setattr(croniter_module, "croniter", counting)
+
+    bank = await _make_bank(memory, request_context)
+    async with memory._pool.acquire() as conn:
+        mm_ids = [await _insert_mm(conn, bank, refresh_cron=cron, last_refreshed_offset="1 day") for _ in range(3)]
+    await _new_fact(memory, bank)
+
+    submitted = _patch_submit(memory, monkeypatch)
+    await MaintenanceLoop(memory)._run_scheduled_mm_refresh()
+
+    assert set(mm_ids) <= set(submitted)
+    assert parsed.count(cron) == 1

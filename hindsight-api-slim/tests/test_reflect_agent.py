@@ -2322,6 +2322,27 @@ class TestNoAnswerFailsHard:
         assert "no answer" in str(exc_info.value)
 
     @pytest.mark.asyncio
+    async def test_a_done_without_answer_is_asked_for_once_more(self, mock_llm, mock_functions):
+        """gpt-oss answered done with answer_ready's lone ``answer_found`` (#6520): the model is
+        told the answer is missing and asked again, once; empty twice still raises (tests below)."""
+        script = self._recall_then({"answer_found": True})
+        script.append(
+            LLMToolCallResult(
+                tool_calls=[
+                    LLMToolCall(id="3", name="done", arguments={"answer": "Alice leads it.", "answer_found": True})
+                ],
+                finish_reason="tool_calls",
+            )
+        )
+        mock_llm.call_with_tools.side_effect = closing_echo(script)
+
+        result = await self._run(mock_llm, mock_functions)
+
+        assert result.text == "Alice leads it."
+        re_ask = mock_llm.call_with_tools.call_args.kwargs["messages"][-1]
+        assert re_ask["role"] == "tool" and "carried no answer" in re_ask["content"]
+
+    @pytest.mark.asyncio
     async def test_missing_done_answer_raises(self, mock_llm, mock_functions):
         """``answer`` absent entirely, not just blank."""
         mock_llm.call_with_tools.side_effect = closing_echo(self._recall_then({"memory_ids": ["mem-1"]}))
@@ -2645,8 +2666,8 @@ class TestMentalModelShortCircuitRealLLM:
         }
 
     @pytest.mark.asyncio
-    async def test_real_fresh_mental_model_answers_without_lower_retrieval(self, llm_config, mock_functions):
-        """A fresh, sufficient mental model lets the real agent answer without obs/recall."""
+    async def test_real_fresh_mental_model_answers_from_the_page(self, llm_config, mock_functions):
+        """A fresh, sufficient mental model lets the real agent answer from the page itself."""
         functions = self._stub_functions(
             mock_functions,
             mental_models=[
@@ -2678,10 +2699,10 @@ class TestMentalModelShortCircuitRealLLM:
         )
 
         assert result.text, "agent must return a non-empty answer"
-        # The core behavioural win: the forced lower-level path was released, and a
-        # real model answered off the fresh mental model instead of digging deeper.
-        functions["search_observations_fn"].assert_not_called()
-        functions["recall_fn"].assert_not_called()
+        # Whether the model then also looks at observations or recall is its own
+        # choice once forcing is released, so it is not asserted (#6619): the release
+        # itself is deterministic and covered by the MockLLM tests above. What only a
+        # real model shows is that it answers off the fresh page, which the judge checks.
         await assert_meets_criteria(
             response=result.text,
             criteria=(
@@ -2819,17 +2840,17 @@ class TestMentalModelShortCircuitRealLLM:
         )
 
         assert result.text, "agent must return a non-empty answer"
-        # The behavioural fix: a page that does not cover the question is not an
-        # answer, so the agent goes to the layer that does instead of denying.
-        assert functions["recall_fn"].await_count > 0, (
-            "the agent answered without calling recall, from a page that holds no status for the issue"
-        )
+        # No hard assert on recall being called (#6619): which tools a free turn picks
+        # is the model's choice. The close date and the flag removal live only in the
+        # recall layer, so the judge requires one of them: that is the evidence the agent
+        # dug deeper rather than guessed.
         await assert_meets_criteria(
             response=result.text,
             criteria=(
-                "The answer reports that AURORA-412 was closed/fixed (on 12 March, and/or that its feature flag "
-                "was removed). It does NOT claim the bank holds nothing, no record, no status or no history for "
-                "AURORA-412."
+                "The answer reports that AURORA-412 was closed on 12 March, or that its feature flag was removed "
+                "(a bare 'it was closed' without either detail does not count). It does NOT claim the bank holds nothing, no record, no status or no history for "
+                "AURORA-412. Saying that the release-process page itself records no status is fine, as long as "
+                "the answer goes on to report the closed/fixed status."
             ),
             context=(
                 "The first search returned only a fresh page about the AURORA release process, which records no "
@@ -2900,8 +2921,8 @@ class TestMentalModelShortCircuitRealLLM:
         await assert_meets_criteria(
             response=result.text,
             criteria=(
-                "The answer reports that AURORA-412 was closed/fixed (on 12 March, and/or that its feature flag "
-                "was removed). It does NOT claim the bank holds nothing about AURORA-412."
+                "The answer reports that AURORA-412 was closed on 12 March, or that its feature flag was removed "
+                "(a bare 'it was closed' without either detail does not count). It does NOT claim the bank holds nothing about AURORA-412."
             ),
             context=(
                 "The page layer held only the release process. The raw-fact layer holds that AURORA-412 was "

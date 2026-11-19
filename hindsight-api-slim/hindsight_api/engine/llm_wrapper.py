@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import time
+from collections.abc import Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from typing import TYPE_CHECKING, Any, Union
 
@@ -1355,8 +1356,13 @@ class LLMProvider:
         skip_validation: bool = False,
         strict_schema: bool | None = None,
         prompt_cache: PromptCachePrefix | None = None,
+        accept_reply: Callable[[LLMCallResult], bool] | None = None,
     ) -> LLMCallResult:
         """Make an LLM API call with retry logic — see ``_call`` for the arguments.
+
+        ``accept_reply`` is for a fallback chain (``MultiLLMProvider``), which asks its
+        next member when it returns False. A single provider has no other member to ask,
+        so it ignores the check and the caller handles the reply itself.
 
         An installed LLM request extension decides first how the call is sent: its
         credentials, or a different LLM altogether, which then runs the call in this
@@ -1533,10 +1539,12 @@ class LLMProvider:
                         **cache_kwarg,
                         **attempt_kwarg,
                     )
-                except Exception as e:
+                except BaseException as e:
                     # The provider call may have succeeded (and incurred token
                     # cost) before local parsing/validation raised; attach the
                     # provider-reported usage to the error trace when available.
+                    # BaseException so a cancelled call (client gone mid-reflect)
+                    # still leaves a span; it is re-raised unchanged (#6624).
                     usage = current_response_usage()
                     get_span_recorder().record_llm_call(
                         provider=self.provider,
@@ -1615,11 +1623,29 @@ class LLMProvider:
                 max_backoff=max_backoff,
                 tool_choice=tool_choice,
             )
-        held = tools_via_schema.response_schema(tools, tool_choice)
-        text_messages = tools_via_schema.as_text_messages(
-            [*messages, {"role": "user", "content": tools_via_schema.turn_request(tools, tool_choice)}],
-            declared_tools or tools,
-        )
+        declared = declared_tools or tools
+        # Claude keeps a cached prefix only while the reply schema stays the same, so there every
+        # turn is held to "one of the declared functions" and a forced or narrowed turn is checked
+        # below instead: with a schema per turn kind, no reflect turn read a cache back on Bedrock.
+        # Elsewhere a forced turn keeps its own schema, which small models need to follow it
+        # (Gemma 4 made 1/12 forced searches without it, see tools_via_schema).
+        # The price on Claude: the reply schema no longer holds a turn's own limits. A forced or
+        # narrowed turn is checked below, and the closing ``done``'s cited-handle limits
+        # (reflect's ``_with_cited_handles``) go: an invented handle is dropped when the answer
+        # is read (``_cited_ids``), and a reply that runs to the token cap fails the closing
+        # call, which falls back to the standalone synthesis prompt.
+        shared_shape = self._provider_impl.caches_marked_prefix()
+        reply_choice = LLM_TOOL_CHOICE_REQUIRED if shared_shape else tool_choice
+        held = tools_via_schema.response_schema(declared if shared_shape else tools, reply_choice)
+        request = tools_via_schema.turn_request(tools, tool_choice, as_call=shared_shape)
+        if shared_shape:
+            text_messages = tools_via_schema.with_cached_turn_request(
+                tools_via_schema.as_text_messages(messages, declared, keep_parts=True), request
+            )
+        else:
+            text_messages = tools_via_schema.as_text_messages(
+                [*messages, {"role": "user", "content": request}], declared
+            )
         # The model-call record is built inside ``call``: bound here, it carries the turn's calls.
         turn_token = set_schema_tool_turn(SchemaToolTurn(tools=tools, tool_choice=tool_choice))
         usage = TokenUsage()  # a correction is billed too
@@ -1660,8 +1686,11 @@ class LLMProvider:
                     if isinstance(result.content, str)
                     else json.dumps(result.content, ensure_ascii=False)
                 )
-                tool_calls = tools_via_schema.calls_from_reply(reply, tools, tool_choice)
+                tool_calls = tools_via_schema.calls_from_reply(reply, tools, reply_choice)
                 violation = tools_via_schema.reply_violation(reply, tool_calls, tools)
+                forced = tool_choice.function_name
+                if violation is None and forced is not None and tool_calls[0].name != forced:
+                    violation = f"this turn must call `{forced}`, not `{tool_calls[0].name}`"
                 if violation is None:
                     break
                 if correction:
@@ -1676,8 +1705,7 @@ class LLMProvider:
                     {"role": "assistant", "content": reply},
                     {
                         "role": "user",
-                        "content": f"That reply does not fit the required format: {violation}. "
-                        + tools_via_schema.turn_request(tools, tool_choice),
+                        "content": f"That reply does not fit the required format: {violation}. " + request,
                     },
                 ]
         finally:
@@ -1791,10 +1819,12 @@ class LLMProvider:
                         tool_choice=tool_choice,
                         **attempt_kwarg,
                     )
-                except Exception as e:
+                except BaseException as e:
                     # The provider call may have succeeded (and incurred token
                     # cost) before local parsing/validation raised; attach the
                     # provider-reported usage to the error trace when available.
+                    # BaseException so a cancelled call (client gone mid-reflect)
+                    # still leaves a span; it is re-raised unchanged (#6624).
                     usage = current_response_usage()
                     get_span_recorder().record_llm_call(
                         provider=self.provider,

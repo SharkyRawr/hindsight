@@ -115,6 +115,15 @@ async def test_every_knowledge_bank_operation_goes_through_its_own_hook(api_clie
         r = await _upload(api_client, kb, [("blue.png", _png((0, 0, 255)), "image/png")], [{"document_id": "b"}])
         assert r.is_success, r.text
         assert (await api_client.delete(f"{KB}/{kb}/documents/b")).status_code == 200
+        assert (await api_client.get(f"{KB}/{kb}/config")).status_code == 200
+        r = await api_client.patch(f"{KB}/{kb}/config", json={"updates": {"text_passage_tokens": 64}})
+        assert r.status_code == 200, r.text
+        assert (await api_client.delete(f"{KB}/{kb}/config")).status_code == 200
+        assert (await api_client.get(f"{KB}/{kb}/tags")).status_code == 200
+        r = await api_client.get(f"{KB}/{kb}/stats/timeseries", params={"period": "7d"})
+        assert r.status_code == 200, r.text
+        assert (await api_client.get(f"{KB}/{kb}/documents/red/file")).status_code == 200
+        assert (await api_client.get(f"{KB}/{kb}/documents/red/passages/0/media")).status_code == 200
         assert [op for bank, op in validator.seen if bank == kb] == [
             KnowledgeBankReadOperation.GET_KNOWLEDGE_BANK,
             KnowledgeBankReadOperation.LIST_KNOWLEDGE_BANK_DOCUMENTS,
@@ -122,6 +131,13 @@ async def test_every_knowledge_bank_operation_goes_through_its_own_hook(api_clie
             KnowledgeBankReadOperation.SEARCH_KNOWLEDGE_BANK,
             KnowledgeBankWriteOperation.INGEST_KNOWLEDGE_BANK,
             KnowledgeBankWriteOperation.DELETE_KNOWLEDGE_BANK_DOCUMENT,
+            KnowledgeBankReadOperation.GET_KNOWLEDGE_BANK_CONFIG,
+            KnowledgeBankWriteOperation.UPDATE_KNOWLEDGE_BANK_CONFIG,
+            KnowledgeBankWriteOperation.RESET_KNOWLEDGE_BANK_CONFIG,
+            KnowledgeBankReadOperation.LIST_KNOWLEDGE_BANK_TAGS,
+            KnowledgeBankReadOperation.GET_KNOWLEDGE_BANK,
+            KnowledgeBankReadOperation.GET_KNOWLEDGE_BANK_DOCUMENT,
+            KnowledgeBankReadOperation.GET_KNOWLEDGE_BANK_DOCUMENT,
         ]
 
         # A rejected bank answers the validator's status, never a 404 that would say it exists.
@@ -130,7 +146,15 @@ async def test_every_knowledge_bank_operation_goes_through_its_own_hook(api_clie
             api_client.get(f"{KB}/{secret}/documents"),
             api_client.post(f"{KB}/{secret}/search", json={"query": "red"}),
             api_client.post(f"{KB}/{secret}/ingest", json={"items": [{"text": "x"}]}),
+            api_client.get(f"{KB}/{secret}/documents/nope"),
             api_client.get(f"{KB}/{secret}/documents/nope/file"),
+            api_client.get(f"{KB}/{secret}/documents/nope/passages/0/media"),
+            api_client.delete(f"{KB}/{secret}/documents/nope"),
+            api_client.get(f"{KB}/{secret}/tags"),
+            api_client.get(f"{KB}/{secret}/stats/timeseries", params={"period": "7d"}),
+            api_client.get(f"{KB}/{secret}/config"),
+            api_client.patch(f"{KB}/{secret}/config", json={"updates": {"text_passage_tokens": 64}}),
+            api_client.delete(f"{KB}/{secret}/config"),
             api_client.delete(f"{KB}/{secret}"),
             api_client.post(KB, json={"bank_id": f"secret-{uuid.uuid4().hex[:8]}"}),
         ):
@@ -142,6 +166,88 @@ async def test_every_knowledge_bank_operation_goes_through_its_own_hook(api_clie
         await api_client.delete(f"{KB}/{secret}")
 
 
+class RecordsCompletions(_Accepting):
+    """Records the post-operation hooks, so a test can check each fires with its work's size."""
+
+    def __init__(self) -> None:
+        super().__init__({})
+        self.searches: list = []
+        self.ingests: list = []
+        self.deletes: list = []
+
+    async def on_knowledge_bank_search_complete(self, result) -> None:
+        self.searches.append(result)
+
+    async def on_knowledge_bank_ingest_complete(self, result) -> None:
+        self.ingests.append(result)
+
+    async def on_knowledge_bank_delete_complete(self, result) -> None:
+        self.deletes.append(result)
+
+
+async def test_completion_hooks_fire_with_their_work_size(api_client, kb, install_validator):  # noqa: F811
+    """Search, ingest and delete each fire their completion hook with what the operation did:
+    the passages committed, the passages removed, and what a search's results weigh."""
+    validator = install_validator(RecordsCompletions())
+    assert isinstance(validator, RecordsCompletions)
+    try:
+        r = await _upload(api_client, kb, [("red.png", _png((255, 0, 0)), "image/png")], [{"document_id": "red"}])
+        assert r.is_success, r.text
+        # An ingest fired, carrying the bank and at least one committed passage, and the document's
+        # billable content size — for an image, its bytes at the media rate (so at least one token).
+        assert validator.ingests, "ingest hook did not fire"
+        assert all(i.bank_id == kb for i in validator.ingests)
+        assert sum(i.passages for i in validator.ingests) >= 1
+        assert sum(i.content_tokens for i in validator.ingests) >= 1
+
+        # Traced or not, a search reports what its results weigh: the figure the trace calls tokens_used.
+        r = await api_client.post(f"{KB}/{kb}/search", json={"query": "red", "trace": True})
+        assert r.status_code == 200, r.text
+        await _search(api_client, kb, query="red")
+        traced, untraced = validator.searches[-2:]
+        assert traced.bank_id == untraced.bank_id == kb
+        assert traced.result_count == untraced.result_count == len(r.json()["results"]) >= 1
+        assert traced.results_tokens == untraced.results_tokens == r.json()["trace"]["tokens_used"] > 0
+
+        assert (await api_client.delete(f"{KB}/{kb}/documents/red")).status_code == 200
+        assert validator.deletes, "delete hook did not fire"
+        assert sum(d.passages for d in validator.deletes) >= 1
+        assert sum(d.content_tokens for d in validator.deletes) >= 1
+    finally:
+        install_validator(None)
+
+
+class RaisesInCompletions(_Accepting):
+    """Every completion hook raises — metering must stay best-effort: the operation still succeeds."""
+
+    async def on_knowledge_bank_search_complete(self, result) -> None:
+        raise RuntimeError("metering down")
+
+    async def on_knowledge_bank_ingest_complete(self, result) -> None:
+        raise RuntimeError("metering down")
+
+    async def on_knowledge_bank_delete_complete(self, result) -> None:
+        raise RuntimeError("metering down")
+
+
+async def test_a_raising_completion_hook_does_not_fail_the_operation(api_client, kb, install_validator):  # noqa: F811
+    """A metering extension that raises in a completion hook must not fail the ingest (whose
+    passages are already committed, and whose hook fires inside the batch's retry try), the search,
+    or the delete."""
+    install_validator(RaisesInCompletions({}))
+    try:
+        r = await _upload(api_client, kb, [("red.png", _png((255, 0, 0)), "image/png")], [{"document_id": "red"}])
+        assert r.is_success, r.text
+        # The document is ready despite the ingest hook raising.
+        doc = await api_client.get(f"{KB}/{kb}/documents/red")
+        assert doc.status_code == 200 and doc.json()["status"] == "ready", doc.text
+        # Search still returns (its helper asserts 200), delete still succeeds.
+        await _search(api_client, kb, query="red")
+        assert (await api_client.delete(f"{KB}/{kb}/documents/red")).status_code == 200
+    finally:
+        install_validator(None)
+
+
 async def test_memory_bank_hooks_never_apply_to_a_knowledge_bank(api_client, install_validator, fake_embedder):  # noqa: F811
     install_validator(RejectsEveryMemoryBankHook({}))
     bank_id = f"kb-{uuid.uuid4().hex[:8]}"
@@ -151,6 +257,11 @@ async def test_memory_bank_hooks_never_apply_to_a_knowledge_bank(api_client, ins
         assert r.is_success, r.text
         assert (await api_client.get(f"{KB}/{bank_id}/documents/d")).status_code == 200
         assert bank_id in [b["bank_id"] for b in (await api_client.get(KB)).json()["banks"]]
+        # Through the memory-bank config routes, a caller the validator rejects is rejected (403), and
+        # does not learn from a 400 that the bank is a knowledge bank.
+        memory_config = f"/v1/default/banks/{bank_id}/config"
+        assert (await api_client.patch(memory_config, json={"updates": {"retain_mission": "x"}})).status_code == 403
+        assert (await api_client.delete(memory_config)).status_code == 403
         assert (await api_client.delete(f"{KB}/{bank_id}")).status_code == 200
     finally:
         install_validator(None)
@@ -266,17 +377,17 @@ STRATEGIES = {
 @pytest.fixture
 def strategies(monkeypatch):
     def configure(default: str | None = None) -> None:
-        monkeypatch.setenv("HINDSIGHT_API_INGEST_STRATEGIES", json.dumps(STRATEGIES))
+        monkeypatch.setenv("HINDSIGHT_API_KB_INGEST_STRATEGIES", json.dumps(STRATEGIES))
         if default:
-            monkeypatch.setenv("HINDSIGHT_API_INGEST_DEFAULT_STRATEGY", default)
+            monkeypatch.setenv("HINDSIGHT_API_KB_INGEST_DEFAULT_STRATEGY", default)
         else:
-            monkeypatch.delenv("HINDSIGHT_API_INGEST_DEFAULT_STRATEGY", raising=False)
+            monkeypatch.delenv("HINDSIGHT_API_KB_INGEST_DEFAULT_STRATEGY", raising=False)
         clear_config_cache()
 
     configure()
     yield configure
-    monkeypatch.delenv("HINDSIGHT_API_INGEST_STRATEGIES")
-    monkeypatch.delenv("HINDSIGHT_API_INGEST_DEFAULT_STRATEGY", raising=False)
+    monkeypatch.delenv("HINDSIGHT_API_KB_INGEST_STRATEGIES")
+    monkeypatch.delenv("HINDSIGHT_API_KB_INGEST_DEFAULT_STRATEGY", raising=False)
     clear_config_cache()
 
 

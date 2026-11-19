@@ -33,6 +33,23 @@ SettleFn = Callable[[str], Awaitable[None]]
 BANK_PREFIX = "systest-"
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    # Accept `-n` and ignore it. A shell or agent that exports `PYTEST_ADDOPTS=-n 3` to tame the
+    # api-slim suite otherwise aborts this one with "unrecognized arguments: -n": pytest-xdist is
+    # not installed here, and running in parallel would be wrong anyway, since every worker would
+    # start its own server on the one fixed pg0 port. `_addoption` because pytest reserves
+    # lowercase short flags for itself; it is the same call pytest-xdist makes to register `-n`.
+    parser.getgroup("system-tests")._addoption("-n", dest="ignored_numprocesses", default=None)
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    if config.getoption("ignored_numprocesses") is not None:
+        config.issue_config_time_warning(
+            pytest.PytestConfigWarning("-n is ignored: the system tests run serially against one server."),
+            stacklevel=2,
+        )
+
+
 @pytest.fixture(scope="session")
 def stubs() -> Stubs:
     return Stubs()
@@ -134,6 +151,25 @@ def decision_model_server(stub_server, tmp_path_factory: pytest.TempPathFactory)
             "HINDSIGHT_API_DECISION_MODEL_PROVIDER": "typesafe",
             "HINDSIGHT_API_DECISION_MODEL_API_KEY": "stub-key",
             "HINDSIGHT_API_DECISION_MODEL_BASE_URL": stub_server.url,
+            "HINDSIGHT_API_WORKER_ENABLED": "false",
+        },
+    )
+    yield server
+    server.stop()
+
+
+@pytest.fixture(scope="session")
+def knowledge_reranker_server(stub_server, tmp_path_factory: pytest.TempPathFactory) -> Iterator[object]:
+    """A server whose knowledge-bank search reranks with the stub's Cohere-style /rerank, pictures
+    included. Only knowledge search: recall keeps its own reranker. HTTP only, as ``decision_model_server``."""
+    log_path: Path = tmp_path_factory.mktemp("knowledge-reranker-server") / "server.log"
+    server = start_hindsight_server(
+        stub_url=stub_server.url,
+        log_path=log_path,
+        extra_env={
+            "HINDSIGHT_API_KB_RERANKER_URL": f"{stub_server.url}/rerank",
+            "HINDSIGHT_API_KB_RERANKER_API_KEY": "stub-key",
+            "HINDSIGHT_API_KB_RERANKER_MODEL": "stub-reranker",
             "HINDSIGHT_API_WORKER_ENABLED": "false",
         },
     )
@@ -255,6 +291,34 @@ def logged_out_primary_server(stub_server, tmp_path_factory: pytest.TempPathFact
             "HINDSIGHT_API_LLM_PROVIDER": "chatgpt",
             "HINDSIGHT_API_LLM_MODEL": "gpt-5",
             "HINDSIGHT_API_LLM_CHATGPT_HOME": str(run_dir / "chatgpt"),
+            "HINDSIGHT_API_LLM_STRATEGY": '{"mode": "failover"}',
+            "HINDSIGHT_API_LLM_1_PROVIDER": "openai",
+            "HINDSIGHT_API_LLM_1_MODEL": "stub-model",
+            "HINDSIGHT_API_LLM_1_API_KEY": "stub-key",
+            "HINDSIGHT_API_LLM_1_BASE_URL": f"{stub_server.url}/v1",
+            "HINDSIGHT_API_WORKER_ENABLED": "false",
+        },
+    )
+    yield server
+    server.stop()
+
+
+@pytest.fixture(scope="session")
+def echo_primary_server(stub_server, tmp_path_factory: pytest.TempPathFactory) -> Iterator[object]:
+    """A failover chain of two stub models, with no retry budget.
+
+    The story answers member 0 (``stub-echo``) with the JSON schema instead of the facts,
+    as Gemma 4 on vLLM sometimes does, and member 1 (``stub-model``) with the facts. With
+    retries at 0 there is no re-ask, so only the chain can save the document. The chain
+    is server-level, hence a process; HTTP only, for the same reason as ``wif_server``.
+    """
+    run_dir = tmp_path_factory.mktemp("echo-primary-server")
+    server = start_hindsight_server(
+        stub_url=stub_server.url,
+        log_path=run_dir / "server.log",
+        extra_env={
+            "HINDSIGHT_API_LLM_MODEL": "stub-echo",
+            "HINDSIGHT_API_LLM_MAX_RETRIES": "0",
             "HINDSIGHT_API_LLM_STRATEGY": '{"mode": "failover"}',
             "HINDSIGHT_API_LLM_1_PROVIDER": "openai",
             "HINDSIGHT_API_LLM_1_MODEL": "stub-model",
@@ -502,6 +566,13 @@ async def logged_out_primary_client(logged_out_primary_server) -> AsyncIterator[
     await client.aclose()
 
 
+@pytest.fixture
+async def echo_primary_client(echo_primary_server) -> AsyncIterator[Hindsight]:
+    client = Hindsight(base_url=echo_primary_server.url)
+    yield client
+    await client.aclose()
+
+
 @pytest.fixture(scope="session")
 def failover_server(stub_server, tmp_path_factory: pytest.TempPathFactory) -> Iterator[object]:
     """A server whose primary reranker is unreachable, with ``rrf`` as the next member.
@@ -552,6 +623,13 @@ async def split_embeddings_client(split_embeddings_server) -> AsyncIterator[Hind
 @pytest.fixture
 async def decision_model_client(decision_model_server) -> AsyncIterator[Hindsight]:
     client = Hindsight(base_url=decision_model_server.url)
+    yield client
+    await client.aclose()
+
+
+@pytest.fixture
+async def knowledge_reranker_client(knowledge_reranker_server) -> AsyncIterator[Hindsight]:
+    client = Hindsight(base_url=knowledge_reranker_server.url)
     yield client
     await client.aclose()
 

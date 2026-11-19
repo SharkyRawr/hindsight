@@ -41,7 +41,6 @@ class EvalRecord(BaseModel):
     #: The page's size after each wave; empty for a one-shot reflect answer.
     sizes: list[int] = Field(default_factory=list)
 
-
     @property
     def operation(self) -> Operation:
         return _OPERATION[self.kind]

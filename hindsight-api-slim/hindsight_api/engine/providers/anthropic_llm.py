@@ -19,10 +19,12 @@ from hindsight_api.engine.cache_affinity import apply_opencode_session
 from hindsight_api.engine.llm_interface import (
     LLMInterface,
     ProviderContentPolicyError,
+    merge_extra_body,
 )
 from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usage
 from hindsight_api.engine.llm_transport import build_sdk_timeout, describe_llm_error
 from hindsight_api.engine.providers.llm_debug import dump_request_on_4xx
+from hindsight_api.engine.providers.openai_compatible_llm import _strip_code_fences, record_retried_attempt
 from hindsight_api.engine.remote_retry import jittered_backoff
 from hindsight_api.engine.response_models import (
     BatchRequest,
@@ -406,8 +408,12 @@ class AnthropicLLM(LLMInterface):
         if use_native_format:
             call_params["output_config"] = {"format": {"type": "json_schema", "schema": schema}}
 
-        if self._extra_body:
-            call_params["extra_body"] = self._extra_body
+        extra_body = self._extra_body
+        if self._output_format_rejected:
+            # The endpoint refused output_config; resending the operator's copy would refuse again.
+            extra_body = {k: v for k, v in extra_body.items() if k != "output_config"}
+        if extra_body:
+            call_params["extra_body"] = merge_extra_body(call_params, extra_body)
 
         # opencode-go's /v1/messages requires x-opencode-session (#4071), reached
         # via provider=anthropic + an opencode.ai base URL; the host check decides.
@@ -416,6 +422,7 @@ class AnthropicLLM(LLMInterface):
         last_exception = None
 
         for attempt in range(max_retries + 1):
+            attempt_started = time.perf_counter()
             try:
                 async with attempt_context() if attempt_context is not None else nullcontext():
                     set_stage(f"llm.{self.provider}.{scope}.attempt={attempt + 1}/{max_retries + 1}")
@@ -438,18 +445,10 @@ class AnthropicLLM(LLMInterface):
                         content += block.text
 
                 if response_format is not None:
-                    # Models may wrap JSON in markdown code blocks
-                    clean_content = content
-                    if "```json" in content:
-                        clean_content = content.split("```json")[1].split("```")[0].strip()
-                    elif "```" in content:
-                        clean_content = content.split("```")[1].split("```")[0].strip()
-
-                    try:
-                        json_data = json.loads(clean_content)
-                    except json.JSONDecodeError:
-                        # Fallback to parsing raw content if markdown stripping failed
-                        json_data = json.loads(content)
+                    # Models may wrap JSON in markdown code blocks. The shared stripper only
+                    # treats a fence on its own line as one, so a code block inside a JSON
+                    # string value is not mistaken for the reply (#6640).
+                    json_data = json.loads(_strip_code_fences(content))
 
                     if skip_validation:
                         result = json_data
@@ -561,6 +560,14 @@ class AnthropicLLM(LLMInterface):
                     )
 
                     if should_retry:
+                        record_retried_attempt(
+                            provider=self.provider,
+                            model=self.model,
+                            scope=scope,
+                            messages=messages,
+                            error=e,
+                            started=attempt_started,
+                        )
                         await asyncio.sleep(jittered_backoff(attempt, initial_backoff, max_backoff))
                         continue
 
@@ -581,6 +588,10 @@ class AnthropicLLM(LLMInterface):
 
     def supports_vision(self) -> bool:
         """Every Claude model this provider can reach accepts image blocks."""
+        return True
+
+    def caches_marked_prefix(self) -> bool:
+        """Claude caches up to a ``cache_control`` part, passed through by ``_to_anthropic_content``."""
         return True
 
     # ── Message Batches API (50% token discount) ─────────────────────────────
@@ -649,10 +660,10 @@ class AnthropicLLM(LLMInterface):
             params["system"] = _cached_system_blocks(system_prompt, schema_msg)
 
         # Batch params ARE the raw Messages body, so operator-configured extra
-        # body params merge directly (the sync path routes them through the
-        # SDK's extra_body, which does the same merge server-side).
+        # body params merge directly; objects on both sides are deep-merged so a
+        # configured output_config.effort keeps output_config.format (#6640).
         if self._extra_body:
-            params.update(self._extra_body)
+            params.update(merge_extra_body(params, self._extra_body))
 
         return params
 

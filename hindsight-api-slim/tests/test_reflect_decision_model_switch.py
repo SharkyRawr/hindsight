@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from hindsight_api.engine.memories import ReflectFreshness
 from hindsight_api.models import RequestContext
 
 
@@ -30,8 +31,8 @@ def engine():
     )
     eng._authenticate_tenant = AsyncMock()  # type: ignore[method-assign]
     eng.ensure_bank_profile = AsyncMock(return_value={"name": "Test", "mission": ""})  # type: ignore[method-assign]
-    eng._bank_freshness = AsyncMock(  # type: ignore[method-assign]
-        return_value={"last_consolidated_at": None, "pending_consolidation": 0, "last_memory_write_at": None}
+    eng._reflect_freshness = AsyncMock(  # type: ignore[method-assign]
+        return_value=ReflectFreshness(pending=0, last_memory_write_at=None)
     )
     eng.list_directives = AsyncMock(return_value=DirectivePage(items=[], total=0))  # type: ignore[method-assign]
     eng._get_backend = AsyncMock(return_value=SimpleNamespace())  # type: ignore[method-assign]
@@ -138,6 +139,7 @@ def test_a_system_one_provider_drives_reflect(engine, monkeypatch, provider):
         timeout=5.0,
         max_concurrent=1,
         max_request_tokens=8192,
+        tokenizer="jev",
     )
     monkeypatch.setattr(
         "hindsight_api.engine.memory_engine.get_config",
@@ -150,3 +152,7 @@ def test_a_system_one_provider_drives_reflect(engine, monkeypatch, provider):
     # Its cut and verdict are retried like the shared decision model's calls: a single 429 used
     # to drop them, and that round answered like agent mode.
     assert client.retry_policy is not None
+    # Its questions are sized to the configured window, counted in the model's vocabulary (#6659):
+    # the class default (26k) refused every first request on a smaller window.
+    assert client.MAX_QUESTION_TOKENS == 8192
+    assert client.tokenizer == "jev"

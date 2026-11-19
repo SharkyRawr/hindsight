@@ -14,6 +14,9 @@ rerank = module.DecisionRerank(count=lambda t: len(t.split()), truncate=lambda t
 questions = rerank.questions(["a", "b"])
 assert [q.key for q in questions] == ["m0", "m1"], questions
 assert rerank.split("m", rerank.state("q"), {q.key: q.system_one() for q in questions}) == [["m0", "m1"]]
+(request,) = rerank.requests("q", ["a", {"picture": "p1", "text": "b"}])
+assert request.state == {"question": "q", "candidates": {"c1": "a", "c2": {"picture": "p1", "text": "b"}}}
+assert list(request.questions()) == ["c1", "c2"] and request.slots == [0, 1]
 assert rerank.scores([None, 0.9]) == [0.5, 1.0]
 leaked = sorted(name for name in sys.modules if name.split(".")[0] in {"hindsight_api", "toktok", "pydantic"})
 assert not leaked, leaked
@@ -31,6 +34,72 @@ def test_the_tokenizer_is_the_callers():
     # A quarter of a 40-token request: 10 words of memory, whatever the cap says.
     (question,) = words.questions(["word " * 50])
     assert question.memory == " ".join(["word"] * 10)
+    requests = words.requests("q", ["word " * 50, {"picture": "p1", "text": "word " * 50}])
+    assert {key: doc for request in requests for key, doc in request.state["candidates"].items()} == {
+        "c1": " ".join(["word"] * 10),
+        "c2": {"picture": "p1", "text": " ".join(["word"] * 10)},
+    }
+
+
+def test_the_requests_fill_the_window_in_order_and_count_what_the_caller_adds():
+    """Split only past the window, each request a run of the candidates in their order; a
+    picture costs what ``extra_tokens`` says, as the tokenizer does not see it."""
+    words = decision_rerank_interface.DecisionRerank(
+        count=lambda t: len(t.split()), truncate=lambda t, n: t, max_request_tokens=1_000
+    )
+    docs = ["alpha beta", "gamma delta", {"picture": "p1", "text": "epsilon"}]
+    (whole,) = words.requests("q", docs)
+    assert whole.slots == [0, 1, 2]
+    heavy = words.requests("q", docs, extra_tokens=lambda text: 900 if '"picture"' in text else 0)
+    assert [request.slots for request in heavy] == [[0, 1], [2]]
+    assert heavy[1].keys == ["c3"] and list(heavy[1].state["candidates"]) == ["c3"]
+    with_context = words.requests("q", docs[:1], shared_context="today is monday")
+    assert with_context[0].state == {"question": "q", "context": "today is monday", "candidates": {"c1": "alpha beta"}}
+
+
+def _words(max_request_tokens: int = 1_000) -> decision_rerank_interface.DecisionRerank:
+    return decision_rerank_interface.DecisionRerank(
+        count=lambda t: len(t.split()), truncate=lambda t, n: t, max_request_tokens=max_request_tokens
+    )
+
+
+def test_a_query_picture_goes_in_the_question_and_without_one_the_question_is_unchanged():
+    words = _words()
+    (plain,) = words.requests("q", ["a"])
+    assert plain.state["question"] == "q"  # the string form, byte for byte
+    (with_text,) = words.requests("q", ["a"], query_picture="query")
+    assert with_text.state["question"] == {"text": "q", "picture": "query"}
+    (image_only,) = words.requests("", ["a"], query_picture="query")
+    assert image_only.state["question"] == {"picture": "query"}  # no empty text
+    (empty,) = words.requests("", ["a"])
+    assert empty.state["question"] == ""
+
+
+def test_the_query_picture_costs_tokens_and_rides_in_every_split_request():
+    words = _words()
+    docs = ["alpha beta", "gamma delta"]
+    cost = lambda text: 900 if '"picture"' in text else 0  # noqa: E731
+    # The hook is the one candidate pictures use. Without a query picture it costs nothing and both fit.
+    (whole,) = words.requests("q", docs, extra_tokens=cost)
+    assert whole.slots == [0, 1]
+    # With one, every request's envelope holds it, so the pool splits and the picture repeats in each.
+    split = words.requests("q", docs, extra_tokens=cost, query_picture="query")
+    assert [r.slots for r in split] == [[0], [1]]
+    assert all(r.state["question"] == {"text": "q", "picture": "query"} for r in split)
+    # No hook, no cost: the picture is free and the pool stays whole.
+    (free,) = words.requests("q", docs, query_picture="query")
+    assert free.slots == [0, 1]
+
+
+def test_the_order_weighs_the_answers_with_the_input_order():
+    """Listwise: an even answer keeps the caller's order; a clear one overturns it. Pointwise
+    (no prior) the answer alone orders."""
+    words = decision_rerank_interface.DecisionRerank(count=lambda t: len(t.split()), truncate=lambda t, n: t)
+    prior = decision_rerank_interface.ORDER_PRIOR
+    assert words.scores([0.5, 0.55], prior) == [1.0, 0.5]
+    assert words.scores([0.1, 0.9], prior) == [0.5, 1.0]
+    assert words.scores([0.5, 0.55]) == [0.5, 1.0]
+    assert words.pruned([0.5, 0.55, 0.01], prior) == [1.0, 2 / 3, 0.0]
 
 
 def test_pruning_without_sending_anything():

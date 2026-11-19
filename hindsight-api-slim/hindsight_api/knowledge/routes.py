@@ -6,11 +6,9 @@ import base64
 import binascii
 import json
 import mimetypes
-import time
 from collections.abc import Callable
-from dataclasses import asdict
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import quote
 
 import aiohttp
@@ -18,21 +16,26 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Reques
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..api.content_disposition import content_disposition
 from ..config import get_config
 from ..engine.aiohttp_session import UpstreamHTTPError
+from ..engine.search.tags import TagGroup, TagsMatch
 from ..extensions.operation_validator import OperationValidationError
 from ..models import RequestContext
+from .bank_config import KnowledgeBankOverrides, KnowledgeBankSettings
 from .service import (
     IngestItem,
     IngestResult,
+    KnowledgeBankConfig,
     KnowledgeBankError,
     KnowledgeBankInfo,
     KnowledgeService,
     SearchRequest,
     SearchResultItem,
+    SearchTrace,
     get_knowledge_service,
 )
-from .store import KnowledgeDocument, KnowledgePassage, SearchFilters, SearchHit
+from .store import ArmName, KnowledgeDocument, KnowledgePassage, SearchFilters, SearchHit
 
 PREFIX = "/v1/default/knowledge-banks"
 
@@ -40,19 +43,20 @@ PREFIX = "/v1/default/knowledge-banks"
 # --- models ---------------------------------------------------------------------------------
 
 
-class KnowledgeConfigResponse(BaseModel):
-    provider: str
-    model: str
-    dimension: int
-    media_types: list[str] = Field(description="Media types this server's embedder can write.")
-    max_file_bytes: int
-    max_media_seconds: int
-    max_pdf_pages: int
-    audio_window_seconds: int
-    video_window_seconds: int
-    media_overlap_seconds: int
-    pdf_page_pixels: int
-    text_passage_tokens: int
+class KnowledgeBankConfigResponse(BaseModel):
+    bank_id: str
+    config: KnowledgeBankSettings = Field(
+        description="Every per-bank ingest setting as the bank splits files with it: its override, else "
+        "the server's default."
+    )
+    overrides: KnowledgeBankOverrides = Field(description="Only the settings this bank overrides.")
+
+
+class KnowledgeBankConfigUpdate(BaseModel):
+    updates: dict[str, Any] = Field(
+        description="Settings to override (named as in `config`); a null value clears that override. "
+        "Each change applies to files ingested after it: re-uploading an unchanged file re-splits it."
+    )
 
 
 class CreateKnowledgeBankRequest(BaseModel):
@@ -67,8 +71,10 @@ class KnowledgeBankResponse(BaseModel):
     ready_count: int
     pending_count: int
     failed_count: int
-    total_bytes: int
     documents_by_media_type: dict[str, int]
+    last_document_at: datetime | None = Field(
+        default=None, description="When a document was last added or changed; null for an empty bank"
+    )
 
 
 class KnowledgeBankListResponse(BaseModel):
@@ -84,7 +90,7 @@ class KnowledgeDeletedResponse(BaseModel):
 
 _STRATEGY_FIELD = Field(
     default=None,
-    description="Ingestion strategy for this item (one of the server's `HINDSIGHT_API_INGEST_STRATEGIES`). Omit "
+    description="Ingestion strategy for this item (one of the server's `HINDSIGHT_API_KB_INGEST_STRATEGIES`). Omit "
     "it and the server's default applies. A file whose type the strategy does not map is chunked as it is.",
 )
 
@@ -187,51 +193,154 @@ class KnowledgeTimeseriesResponse(BaseModel):
 class KnowledgeSearchRequest(BaseModel):
     query: str | None = Field(default=None, description="Text query.")
     query_image: str | None = Field(default=None, description="Base64 image to search with (alone or with text).")
-    top_k: int = Field(default=10, ge=1, le=200)
-    tags: list[str] | None = None
-    tags_match: Literal["any", "all"] = Field(default="any", title="Knowledge Tags Match")
-    document_ids: list[str] | None = None
-    neighbors: int = Field(
-        default=1,
-        ge=0,
-        le=5,
-        description="Text hits come back with this many passages on each side as `context`; overlapping "
-        "windows in one document are merged into the best hit. 0 turns it off.",
+    query_video: str | None = Field(
+        default=None,
+        description="Base64 MP4 clip to search with. Text, image and video can be combined: they are "
+        "embedded together as one query.",
     )
+    budget: Literal["low", "mid", "high"] = Field(
+        default="mid",
+        description="How deep the search ranks before `max_tokens` picks from it: low is fastest, high reaches "
+        "the most candidates (as memory-bank recall's budget).",
+    )
+    max_tokens: int = Field(
+        default=4096,
+        ge=1,
+        le=1_000_000,
+        description="What the results may weigh in all, as the tokens of their text. Hits come best first, each "
+        "text hit with the passages around it joined into its `text`, as many as fit; the rest of the budget widens the "
+        "best hits' context. An image, page or clip costs a small fixed amount plus its text.",
+    )
+    tags: list[str] | None = Field(
+        default=None, description="Filter by document tags, matched as memory-bank recall matches memory tags."
+    )
+    tags_match: TagsMatch = Field(
+        default="any",
+        description="How to match tags: 'any' (OR, includes untagged), 'all' (AND, includes untagged), "
+        "'any_strict' (OR, excludes untagged), 'all_strict' (AND, excludes untagged), "
+        "'exact' (set-equality, excludes untagged). With 'exact' and no tags (or []), only untagged documents match.",
+    )
+    tag_groups: list[TagGroup] | None = Field(
+        default=None,
+        description="Compound tag filter using boolean groups, as memory-bank recall takes it. Groups in the list "
+        "are AND-ed. Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}. A leaf "
+        "may set resolve='fuzzy' to match its tags against this bank's document tags by trigram similarity.",
+    )
+    document_ids: list[str] | None = None
     media_types: list[Literal["document", "image", "audio", "video", "text"]] | None = Field(
         default=None, title="Knowledge Media Types"
     )
-    pattern: str | None = Field(
-        default=None,
-        description="Exact text (case-insensitive), e.g. an error code or a name. Passages containing it rank "
-        "above all others; without `query`/`query_image`, documents are ranked by how many passages match.",
-    )
-    regex: bool = Field(
+    trace: bool = Field(
         default=False,
-        description="Treat `pattern` as a POSIX regular expression (case-insensitive), e.g. `timebox|time-box`.",
+        description="Also return how the search ranked and what the token budget kept: every ranked "
+        "candidate with its score step by step, the keyword words and their weights, and each phase's time.",
     )
+
+
+class KnowledgeTagItem(BaseModel):
+    tag: str
+    count: int = Field(description="How many of the bank's documents carry this tag")
+
+
+class KnowledgeTagsResponse(BaseModel):
+    """One page of a knowledge bank's document tags, most used first (as memory-bank `list_tags`)."""
+
+    items: list[KnowledgeTagItem]
+    total: int = Field(description="Distinct tags matching `q`, past this page too")
+    limit: int
+    offset: int
 
 
 class KnowledgeSearchResult(KnowledgePassageResponse):
     document_id: str
     filename: str | None
     tags: list[str]
-    score: float = Field(
-        description="Relevance: cosine similarity, fused with keyword matching when the query and document "
-        "share a language, plus 1 when the passage contains `pattern`. Without a query, the number of the "
-        "document's passages that contain `pattern`. Comparable within one response only."
-    )
     document_url: str
-    context: str | None = Field(
-        default=None, description="The hit with its neighbouring passages (text only; see `neighbors`)."
+
+
+class KnowledgeSearchTraceHit(BaseModel):
+    """One ranked candidate: its score step by step, and what the token budget did with it."""
+
+    rank: int = Field(description="Its place among all scored candidates, from 1")
+    outcome: Literal["returned", "merged", "over_budget", "below_depth"] = Field(
+        description="returned: a result of its own; merged: inside a better hit's text (merged_into_rank); "
+        "over_budget: nothing of it fit in max_tokens; below_depth: ranked past what the budget level keeps"
     )
-    context_first_index: int | None = None
-    context_last_index: int | None = None
+    result_rank: int | None = Field(default=None, description="Its place in `results`, from 1, when returned")
+    merged_into_rank: int | None = Field(default=None, description="The rank of the hit whose text holds it")
+    document_id: str
+    filename: str | None
+    index: int
+    media_type: str
+    page: int | None = None
+    start_ms: int | None = None
+    end_ms: int | None = None
+    snippet: str | None = Field(default=None, description="The start of the passage's own text")
+    score: float = Field(description="The final score it was ranked by; comparable within this search only")
+    found_by: list[str] = Field(description="The candidate searches that found it: vector, extra_vectors, keyword")
+    similarity: float = Field(description="Cosine similarity of the query and the passage's main vector")
+    roles: dict[str, float] = Field(
+        description="Best similarity of each extra vector (band, page_text, unit, sentence)"
+    )
+    passage_score: float = Field(description="The similarity with the extra vectors mixed in")
+    with_document: float = Field(description="Averaged with its document's best passage score")
+    keyword: float = Field(description="Keyword score: the summed IDF of the query words it contains")
+    reference_page: bool = Field(description="Read as a reference list, and pushed down")
+
+
+class KnowledgeTraceArmHit(BaseModel):
+    document_id: str
+    index: int
+    score: float = Field(description="Its score in this search: cosine similarity, or ts_rank_cd for keywords")
+
+
+class KnowledgeTraceArm(BaseModel):
+    """One candidate search, with its own list, best first."""
+
+    name: ArmName
+    results: list[KnowledgeTraceArmHit]
+
+
+class KnowledgeTraceBudgetStep(BaseModel):
+    """One step of filling max_tokens, in order."""
+
+    action: Literal["window", "alone", "media", "merged", "widened", "skipped"] = Field(
+        description="window: a text hit with its free neighbours; alone: no room for its neighbours; media: an "
+        "image, page or clip; merged: already inside a better hit's result; widened: leftover budget added a "
+        "passage to a result (5 at most); skipped: nothing of it fit"
+    )
+    rank: int = Field(description="The candidate's rank")
+    document_id: str
+    first: int = Field(description="The window's first passage after this step")
+    last: int = Field(description="The window's last passage after this step")
+    tokens: int = Field(description="Tokens this step added")
+    total: int = Field(description="Tokens used after this step")
+    into_rank: int | None = Field(default=None, description="For merged: the rank of the hit whose result holds it")
+
+
+class KnowledgeSearchTrace(BaseModel):
+    budget: Literal["low", "mid", "high"]
+    depth: int = Field(description="How many of the scored candidates the budget level keeps for max_tokens")
+    max_tokens: int
+    tokens_used: int = Field(description="What the results weigh, in tokens of their text")
+    candidates: int = Field(description="Passages the candidate searches found, before scoring")
+    keyword_weight: float = Field(description="The keyword score's share of the final score")
+    keyword_terms: dict[str, float] = Field(
+        description="Each query word the keyword search used, with its IDF; a word less than half as rare (IDF) "
+        "as the query's rarest word is left out"
+    )
+    timings_ms: dict[str, float] = Field(description="Each phase's time: open_bank, embed, store.search, context")
+    candidate_searches: list[KnowledgeTraceArm] = Field(description="Step 1: each candidate search's own list")
+    hits: list[KnowledgeSearchTraceHit] = Field(description="Steps 2-3: every candidate scored, best first")
+    budget_steps: list[KnowledgeTraceBudgetStep] = Field(description="Step 4: how max_tokens was filled, in order")
 
 
 class KnowledgeSearchResponse(BaseModel):
+    """Results best first. Ranks are what a caller compares: scores are fused per query and mean nothing
+    across responses, so a result does not carry one; ``trace: true`` returns them, step by step."""
+
     results: list[KnowledgeSearchResult]
-    took_ms: float
+    trace: KnowledgeSearchTrace | None = None
 
 
 # --- mapping --------------------------------------------------------------------------------
@@ -251,8 +360,8 @@ def bank_response(info: KnowledgeBankInfo) -> KnowledgeBankResponse:
         ready_count=s.ready_count,
         pending_count=s.pending_count,
         failed_count=s.failed_count,
-        total_bytes=s.total_bytes,
         documents_by_media_type=s.by_media_type,
+        last_document_at=s.last_document_at,
     )
 
 
@@ -293,17 +402,90 @@ def search_result(bank_id: str, hit: SearchHit) -> KnowledgeSearchResult:
         document_id=d.document_id,
         filename=d.filename,
         tags=d.tags,
-        score=round(hit.score, 6),
         document_url=f"{_doc_url(bank_id, d.document_id)}/file",
     )
 
 
 def item_result(bank_id: str, item: SearchResultItem) -> KnowledgeSearchResult:
+    """A hit as the API returns it: a text hit's ``text`` is the run of passages the budget gave it, the
+    matched one (``index``) and the text around it; a context field beside it said the same thing twice."""
     result = search_result(bank_id, item.hit)
-    result.context = item.context
-    result.context_first_index = item.context_first
-    result.context_last_index = item.context_last
+    if item.context is not None:
+        result.text = item.context
     return result
+
+
+#: How much of a passage's own text a trace shows: enough to recognise it.
+TRACE_SNIPPET_CHARS = 200
+
+
+def trace_response(body: KnowledgeSearchRequest, trace: SearchTrace, returned: list[SearchHit]) -> KnowledgeSearchTrace:
+    scored = trace.store.scored or [t.hit for t in trace.hits]
+    rank_of = {id(h): n for n, h in enumerate(scored, 1)}
+    result_rank = {id(hit): n for n, hit in enumerate(returned, 1)}
+    outcome_of = {id(t.hit): t for t in trace.hits}
+    hits = []
+    for n, h in enumerate(scored, 1):
+        traced, explain, text = outcome_of.get(id(h)), h.explain, h.passage.text
+        hits.append(
+            KnowledgeSearchTraceHit(
+                rank=n,
+                outcome=traced.outcome if traced else "below_depth",
+                result_rank=result_rank.get(id(h)),
+                merged_into_rank=rank_of.get(id(traced.merged_into)) if traced and traced.merged_into else None,
+                document_id=h.document.document_id,
+                filename=h.document.filename,
+                index=h.passage.index,
+                media_type=h.document.media_type,
+                page=h.passage.page,
+                start_ms=h.passage.start_ms,
+                end_ms=h.passage.end_ms,
+                snippet=text[:TRACE_SNIPPET_CHARS] if text else None,
+                score=h.score,
+                found_by=explain.found_by if explain else [],
+                similarity=explain.similarity if explain else h.score,
+                roles=explain.roles if explain else {},
+                passage_score=explain.passage_score if explain else h.score,
+                with_document=explain.with_document if explain else h.score,
+                keyword=explain.keyword if explain else 0.0,
+                reference_page=explain.reference_page if explain else False,
+            )
+        )
+    return KnowledgeSearchTrace(
+        budget=body.budget,
+        depth=len(trace.hits),
+        max_tokens=body.max_tokens,
+        tokens_used=trace.tokens_used,
+        candidates=trace.store.candidates,
+        keyword_weight=trace.store.keyword_weight,
+        keyword_terms=trace.store.keyword_terms,
+        timings_ms={phase: round(seconds * 1000, 1) for phase, seconds in trace.seconds.items()},
+        candidate_searches=[
+            KnowledgeTraceArm(
+                name=name,
+                results=[KnowledgeTraceArmHit(document_id=a.document_id, index=a.index, score=a.score) for a in arm],
+            )
+            for name, arm in trace.store.arms.items()
+        ],
+        hits=hits,
+        budget_steps=[
+            KnowledgeTraceBudgetStep(
+                action=st.action,
+                rank=rank_of.get(id(st.hit), 0),
+                document_id=st.document_id,
+                first=st.first,
+                last=st.last,
+                tokens=st.tokens,
+                total=st.total,
+                into_rank=rank_of.get(id(st.into)) if st.into is not None else None,
+            )
+            for st in trace.budget_steps
+        ],
+    )
+
+
+def config_response(state: KnowledgeBankConfig) -> KnowledgeBankConfigResponse:
+    return KnowledgeBankConfigResponse(bank_id=state.bank_id, config=state.settings, overrides=state.overrides)
 
 
 def _ingest_response(result: IngestResult) -> KnowledgeIngestResponse:
@@ -323,22 +505,34 @@ def _content_type(upload: UploadFile) -> str:
 
 
 def _http_error(exc: Exception) -> HTTPException:
+    # A store shedding the call (indexing behind its writers) is "not now": 503 with Retry-After, the
+    # memory banks' own rule, not a 500 that tells a bulk ingest its request is broken. Imported here:
+    # api/http.py builds this router, so a module-level import would load the whole of it first.
+    from ..api.http import _store_unavailable
+
+    unavailable = _store_unavailable(exc)
+    if unavailable is not None:
+        return unavailable
     if isinstance(exc, KnowledgeBankError):
         return HTTPException(status_code=exc.status_code, detail=str(exc))
     if isinstance(exc, OperationValidationError):
         return HTTPException(status_code=exc.status_code, detail=exc.reason)
     if isinstance(exc, ValueError):
         return HTTPException(status_code=400, detail=str(exc))
-    if isinstance(exc, aiohttp.ClientError | UpstreamHTTPError | TimeoutError):
+    if isinstance(exc, aiohttp.ClientError | UpstreamHTTPError):
         # The embedder is a remote server here: its outage is ours to report, not a crash.
         return HTTPException(status_code=503, detail=f"knowledge embedder unavailable: {exc}")
+    if isinstance(exc, TimeoutError):
+        # The embedder's or the database's: a statement past the command timeout raises it too, and
+        # calling every timeout an embedder outage sent a failed bank delete looking at the wrong thing.
+        return HTTPException(status_code=503, detail="timed out waiting for the embedder or the database")
     raise exc
 
 
 def _content_disposition(filename: str | None) -> dict[str, str]:
     if not filename:
         return {}
-    return {"Content-Disposition": f"inline; filename*=UTF-8''{quote(filename)}"}
+    return {"Content-Disposition": content_disposition("inline", filename)}
 
 
 # --- router ---------------------------------------------------------------------------------
@@ -347,8 +541,18 @@ def _content_disposition(filename: str | None) -> dict[str, str]:
 def _require_enabled() -> None:
     # Checked per request rather than at mount time, so a test (or an operator) can flip the flag
     # without rebuilding the app; with it off the server answers as if the routes did not exist.
-    if not get_config().enable_knowledge_banks:
+    if not get_config().enable_kb:
         raise HTTPException(status_code=404, detail="Not Found")
+
+
+def _require_config_writes() -> None:
+    # The memory banks' switch for per-bank config writes covers these too: an operator who froze
+    # bank settings froze all of them.
+    if not get_config().enable_bank_config_api:
+        raise HTTPException(
+            status_code=404,
+            detail="Bank configuration API is disabled. Set HINDSIGHT_API_ENABLE_BANK_CONFIG_API=true to re-enable.",
+        )
 
 
 def build_router(get_request_context: Callable[..., RequestContext]) -> APIRouter:
@@ -363,15 +567,6 @@ def build_router(get_request_context: Callable[..., RequestContext]) -> APIRoute
 
     def service(request: Request) -> KnowledgeService:
         return get_knowledge_service(request.app.state.memory)
-
-    @router.get(
-        "/config",
-        response_model=KnowledgeConfigResponse,
-        summary="Knowledge embedder and limits",
-        operation_id="get_knowledge_config",
-    )
-    async def get_config_route(request: Request) -> KnowledgeConfigResponse:
-        return KnowledgeConfigResponse(**asdict(await service(request).describe()))
 
     @router.post(
         "",
@@ -437,6 +632,57 @@ def build_router(get_request_context: Callable[..., RequestContext]) -> APIRoute
             raise _http_error(exc) from exc
         return KnowledgeDeletedResponse()
 
+    # `overrides` lists only what the bank sets: its unset fields are left out, not sent as null.
+    @router.get(
+        "/{bank_id}/config",
+        response_model=KnowledgeBankConfigResponse,
+        response_model_exclude_none=True,
+        summary="Get a knowledge bank's ingest settings",
+        operation_id="get_knowledge_bank_config",
+    )
+    async def get_bank_config(
+        bank_id: str, request: Request, rc: RequestContext = Depends(get_request_context)
+    ) -> KnowledgeBankConfigResponse:
+        try:
+            return config_response(await service(request).get_bank_config(bank_id, rc))
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @router.patch(
+        "/{bank_id}/config",
+        response_model=KnowledgeBankConfigResponse,
+        response_model_exclude_none=True,
+        summary="Override a knowledge bank's ingest settings",
+        operation_id="update_knowledge_bank_config",
+        dependencies=[Depends(_require_config_writes)],
+    )
+    async def update_bank_config(
+        bank_id: str,
+        body: KnowledgeBankConfigUpdate,
+        request: Request,
+        rc: RequestContext = Depends(get_request_context),
+    ) -> KnowledgeBankConfigResponse:
+        try:
+            return config_response(await service(request).update_bank_config(bank_id, body.updates, rc))
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @router.delete(
+        "/{bank_id}/config",
+        response_model=KnowledgeBankConfigResponse,
+        response_model_exclude_none=True,
+        summary="Reset a knowledge bank's ingest settings to the server's",
+        operation_id="reset_knowledge_bank_config",
+        dependencies=[Depends(_require_config_writes)],
+    )
+    async def reset_bank_config(
+        bank_id: str, request: Request, rc: RequestContext = Depends(get_request_context)
+    ) -> KnowledgeBankConfigResponse:
+        try:
+            return config_response(await service(request).reset_bank_config(bank_id, rc))
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
     @router.get(
         "/{bank_id}/stats/timeseries",
         response_model=KnowledgeTimeseriesResponse,
@@ -447,11 +693,14 @@ def build_router(get_request_context: Callable[..., RequestContext]) -> APIRoute
         bank_id: str,
         request: Request,
         period: Literal["1d", "7d", "30d", "90d"] = Query(default="7d"),
+        media_type: Literal["document", "image", "audio", "video", "text"] | None = Query(
+            default=None, description="Only documents of this media type."
+        ),
         rc: RequestContext = Depends(get_request_context),
     ) -> KnowledgeTimeseriesResponse:
         trunc: Literal["hour", "day"] = "hour" if period == "1d" else "day"
         try:
-            buckets = await service(request).timeseries(bank_id, period, trunc, rc)
+            buckets = await service(request).timeseries(bank_id, period, trunc, rc, media_type=media_type)
         except Exception as exc:
             raise _http_error(exc) from exc
         return KnowledgeTimeseriesResponse(
@@ -605,6 +854,34 @@ def build_router(get_request_context: Callable[..., RequestContext]) -> APIRoute
         return KnowledgeDeletedResponse()
 
     @router.get(
+        "/{bank_id}/tags",
+        response_model=KnowledgeTagsResponse,
+        summary="List a knowledge bank's document tags, with how many documents carry each",
+        operation_id="list_knowledge_bank_tags",
+    )
+    async def list_tags(
+        bank_id: str,
+        request: Request,
+        q: str | None = Query(
+            default=None,
+            description="Wildcard pattern to filter tags (e.g. 'team:*'). Use '*' as wildcard. Case-insensitive.",
+        ),
+        limit: int = Query(default=100, ge=0, le=1000),
+        offset: int = Query(default=0, ge=0),
+        rc: RequestContext = Depends(get_request_context),
+    ) -> KnowledgeTagsResponse:
+        try:
+            page = await service(request).list_tags(bank_id, rc, pattern=q, limit=limit, offset=offset)
+        except Exception as exc:
+            raise _http_error(exc) from exc
+        return KnowledgeTagsResponse(
+            items=[KnowledgeTagItem(tag=t.tag, count=t.documents) for t in page.tags],
+            total=page.total,
+            limit=limit,
+            offset=offset,
+        )
+
+    @router.get(
         "/{bank_id}/documents/{document_id}/file",
         summary="Download a document's original file",
         operation_id="get_knowledge_document_file",
@@ -641,41 +918,47 @@ def build_router(get_request_context: Callable[..., RequestContext]) -> APIRoute
     @router.post(
         "/{bank_id}/search",
         response_model=KnowledgeSearchResponse,
-        summary="Search passages by meaning (text or image query) and exact text",
+        summary="Search passages by meaning: a text, image or video query, alone or combined",
         operation_id="search_knowledge_bank",
     )
     async def search(
         bank_id: str, body: KnowledgeSearchRequest, request: Request, rc: RequestContext = Depends(get_request_context)
     ) -> KnowledgeSearchResponse:
-        started = time.perf_counter()
         try:
             image = base64.b64decode(body.query_image, validate=True) if body.query_image else None
         except (binascii.Error, ValueError) as exc:
             raise HTTPException(status_code=400, detail="query_image must be base64") from exc
+        try:
+            video = base64.b64decode(body.query_video, validate=True) if body.query_video else None
+        except (binascii.Error, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="query_video must be base64") from exc
         filters = SearchFilters(
             tags=body.tags,
             tags_match=body.tags_match,
+            tag_groups=body.tag_groups,
             document_ids=body.document_ids,
             media_types=list(body.media_types) if body.media_types else None,
         )
+        trace = SearchTrace() if body.trace else None
         try:
             hits = await service(request).search(
                 bank_id,
                 SearchRequest(
                     query=body.query,
                     query_image=image,
-                    top_k=body.top_k,
+                    query_video=video,
                     filters=filters,
-                    neighbors=body.neighbors,
-                    pattern=body.pattern,
-                    regex=body.regex,
+                    max_tokens=body.max_tokens,
+                    budget=body.budget,
                 ),
                 rc,
+                trace,
             )
         except Exception as exc:
             raise _http_error(exc) from exc
         return KnowledgeSearchResponse(
-            results=[item_result(bank_id, h) for h in hits], took_ms=round((time.perf_counter() - started) * 1000, 1)
+            results=[item_result(bank_id, h) for h in hits],
+            trace=trace_response(body, trace, [h.hit for h in hits]) if trace is not None else None,
         )
 
     return router

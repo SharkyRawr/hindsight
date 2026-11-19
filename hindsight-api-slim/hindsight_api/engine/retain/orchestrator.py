@@ -46,6 +46,7 @@ from ..memory_engine import count_tokens
 from ..schema import fq_table
 
 if TYPE_CHECKING:
+    from ...config import HindsightConfig
     from ...extensions.operation_validator import OperationValidatorExtension
     from ...models import RequestContext
     from ..memories.base import EntityResolverHandle
@@ -660,6 +661,17 @@ async def _record_retain_event(
 _RETAIN_PARAMS_NOT_REPLAYED = frozenset({"content", "document_id", "update_mode", "tags", "force_reextract"})
 
 
+def _relabel_observation_scopes(retain_params: dict[str, Any], config: "HindsightConfig") -> list | str | None:
+    """The scope a re-retain writes onto the facts it keeps: the request's, else the bank default.
+
+    Freshly extracted facts get the same fallback (``_apply_default_observation_scopes``), so a
+    request that names no scope leaves kept and re-extracted facts agreeing, as a full replace
+    would (#6672).
+    """
+    scopes = retain_params.get("observation_scopes")
+    return config.default_observation_scopes if scopes is None else scopes
+
+
 def _build_retain_params(contents_dicts, document_tags=None, doc_contents=None):
     """Build retain_params and merged_tags from content dicts."""
     if doc_contents is not None:
@@ -672,7 +684,9 @@ def _build_retain_params(contents_dicts, document_tags=None, doc_contents=None):
     for item in items:
         item_tags = item.get("tags", []) or []
         all_tags.update(item_tags)
-    merged_tags = list(all_tags)
+    # Sorted, not set order: string hashing differs per process, and a document's tags written
+    # in another order by another worker read as a change and rewrite every unit it owns (#6591).
+    merged_tags = sorted(all_tags)
 
     retain_params = {}
     if items:
@@ -1409,7 +1423,7 @@ async def _delta_store_owned_write(
                     effective_doc_id,
                     merged_tags,
                     retain_params.get("metadata", {}),
-                    observation_scopes=retain_params.get("observation_scopes"),
+                    observation_scopes=_relabel_observation_scopes(retain_params, config),
                     label_tag_keys=label_tag_keys(getattr(config, "entity_labels", None)),
                     previous_document_tags=doc_tags_at_load,
                     ops=pool.ops,
@@ -4558,7 +4572,7 @@ async def _try_delta_retain(
                             effective_doc_id,
                             merged_tags,
                             retain_params.get("metadata", {}),
-                            observation_scopes=retain_params.get("observation_scopes"),
+                            observation_scopes=_relabel_observation_scopes(retain_params, config),
                             label_tag_keys=label_tag_keys(getattr(config, "entity_labels", None)),
                             previous_document_tags=doc_tags_at_load,
                             ops=pool.ops,
@@ -4742,7 +4756,7 @@ async def _delta_metadata_only(
                     document_id,
                     merged_tags,
                     retain_params.get("metadata", {}),
-                    observation_scopes=retain_params.get("observation_scopes"),
+                    observation_scopes=_relabel_observation_scopes(retain_params, config),
                     label_tag_keys=label_tag_keys(getattr(config, "entity_labels", None)),
                     previous_document_tags=previous_document_tags,
                     ops=pool.ops,
@@ -4792,7 +4806,7 @@ async def _delta_metadata_only(
                     document_id,
                     merged_tags,
                     retain_params.get("metadata", {}),
-                    observation_scopes=retain_params.get("observation_scopes"),
+                    observation_scopes=_relabel_observation_scopes(retain_params, config),
                     label_tag_keys=label_tag_keys(getattr(config, "entity_labels", None)),
                     previous_document_tags=previous_document_tags,
                     ops=pool.ops,
@@ -4835,7 +4849,7 @@ def _build_contents(
     contents = []
     for item in contents_dicts:
         item_tags = item.get("tags", []) or []
-        merged_tags = list(set(item_tags + (document_tags or [])))
+        merged_tags = sorted(set(item_tags + (document_tags or [])))
 
         if "event_date" in item and item["event_date"] is None:
             event_date_value = None

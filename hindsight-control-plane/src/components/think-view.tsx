@@ -17,32 +17,48 @@ import {
 } from "@/components/ui/select";
 import { FactType, FactTypeFilter } from "@/components/fact-type-filter";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import {
-  Sparkles,
-  Info,
-  Tag,
-  Clock,
-  Database,
-  Brain,
-  MessageSquare,
-  X,
-  Check,
-  Play,
-} from "lucide-react";
+import { Sparkles, Info, Tag, Clock, Database, Brain, MessageSquare, X, Play } from "lucide-react";
 import { AttachmentStrip } from "@/components/ui/inline-attachment-text";
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import JsonView from "react18-json-view";
 import "react18-json-view/src/style.css";
 import { MemoryDetailModal } from "./memory-detail-modal";
+import { ReflectLLMStep } from "./reflect-llm-step";
 import { MentalModelDetailModal } from "./mental-model-detail-modal";
 import { ResponseSchemaField } from "./response-schema-field";
+import { buildReflectTimeline, traceIterations, traceWallMs } from "@/lib/reflect-timeline";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 type TagsMatch = "any" | "all" | "any_strict" | "all_strict" | "exact";
 type ViewMode = "answer" | "trace" | "json";
-type BasedOnTab = "directives" | "mental_models" | "observations" | "world" | "experience";
+type BasedOnTab =
+  | "directives"
+  | "mental_models"
+  | "observations"
+  | "world"
+  | "experience"
+  | "documents";
+
+type KnowledgeDocument = { source?: string; document_id: string; text?: string };
+
+/**
+ * The linked knowledge banks' passages reflect read. They reach the agent inside the recall
+ * tool's output (`documents`), not in `based_on`, so they are read from the trace.
+ */
+export function knowledgeDocuments(trace: any): KnowledgeDocument[] {
+  const seen = new Set<string>();
+  return (trace?.tool_calls ?? [])
+    .filter((tc: any) => tc.tool === "recall")
+    .flatMap((tc: any) => (tc.output?.documents ?? []) as KnowledgeDocument[])
+    .filter((d: KnowledgeDocument) => {
+      const key = `${d.document_id}|${d.text ?? ""}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
 
 // Stable component identity preserves the table's scroll position when controls change.
 function ReflectMarkdownTable({ children }: { children?: ReactNode }) {
@@ -565,17 +581,13 @@ export function ThinkView() {
                     <CardTitle className="text-base">{t("executionTraceTitle")}</CardTitle>
                     <CardDescription className="text-xs">
                       {t("executionTraceDescription", {
-                        iterations: result.iterations || 0,
-                        iterationsPlural: (result.iterations || 0) !== 1 ? "s" : "",
-                        totalMs:
-                          (result.trace?.llm_calls?.reduce(
-                            (sum: number, lc: any) => sum + lc.duration_ms,
-                            0
-                          ) || 0) +
-                          (result.trace?.tool_calls?.reduce(
-                            (sum: number, tc: any) => sum + tc.duration_ms,
-                            0
-                          ) || 0),
+                        iterations: traceIterations(result.trace?.tool_calls || []),
+                        iterationsPlural:
+                          traceIterations(result.trace?.tool_calls || []) !== 1 ? "s" : "",
+                        totalMs: traceWallMs(
+                          result.trace?.llm_calls || [],
+                          result.trace?.tool_calls || []
+                        ),
                       })}
                     </CardDescription>
                   </CardHeader>
@@ -593,155 +605,83 @@ export function ThinkView() {
                     ) : (result.trace?.llm_calls && result.trace.llm_calls.length > 0) ||
                       (result.trace?.tool_calls && result.trace.tool_calls.length > 0) ? (
                       <div className="max-h-[500px] overflow-y-auto pr-2">
-                        {/* Build timeline: LLM -> Tools -> LLM -> Tools */}
-                        {(() => {
-                          const llmCalls = result.trace?.llm_calls || [];
-                          const toolCalls = result.trace?.tool_calls || [];
+                        {buildReflectTimeline(
+                          result.trace?.llm_calls || [],
+                          result.trace?.tool_calls || []
+                        ).map((item, idx, timeline) => (
+                          <div key={idx} className="relative">
+                            {/* Timeline connector */}
+                            {idx < timeline.length - 1 && (
+                              <div className="absolute left-3 top-6 bottom-0 w-0.5 bg-border" />
+                            )}
 
-                          // Build interleaved timeline
-                          const timeline: Array<{
-                            type: "llm" | "tools";
-                            llm?: any;
-                            tools?: any[];
-                            iteration: number;
-                            isFinal?: boolean;
-                          }> = [];
-
-                          llmCalls.forEach((lc: any, idx: number) => {
-                            // Add tools for this iteration (using iteration field from tool trace)
-                            const iterTools = toolCalls.filter(
-                              (tc: any) => tc.iteration === idx + 1
-                            );
-                            // Determine if this is the final LLM call:
-                            // - scope includes "final", OR
-                            // - it's the last LLM call AND no tools were called after it
-                            const isLastLLMCall = idx === llmCalls.length - 1;
-                            const isFinal =
-                              lc.scope.includes("final") ||
-                              (isLastLLMCall && iterTools.length === 0);
-                            const iterNum = isFinal ? llmCalls.length : idx + 1;
-
-                            // Add LLM call
-                            timeline.push({
-                              type: "llm",
-                              llm: lc,
-                              iteration: iterNum,
-                              isFinal,
-                            });
-
-                            if (iterTools.length > 0) {
-                              timeline.push({
-                                type: "tools",
-                                tools: iterTools,
-                                iteration: idx + 1,
-                              });
-                            }
-                          });
-
-                          return timeline.map((item, idx) => (
-                            <div key={idx} className="relative">
-                              {/* Timeline connector */}
-                              {idx < timeline.length - 1 && (
-                                <div className="absolute left-3 top-6 bottom-0 w-0.5 bg-border" />
-                              )}
-
-                              {item.type === "llm" ? (
-                                // LLM Call
-                                <div className="flex items-start gap-3 pb-3">
-                                  <div
-                                    className={`w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0 ${
-                                      item.isFinal
-                                        ? "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400"
-                                        : "bg-primary/10 text-primary"
-                                    }`}
-                                  >
-                                    {item.isFinal ? (
-                                      <Check className="w-3.5 h-3.5" strokeWidth={2.5} />
-                                    ) : (
-                                      <span className="text-[10px] font-semibold">
-                                        {item.iteration}
-                                      </span>
-                                    )}
-                                  </div>
-                                  <div className="flex-1 min-w-0">
-                                    <div className="flex items-center justify-between">
-                                      <span className="font-medium text-sm">
-                                        {item.isFinal ? t("responseGenerated") : t("agentDecided")}
-                                      </span>
-                                      <span className="text-xs text-muted-foreground flex items-center gap-1">
-                                        <Clock className="w-3 h-3" />
-                                        {item.llm.duration_ms}ms
-                                      </span>
-                                    </div>
-                                    <span className="text-xs text-muted-foreground">
-                                      {item.isFinal ? t("finalAnswer") : t("calledToolsBelow")}
-                                    </span>
-                                  </div>
+                            {item.kind === "llm" ? (
+                              <ReflectLLMStep
+                                step={item.step}
+                                durationMs={item.duration_ms}
+                                offsetMs={item.offset_ms}
+                              />
+                            ) : (
+                              <div className="flex items-start gap-3 pb-3">
+                                <div className="w-6 h-6 rounded-full flex items-center justify-center bg-blue-500/15 text-blue-600 dark:text-blue-400 flex-shrink-0">
+                                  <Play className="w-3 h-3" fill="currentColor" />
                                 </div>
-                              ) : (
-                                // Tool Calls
-                                <div className="flex items-start gap-3 pb-3">
-                                  <div className="w-6 h-6 rounded-full flex items-center justify-center bg-blue-500/15 text-blue-600 dark:text-blue-400 flex-shrink-0">
-                                    <Play className="w-3 h-3" fill="currentColor" />
+                                <div className="flex-1 min-w-0 space-y-2">
+                                  <div className="text-xs text-muted-foreground">
+                                    {item.tools.length !== 1
+                                      ? t("executingToolsPlural", { count: item.tools.length })
+                                      : t("executingTools", { count: item.tools.length })}
+                                    <span className="font-mono"> · +{item.offset_ms}ms</span>
                                   </div>
-                                  <div className="flex-1 min-w-0 space-y-2">
-                                    <div className="text-xs text-muted-foreground">
-                                      {(item.tools?.length ?? 0) !== 1
-                                        ? t("executingToolsPlural", {
-                                            count: item.tools?.length ?? 0,
-                                          })
-                                        : t("executingTools", { count: item.tools?.length ?? 0 })}
-                                    </div>
-                                    {item.tools?.map((tc: any, tcIdx: number) => (
-                                      <div
-                                        key={tcIdx}
-                                        className="border border-border rounded-lg overflow-hidden"
-                                      >
-                                        <div className="flex items-center justify-between px-3 py-1.5 bg-muted/50">
-                                          <span className="font-medium text-sm text-foreground">
-                                            {tc.tool}
-                                          </span>
-                                          <span className="text-xs text-muted-foreground flex items-center gap-1">
-                                            <Clock className="w-3 h-3" />
-                                            {tc.duration_ms}ms
-                                          </span>
+                                  {item.tools.map((tc: any, tcIdx: number) => (
+                                    <div
+                                      key={tcIdx}
+                                      className="border border-border rounded-lg overflow-hidden"
+                                    >
+                                      <div className="flex items-center justify-between px-3 py-1.5 bg-muted/50">
+                                        <span className="font-medium text-sm text-foreground">
+                                          {tc.tool}
+                                        </span>
+                                        <span className="text-xs text-muted-foreground flex items-center gap-1">
+                                          <Clock className="w-3 h-3" />
+                                          {tc.duration_ms}ms
+                                        </span>
+                                      </div>
+                                      <div className="p-2 space-y-2">
+                                        <div>
+                                          <p className="text-[10px] font-semibold text-muted-foreground mb-1">
+                                            {t("toolInputLabel")}
+                                          </p>
+                                          <div className="bg-muted p-1.5 rounded text-xs overflow-auto max-h-32">
+                                            <JsonView
+                                              src={tc.input}
+                                              collapsed={1}
+                                              theme="default"
+                                            />
+                                          </div>
                                         </div>
-                                        <div className="p-2 space-y-2">
+                                        {tc.output && (
                                           <div>
                                             <p className="text-[10px] font-semibold text-muted-foreground mb-1">
-                                              {t("toolInputLabel")}
+                                              {t("toolOutputLabel")}
                                             </p>
                                             <div className="bg-muted p-1.5 rounded text-xs overflow-auto max-h-32">
                                               <JsonView
-                                                src={tc.input}
+                                                src={tc.output}
                                                 collapsed={1}
                                                 theme="default"
                                               />
                                             </div>
                                           </div>
-                                          {tc.output && (
-                                            <div>
-                                              <p className="text-[10px] font-semibold text-muted-foreground mb-1">
-                                                {t("toolOutputLabel")}
-                                              </p>
-                                              <div className="bg-muted p-1.5 rounded text-xs overflow-auto max-h-32">
-                                                <JsonView
-                                                  src={tc.output}
-                                                  collapsed={1}
-                                                  theme="default"
-                                                />
-                                              </div>
-                                            </div>
-                                          )}
-                                        </div>
+                                        )}
                                       </div>
-                                    ))}
-                                  </div>
+                                    </div>
+                                  ))}
                                 </div>
-                              )}
-                            </div>
-                          ));
-                        })()}
+                              </div>
+                            )}
+                          </div>
+                        ))}
                       </div>
                     ) : (
                       <div className="flex items-start gap-3 p-3 bg-muted border border-border rounded-lg">
@@ -768,7 +708,8 @@ export function ThinkView() {
                           (result.based_on?.observations?.filter(
                             (o: any) => o.subtype !== "directive"
                           )?.length || 0) +
-                          (result.based_on?.directives?.length || 0),
+                          (result.based_on?.directives?.length || 0) +
+                          knowledgeDocuments(result.trace).length,
                       })}
                     </CardDescription>
                   </CardHeader>
@@ -789,7 +730,8 @@ export function ThinkView() {
                       (result.based_on?.mental_models &&
                         result.based_on.mental_models.length > 0) ||
                       (result.based_on?.directives && result.based_on.directives.length > 0) ||
-                      (result.based_on?.observations && result.based_on.observations.length > 0) ? (
+                      (result.based_on?.observations && result.based_on.observations.length > 0) ||
+                      knowledgeDocuments(result.trace).length > 0 ? (
                       (() => {
                         const memories = result.based_on?.memories || [];
                         const worldFacts = memories.filter((f: any) => f.type === "world");
@@ -803,6 +745,7 @@ export function ThinkView() {
                         );
                         // Directives are in based_on.directives
                         const directives = result.based_on?.directives || [];
+                        const documents = knowledgeDocuments(result.trace);
 
                         // Build tabs array with all categories
                         const tabs: { id: BasedOnTab; label: string; count: number }[] = [
@@ -823,9 +766,18 @@ export function ThinkView() {
                             label: t("tabExperience"),
                             count: experienceFacts.length,
                           },
+                          {
+                            id: "documents",
+                            label: t("tabKnowledgeBanks"),
+                            count: documents.length,
+                          },
                         ];
 
-                        const currentTab = activeBasedOnTab;
+                        // The chosen tab, or the first with anything in it: a reflect answered from
+                        // documents alone would otherwise open on an empty "World".
+                        const currentTab = tabs.find((tab) => tab.id === activeBasedOnTab)?.count
+                          ? activeBasedOnTab
+                          : (tabs.find((tab) => tab.count > 0)?.id ?? activeBasedOnTab);
 
                         const getCurrentFacts = () => {
                           switch (currentTab) {
@@ -839,6 +791,8 @@ export function ThinkView() {
                               return worldFacts;
                             case "experience":
                               return experienceFacts;
+                            case "documents":
+                              return documents;
                             default:
                               return [];
                           }
@@ -849,12 +803,13 @@ export function ThinkView() {
                         return (
                           <div>
                             {/* Tabs */}
-                            <div className="flex items-center gap-1 bg-muted rounded-lg p-1 mb-4">
+                            {/* Wraps: six tabs do not fit side by side in a half-width card. */}
+                            <div className="flex flex-wrap items-center gap-1 bg-muted rounded-lg p-1 mb-4">
                               {tabs.map((tab) => (
                                 <button
                                   key={tab.id}
                                   onClick={() => setActiveBasedOnTab(tab.id)}
-                                  className={`flex-1 px-3 py-1.5 rounded-md text-sm font-medium transition-all ${
+                                  className={`flex-1 whitespace-nowrap px-3 py-1.5 rounded-md text-sm font-medium transition-all ${
                                     currentTab === tab.id
                                       ? "bg-background text-foreground shadow-sm"
                                       : "text-muted-foreground hover:text-foreground"
@@ -872,12 +827,13 @@ export function ThinkView() {
                                   <div
                                     key={item.id || i}
                                     className={`p-4 bg-muted/50 rounded-lg border border-border/50 ${
-                                      currentTab !== "directives"
+                                      currentTab !== "directives" && currentTab !== "documents"
                                         ? "cursor-pointer hover:bg-muted/80 transition-colors"
                                         : ""
                                     }`}
                                     onClick={() => {
-                                      if (currentTab === "directives") return; // Not clickable
+                                      if (currentTab === "directives" || currentTab === "documents")
+                                        return; // Not clickable
                                       if (currentTab === "observations")
                                         handleSelectObservation(item);
                                       else if (currentTab === "mental_models")
@@ -891,6 +847,17 @@ export function ThinkView() {
                                         {item.content && (
                                           <p className="mt-1 text-xs text-muted-foreground line-clamp-2">
                                             {item.content}
+                                          </p>
+                                        )}
+                                      </>
+                                    ) : currentTab === "documents" ? (
+                                      <>
+                                        <div className="font-medium text-sm">
+                                          {item.source || item.document_id}
+                                        </div>
+                                        {item.text && (
+                                          <p className="mt-1 whitespace-pre-wrap text-xs text-muted-foreground line-clamp-4">
+                                            {item.text}
                                           </p>
                                         )}
                                       </>

@@ -11,6 +11,8 @@ import os
 import platform
 import re
 import signal
+import socket
+import struct
 import subprocess
 import sys
 import sysconfig
@@ -28,7 +30,7 @@ from rich.text import Text
 
 from ._http_probe import ProbeResponse, probe_get
 from .embed_manager import EmbedManager
-from .profile_manager import ProfileLockTimeout, ProfileManager, lock_file, unlock_file
+from .profile_manager import ProfileLockTimeout, ProfileManager, ProfilePaths, lock_file, unlock_file
 
 logger = logging.getLogger(__name__)
 console = Console(stderr=True)
@@ -71,6 +73,13 @@ def _parse_non_negative_int(value: str | None, default: int, name: str) -> int:
 # runners than POSIX.
 DAEMON_STARTUP_TIMEOUT = int(os.getenv("HINDSIGHT_EMBED_DAEMON_STARTUP_TIMEOUT", "180"))
 DAEMON_STARTUP_TERMINATE_TIMEOUT = 10
+# How long a start waits for the daemon it replaces to finish exiting. A stopping
+# daemon frees its port first, then drains in-flight work (up to
+# HINDSIGHT_API_WORKER_SHUTDOWN_DRAIN_SECONDS, 20s by default), and only then stops
+# the profile's embedded Postgres. A replacement started inside that window ran its
+# migrations against a Postgres the old daemon then shut down: "Database migration
+# failed" on restart (#6540). Generous on purpose: waiting is cheap, the race is not.
+PREVIOUS_DAEMON_EXIT_TIMEOUT = 60.0
 DEFAULT_DAEMON_IDLE_TIMEOUT = 0  # 0 = disabled (no auto-exit)
 ENV_DAEMON_LOG_MAX_BYTES = "HINDSIGHT_EMBED_DAEMON_LOG_MAX_BYTES"
 ENV_DAEMON_LOG_BACKUP_COUNT = "HINDSIGHT_EMBED_DAEMON_LOG_BACKUP_COUNT"
@@ -186,6 +195,39 @@ def _strip_parent_interpreter_env(env: dict[str, str]) -> dict[str, str]:
     return {key: value for key, value in env.items() if key not in _PARENT_INTERPRETER_ENV}
 
 
+_AF_INET = 2
+_AF_INET6 = 23
+_ERROR_INSUFFICIENT_BUFFER = 122
+
+
+@dataclass(frozen=True)
+class _TcpRowLayout:
+    """Where the fields sit in one GetExtendedTcpTable row (TCP_TABLE_OWNER_PID_*)."""
+
+    size: int
+    port_offset: int
+    pid_offset: int
+
+
+# MIB_TCPROW_OWNER_PID is six DWORDs; MIB_TCP6ROW_OWNER_PID puts a 16-byte address
+# and a scope id before the port.
+_TCP_ROW_LAYOUT = {_AF_INET: _TcpRowLayout(24, 8, 20), _AF_INET6: _TcpRowLayout(56, 20, 52)}
+
+
+def _listener_pids_from_tcp_table(table: bytes, family: int, port: int) -> list[int]:
+    """Owning PIDs of the rows bound to `port` in a raw GetExtendedTcpTable buffer."""
+    layout = _TCP_ROW_LAYOUT[family]
+    (count,) = struct.unpack_from("<I", table, 0)
+    pids: list[int] = []
+    for index in range(count):
+        row = 4 + index * layout.size
+        (raw_port,) = struct.unpack_from("<I", table, row + layout.port_offset)
+        # The port sits in network byte order in the DWORD's low 16 bits.
+        if socket.ntohs(raw_port & 0xFFFF) == port:
+            pids.append(struct.unpack_from("<I", table, row + layout.pid_offset)[0])
+    return pids
+
+
 def _detach_popen_kwargs(log_handle: IO[bytes]) -> dict:
     """Cross-platform kwargs to spawn a subprocess detached from the caller.
 
@@ -237,6 +279,25 @@ def _signal_startup_process(process: subprocess.Popen, *, force: bool) -> None:
         process.kill()
     else:
         os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+
+
+def _kill_process_tree(pid: int) -> None:
+    """Force-kill a daemon we launched and everything it started.
+
+    Like `_signal_startup_process`: the pid may be the ``uvx`` launcher, and
+    killing only it would leave the real API holding the embedded Postgres.
+    """
+    if platform.system() == "Windows":
+        DaemonEmbedManager._run_probe(["taskkill", "/T", "/F", "/PID", str(pid)])
+        return
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        # Not a group leader after all: kill what there is.
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
 
 
 def _terminate_startup_process(process: subprocess.Popen) -> None:
@@ -584,8 +645,8 @@ class DaemonEmbedManager(EmbedManager):
         host that has plenty.
 
         `errors="replace"` is the half that makes it deterministic; `encoding` alone
-        still raises. Only the localized header carries non-ASCII, so every line the
-        parsers read survives intact and neither needed changing.
+        still raises. A replaced character can land in the netstat state column too
+        ("ABHÖREN"), which is why `_windows_listening_pids` does not read that column.
         """
         try:
             result = subprocess.run(
@@ -603,15 +664,25 @@ class DaemonEmbedManager(EmbedManager):
 
     @staticmethod
     def _windows_listening_pids(port: int) -> list[int]:
-        """PIDs listening on `port` according to netstat."""
+        """PIDs listening on `port`: asked from the kernel, netstat only as a fallback.
+
+        netstat prints its state column in the display language ("ABHÖREN" on a
+        German Windows) and is a subprocess that a loaded machine can push past the
+        probe deadline. Either way the caller got no PID for a daemon that was up,
+        and `daemon stop` / the stale-daemon restart refused to act (#6602).
+        """
+        native = DaemonEmbedManager._windows_native_listening_pids(port)
+        if native is not None:
+            return native
         output = DaemonEmbedManager._run_probe(["netstat", "-ano", "-p", "TCP"])
         if output is None:
             return []
         pids: list[int] = []
         for line in output.splitlines():
             fields = line.split()
-            # proto, local address, foreign address, state, pid
-            if len(fields) < 5 or fields[-2] != "LISTENING":
+            # proto, local address, foreign address, state, pid. The state is
+            # localized ("ABHÖREN"), so a listener is told by its foreign port 0.
+            if len(fields) < 5 or fields[0] != "TCP" or not fields[2].endswith(":0"):
                 continue
             # Match on the local address' port only: the daemon binds 127.0.0.1
             # but the UI can bind 0.0.0.0 or [::1] (issue #3527), and an
@@ -623,6 +694,48 @@ class DaemonEmbedManager(EmbedManager):
                 pids.append(int(fields[-1]))
             except ValueError:
                 continue
+        return pids
+
+    @staticmethod
+    def _windows_native_listening_pids(port: int) -> list[int] | None:
+        """PIDs listening on `port` from GetExtendedTcpTable, or None if it can't be read.
+
+        The table carries the state as a number and the owning PID, so nothing here
+        depends on the display language, and it answers without a subprocess.
+        """
+        import ctypes
+        from ctypes import wintypes
+
+        win_dll = getattr(ctypes, "WinDLL", None)  # only defined on Windows
+        if win_dll is None:
+            return None
+        try:
+            get_table = win_dll("iphlpapi").GetExtendedTcpTable
+        except (OSError, AttributeError):
+            return None
+        get_table.restype = wintypes.DWORD
+        get_table.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(wintypes.DWORD),
+            wintypes.BOOL,
+            wintypes.ULONG,
+            ctypes.c_int,  # TCP_TABLE_CLASS
+            wintypes.ULONG,
+        ]
+        tcp_table_owner_pid_listener = 3
+        pids: list[int] = []
+        for family in (_AF_INET, _AF_INET6):
+            size = wintypes.DWORD(0)
+            # The first call only reports the size the table needs. The table can
+            # grow between the two calls, so retry while it says the buffer is short.
+            for _attempt in range(3):
+                buffer = ctypes.create_string_buffer(max(size.value, 4))
+                status = get_table(buffer, ctypes.byref(size), False, family, tcp_table_owner_pid_listener, 0)
+                if status != _ERROR_INSUFFICIENT_BUFFER:
+                    break
+            if status != 0:
+                return None
+            pids.extend(_listener_pids_from_tcp_table(buffer.raw, family, port))
         return pids
 
     @staticmethod
@@ -820,6 +933,57 @@ class DaemonEmbedManager(EmbedManager):
         return False
 
     @staticmethod
+    def _daemon_pid_file(paths: ProfilePaths) -> Path:
+        """Where the start path records the PID of the daemon it launched."""
+        return paths.log.with_suffix(".pid")
+
+    @staticmethod
+    def _is_profile_daemon(pid: int, port: int) -> bool:
+        """True while `pid` is alive and is the daemon launched for `port`.
+
+        The port check guards against PID reuse (another profile's daemon, or
+        anything else) and rules out an exited daemon left as a zombie, whose
+        command line no longer carries its arguments.
+        """
+        cmdline = DaemonEmbedManager._process_command_line(pid)
+        if cmdline is None:
+            return False
+        lowered = cmdline.lower()
+        return any(marker in lowered for marker in DAEMON_PROCESS_MARKERS) and (
+            re.search(rf"--port[ =]{port}(\s|$)", lowered) is not None
+        )
+
+    def _wait_for_previous_daemon_exit(self, paths: ProfilePaths) -> None:
+        """Block until the daemon this profile last launched has exited.
+
+        Callers reach this with the port already free, so a recorded daemon that
+        is still alive is one that is shutting down and has yet to stop the
+        embedded Postgres a replacement would share. If it outlives the wait it
+        is hung; it is killed so the start can proceed.
+        """
+        pid_file = self._daemon_pid_file(paths)
+        try:
+            pid = int(pid_file.read_text().strip())
+        except (OSError, ValueError):
+            return
+
+        def _exited_within(seconds: float) -> bool:
+            deadline = time.monotonic() + seconds
+            while self._is_profile_daemon(pid, paths.port):
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.2)
+            return True
+
+        if self._is_profile_daemon(pid, paths.port):
+            logger.info(f"Waiting for the previous daemon (PID {pid}) to finish shutting down")
+            if not _exited_within(PREVIOUS_DAEMON_EXIT_TIMEOUT):
+                logger.warning(f"Previous daemon (PID {pid}) did not exit in time; killing it")
+                _kill_process_tree(pid)
+                _exited_within(DAEMON_STARTUP_TERMINATE_TIMEOUT)
+        pid_file.unlink(missing_ok=True)
+
+    @staticmethod
     def _port_health_ok(port: int) -> bool:
         """Return True when the listener on port responds like initialized Hindsight."""
         response = _probe(f"http://127.0.0.1:{port}/health", HEALTH_PROBE_TIMEOUT)
@@ -964,6 +1128,10 @@ class DaemonEmbedManager(EmbedManager):
                 self._register_profile(profile, port, config)
             return True
 
+        # A free port does not mean the previous daemon is gone (see
+        # PREVIOUS_DAEMON_EXIT_TIMEOUT).
+        self._wait_for_previous_daemon_exit(paths)
+
         # Load profile's .env file and merge with provided config
         # This fixes issue #305 where profile env vars were ignored
         profile_config = self._profile_manager.load_profile_config(profile)
@@ -1053,6 +1221,10 @@ class DaemonEmbedManager(EmbedManager):
             # can close its handle as soon as Popen returns.
             with open(daemon_log, "ab") as daemon_log_handle:
                 daemon_process = subprocess.Popen(cmd, env=env, **_detach_popen_kwargs(daemon_log_handle))
+            try:
+                self._daemon_pid_file(paths).write_text(str(daemon_process.pid))
+            except OSError:
+                logger.debug("Could not record daemon PID for %s", profile_label, exc_info=True)
 
             # Wait for daemon to be ready with rich UI
             start_time = time.time()

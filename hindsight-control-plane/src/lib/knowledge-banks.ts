@@ -4,7 +4,9 @@
  * `lib/api.ts`; uploads live here because they need XHR for progress events.
  */
 
+import type { TagGroup } from "./api";
 import { withBasePath } from "./base-path";
+import type { TagsMatch } from "./tag-filter-params";
 
 /** What a document or passage is. "document" covers PDF, Office and HTML files. */
 export type MediaType = "document" | "image" | "audio" | "video" | "text";
@@ -21,25 +23,41 @@ export interface KnowledgeBank {
   ready_count: number;
   pending_count: number;
   failed_count: number;
-  total_bytes: number;
   documents_by_media_type: Partial<Record<MediaType, number>>;
+  /** When a document was last added or changed; null for an empty bank. */
+  last_document_at?: string | null;
 }
 
-export interface KnowledgeConfig {
-  provider: string;
-  model: string;
-  dimension: number;
-  /** The media types this server can write. */
-  media_types: MediaType[];
-  max_file_bytes: number;
-  max_media_seconds: number;
-  max_pdf_pages: number;
+/** The settings a knowledge bank splits its files with: its own value, else the server's. */
+export interface KnowledgeIngestSettings {
+  text_passage_tokens: number;
+  pdf_page_pixels: number;
+  pdf_bands: boolean;
+  image_tokens: number;
   audio_window_seconds: number;
   video_window_seconds: number;
   media_overlap_seconds: number;
-  pdf_page_pixels: number;
-  text_passage_tokens: number;
+  /** May only be lower than the server's. */
+  max_media_seconds: number;
+  /** May only be lower than the server's. */
+  max_pdf_pages: number;
+  /** May only add to the server's. */
+  disabled_media_types: MediaType[];
 }
+
+export type KnowledgeSettingName = keyof KnowledgeIngestSettings;
+
+/** `GET/PATCH/DELETE /{bank}/config`: every setting resolved, and only the ones the bank sets. */
+export interface KnowledgeBankConfig {
+  bank_id: string;
+  config: KnowledgeIngestSettings;
+  overrides: Partial<KnowledgeIngestSettings>;
+}
+
+/** A PATCH body's `updates`: a null clears that override. */
+export type KnowledgeBankConfigUpdates = {
+  [K in KnowledgeSettingName]?: KnowledgeIngestSettings[K] | null;
+};
 
 export interface KnowledgeDocument {
   document_id: string;
@@ -74,35 +92,94 @@ export interface KnowledgeSearchResult extends KnowledgePassage {
   document_id: string;
   filename: string | null;
   tags: string[];
-  score: number;
   document_url: string;
-  /** Text hits: the hit merged with its neighbouring passages (see `neighbors`). */
-  context?: string | null;
-  context_first_index?: number | null;
-  context_last_index?: number | null;
-  /** Set on the `documents` section of a memory-bank recall: which knowledge bank it came from. */
-  bank_id?: string;
 }
+
+export type SearchBudget = "low" | "mid" | "high";
+export const SEARCH_BUDGETS: SearchBudget[] = ["low", "mid", "high"];
 
 export interface KnowledgeSearchRequest {
   query?: string;
   query_image?: string;
-  top_k: number;
+  /** Base64 MP4 clip; combined with the text and the image into one query. */
+  query_video?: string;
+  /** What the hits, and the text around them, may weigh in all, in tokens (server default 4096). */
+  max_tokens?: number;
+  /** How deep the search ranks before `max_tokens` picks from it (server default "mid"). */
+  budget?: SearchBudget;
   tags?: string[];
-  tags_match?: "any" | "all";
+  /** Same rules as memory recall: any/all keep untagged documents, the _strict modes and exact drop them. */
+  tags_match?: TagsMatch;
+  /** Compound boolean tag filter, as memory recall takes it. */
+  tag_groups?: TagGroup[];
   document_ids?: string[];
   media_types?: MediaType[];
-  /** Passages on each side of a text hit to return as `context` (0..5, server default 1). */
-  neighbors?: number;
-  /** Exact text (case-insensitive); alone, documents with the most matching passages come first. */
-  pattern?: string;
-  /** Treat `pattern` as a POSIX regular expression. */
-  regex?: boolean;
+  /** Also return how the search ranked and what the token budget kept. */
+  trace?: boolean;
 }
 
+/** One ranked candidate of a traced search: its score step by step, and what the budget did. */
+export interface KnowledgeSearchTraceHit {
+  rank: number;
+  outcome: "returned" | "merged" | "over_budget" | "below_depth";
+  result_rank: number | null;
+  merged_into_rank: number | null;
+  document_id: string;
+  filename: string | null;
+  index: number;
+  media_type: MediaType;
+  page: number | null;
+  start_ms: number | null;
+  end_ms: number | null;
+  snippet: string | null;
+  score: number;
+  found_by: string[];
+  similarity: number;
+  roles: Record<string, number>;
+  passage_score: number;
+  with_document: number;
+  keyword: number;
+  reference_page: boolean;
+}
+
+/** One step of filling max_tokens, in order. */
+export interface KnowledgeTraceBudgetStep {
+  action: "window" | "alone" | "media" | "merged" | "widened" | "skipped";
+  rank: number;
+  document_id: string;
+  first: number;
+  last: number;
+  tokens: number;
+  total: number;
+  into_rank: number | null;
+}
+
+export interface KnowledgeSearchTrace {
+  budget: SearchBudget;
+  /** How many scored candidates the budget level keeps for max_tokens. */
+  depth: number;
+  max_tokens: number;
+  tokens_used: number;
+  candidates: number;
+  keyword_weight: number;
+  keyword_terms: Record<string, number>;
+  timings_ms: Record<string, number>;
+  /** Step 1: each candidate search's own list, best first. */
+  candidate_searches: {
+    name: "vector" | "extra_vectors" | "keyword";
+    results: { document_id: string; index: number; score: number }[];
+  }[];
+  /** Every candidate scored, best first. */
+  hits: KnowledgeSearchTraceHit[];
+  /** How max_tokens was filled, in order. */
+  budget_steps: KnowledgeTraceBudgetStep[];
+}
+
+/** Results best first: a result carries its rank, not its score (scores mean nothing across queries);
+ * a traced search's `trace` carries the scores, step by step. */
 export interface KnowledgeSearchResponse {
   results: KnowledgeSearchResult[];
-  took_ms: number;
+  trace?: KnowledgeSearchTrace | null;
 }
 
 export interface KnowledgeIngestResponse {
@@ -128,7 +205,7 @@ export function knowledgeApi(...segments: string[]): string {
 }
 
 /**
- * The API hands out `media_url`/`file_url` as dataplane paths
+ * The API hands out `passage_url`/`document_url` as dataplane paths
  * (`/v1/default/knowledge-banks/...`); the browser reaches them through the proxy.
  */
 export function proxiedMediaUrl(apiPath: string): string {
@@ -214,6 +291,23 @@ export function fileToBase64(file: Blob): Promise<string> {
 }
 
 /** Builds the multipart body of `POST /{bank}/files/ingest`: `files` parts plus the aligned `request` JSON. */
+/** Groups items, in order, into batches of at most `maxBytes`; an item bigger than that goes alone. */
+export function packUploads<T>(items: T[], size: (item: T) => number, maxBytes: number): T[][] {
+  const batches: T[][] = [];
+  let bytes = 0;
+  for (const item of items) {
+    const last = batches[batches.length - 1];
+    if (last && bytes + size(item) <= maxBytes) {
+      last.push(item);
+      bytes += size(item);
+    } else {
+      batches.push([item]);
+      bytes = size(item);
+    }
+  }
+  return batches;
+}
+
 export function buildUploadForm(files: File[], options: FileUploadOptions[]): FormData {
   const form = new FormData();
   for (const file of files) form.append("files", file, file.name);
@@ -237,7 +331,7 @@ export function uploadKnowledgeFiles(
 ): Promise<KnowledgeIngestResponse> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open("POST", withBasePath(knowledgeApi(bankId, "files/ingest")));
+    xhr.open("POST", withBasePath(knowledgeApi(bankId, "files", "ingest")));
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable) onProgress(e.loaded / e.total);
     };
@@ -309,36 +403,4 @@ export function fillTimeseries(
     buckets[i].passages += b.passages;
   }
   return { trunc, buckets };
-}
-
-/**
- * Hits split by media type, each hit keeping its overall rank. Groups are ordered by
- * their best hit, so the type of the top result comes first.
- */
-export function groupByMediaType(results: KnowledgeSearchResult[]) {
-  const groups = new Map<MediaType, { result: KnowledgeSearchResult; rank: number }[]>();
-  results.forEach((result, i) => {
-    const hits = groups.get(result.media_type) ?? [];
-    hits.push({ result, rank: i + 1 });
-    groups.set(result.media_type, hits);
-  });
-  return [...groups].map(([mediaType, hits]) => ({ mediaType, hits }));
-}
-
-/**
- * A text hit's context split around the hit, so the hit can be highlighted inside
- * it. Null when there is no context, or the hit text is not found in it verbatim.
- */
-export function splitContext(
-  context: string | null | undefined,
-  hit: string | null | undefined
-): { before: string; hit: string; after: string } | null {
-  if (!context || !hit) return null;
-  const at = context.indexOf(hit);
-  if (at < 0) return null;
-  return {
-    before: context.slice(0, at),
-    hit,
-    after: context.slice(at + hit.length),
-  };
 }

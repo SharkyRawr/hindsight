@@ -1,6 +1,8 @@
 """Tests for daemon_client module."""
 
+import os
 import sys
+import time
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -401,6 +403,9 @@ class TestStartDaemonSerialization:
 
         with (
             patch.object(DaemonEmbedManager, "_clear_port", side_effect=lambda _: calls.append("clear") or True),
+            patch.object(
+                DaemonEmbedManager, "_wait_for_previous_daemon_exit", side_effect=lambda _: calls.append("wait")
+            ),
             patch.object(DaemonEmbedManager, "is_running", side_effect=[False, True, True]),
             patch.object(
                 DaemonEmbedManager, "_rotate_daemon_log", side_effect=lambda *_args, **_kwargs: calls.append("rotate")
@@ -416,7 +421,106 @@ class TestStartDaemonSerialization:
         ):
             assert manager._start_daemon_locked({}, "codex", paths) is True
 
-        assert calls == ["clear", "rotate", "spawn"]
+        assert calls == ["clear", "wait", "rotate", "spawn"]
+
+    def test_start_waits_for_the_previous_daemon_to_exit(self, tmp_path):
+        """A free port is not a stopped daemon (#6540).
+
+        A stopping daemon frees its port first and stops the profile's embedded
+        Postgres last. A replacement spawned in between ran its migrations against
+        a Postgres that then went away. The stand-in below is "still shutting down"
+        for a moment after the port is free; the wait must outlast it.
+        """
+        import subprocess
+
+        from hindsight_embed.profile_manager import ProfilePaths
+
+        paths = ProfilePaths(
+            config=tmp_path / "embed", lock=tmp_path / "daemon.lock", log=tmp_path / "daemon.log", port=9600
+        )
+        exiting = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(1.5)", "hindsight-api", "--port", "9600"]
+        )
+        try:
+            DaemonEmbedManager._daemon_pid_file(paths).write_text(str(exiting.pid))
+            DaemonEmbedManager()._wait_for_previous_daemon_exit(paths)
+            # The process is our child, so it lingered as a zombie until this
+            # poll() reaped it; the wait must have read that zombie as gone.
+            assert exiting.poll() is not None, "the wait returned while the previous daemon was alive"
+            assert not DaemonEmbedManager._daemon_pid_file(paths).exists()
+        finally:
+            exiting.kill()
+            exiting.wait()
+
+    def test_previous_daemon_pid_reused_by_another_process_is_ignored(self, tmp_path, monkeypatch):
+        """The recorded PID only counts while it is still a daemon on this profile's port."""
+        from hindsight_embed.profile_manager import ProfilePaths
+
+        paths = ProfilePaths(
+            config=tmp_path / "embed", lock=tmp_path / "daemon.lock", log=tmp_path / "daemon.log", port=9600
+        )
+        DaemonEmbedManager._daemon_pid_file(paths).write_text("4321")
+        monkeypatch.setattr(
+            DaemonEmbedManager,
+            "_process_command_line",
+            # 96000 starts with 9600: a prefix match would take it for ours.
+            staticmethod(lambda _pid: "python -m hindsight_api.main --idle-timeout 0 --port 96000"),
+        )
+        killed: list[int] = []
+        monkeypatch.setattr("hindsight_embed.daemon_embed_manager._kill_process_tree", killed.append)
+
+        DaemonEmbedManager()._wait_for_previous_daemon_exit(paths)
+
+        assert killed == []
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+    def test_a_hung_previous_daemon_is_killed_with_what_it_started(self, tmp_path, monkeypatch):
+        """Past the wait, the kill reaches the whole group: the recorded PID may be
+        the uvx launcher, and the real API under it holds the embedded Postgres."""
+        import subprocess
+
+        from hindsight_embed.profile_manager import ProfilePaths
+
+        monkeypatch.setattr("hindsight_embed.daemon_embed_manager.PREVIOUS_DAEMON_EXIT_TIMEOUT", 0.2)
+        paths = ProfilePaths(
+            config=tmp_path / "embed", lock=tmp_path / "daemon.lock", log=tmp_path / "daemon.log", port=9600
+        )
+        grandchild_pid_file = tmp_path / "grandchild.pid"
+        launcher = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import subprocess, sys, time; "
+                "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+                f"open({str(grandchild_pid_file)!r}, 'w').write(str(p.pid)); time.sleep(60)",
+                "hindsight-api",
+                "--port",
+                "9600",
+            ],
+            start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while not grandchild_pid_file.exists() or not grandchild_pid_file.read_text():
+                assert time.monotonic() < deadline, "launcher never started its child"
+                time.sleep(0.05)
+            grandchild = int(grandchild_pid_file.read_text())
+            DaemonEmbedManager._daemon_pid_file(paths).write_text(str(launcher.pid))
+
+            DaemonEmbedManager()._wait_for_previous_daemon_exit(paths)
+
+            assert launcher.wait(timeout=5) is not None
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    os.kill(grandchild, 0)
+                except OSError:
+                    break
+                assert time.monotonic() < deadline, "the process the launcher started survived the kill"
+                time.sleep(0.05)
+        finally:
+            launcher.kill()
+            launcher.wait()
 
 
 class TestDaemonLogRotation:
@@ -656,12 +760,58 @@ class TestListeningPidDiscovery:
             "  TCP    127.0.0.1:29177        0.0.0.0:0              LISTENING       9999\n"
         )
         monkeypatch.setattr("hindsight_embed.daemon_embed_manager.platform.system", lambda: "Windows")
+        _force_netstat(monkeypatch)
         monkeypatch.setattr(
             "hindsight_embed.daemon_embed_manager.subprocess.run",
             lambda cmd, **kwargs: Mock(returncode=0, stdout=netstat),
         )
 
         assert DaemonEmbedManager._listening_pids(19177) == [4321, 4322]
+
+    def test_windows_netstat_in_another_language_still_finds_the_listener(self, monkeypatch):
+        """A German netstat says ABHÖREN, not LISTENING; the listener must still be found (#6602)."""
+        netstat = (
+            "  TCP    127.0.0.1:9177         0.0.0.0:0              ABHÖREN         4321\n"
+            "  TCP    127.0.0.1:9177         127.0.0.1:50000        HERGESTELLT     7777\n"
+        )
+        monkeypatch.setattr("hindsight_embed.daemon_embed_manager.platform.system", lambda: "Windows")
+        _force_netstat(monkeypatch)
+        monkeypatch.setattr(
+            "hindsight_embed.daemon_embed_manager.subprocess.run",
+            lambda cmd, **kwargs: Mock(returncode=0, stdout=netstat),
+        )
+
+        assert DaemonEmbedManager._listening_pids(9177) == [4321]
+
+    def test_reads_listener_pids_from_a_kernel_tcp_table(self):
+        """The GetExtendedTcpTable rows are decoded at the right offsets, for both families."""
+        import socket
+        import struct
+
+        from hindsight_embed.daemon_embed_manager import _AF_INET, _AF_INET6, _listener_pids_from_tcp_table
+
+        def v4_row(port: int, pid: int) -> bytes:
+            return struct.pack("<6I", 2, 0x0100007F, socket.htons(port), 0, 0, pid)
+
+        def v6_row(port: int, pid: int) -> bytes:
+            return bytes(16) + struct.pack("<2I", 0, socket.htons(port)) + bytes(16) + struct.pack("<4I", 0, 0, 2, pid)
+
+        v4 = struct.pack("<I", 2) + v4_row(9177, 4321) + v4_row(8888, 9999)
+        v6 = struct.pack("<I", 2) + v6_row(8888, 9999) + v6_row(9177, 4322)
+
+        assert _listener_pids_from_tcp_table(v4, _AF_INET, 9177) == [4321]
+        assert _listener_pids_from_tcp_table(v6, _AF_INET6, 9177) == [4322]
+        assert _listener_pids_from_tcp_table(struct.pack("<I", 0), _AF_INET, 9177) == []
+
+    @pytest.mark.skipif(sys.platform != "win32", reason="reads the Windows kernel")
+    def test_windows_native_lookup_finds_a_live_listener(self):
+        import socket
+
+        with socket.socket() as server:
+            server.bind(("127.0.0.1", 0))
+            server.listen()
+            port = server.getsockname()[1]
+            assert DaemonEmbedManager._windows_native_listening_pids(port) == [os.getpid()]
 
 
 class TestProcessOwnership:
@@ -740,6 +890,11 @@ class TestProcessOwnership:
                 from hindsight_embed.daemon_embed_manager import DAEMON_PROCESS_MARKERS
 
                 assert DaemonEmbedManager._process_matches(1, DAEMON_PROCESS_MARKERS) is True
+
+
+def _force_netstat(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Send the Windows lookup to its netstat fallback. A real Windows runner would ask the kernel."""
+    monkeypatch.setattr(DaemonEmbedManager, "_windows_native_listening_pids", staticmethod(lambda _port: None))
 
 
 class TestStartDaemonLockTimeout:

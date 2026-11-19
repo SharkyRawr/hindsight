@@ -6,25 +6,32 @@ reflect reads from a linked bank — not the model. Retrieval quality is measure
 hindsight-dev/benchmarks/knowledge_banks_mm.
 """
 
+import asyncio
+import base64
 import io
 import json
 import math
-import shutil
-import subprocess
 import uuid
 from dataclasses import replace
 
 import pytest
 from PIL import Image
 
+from hindsight_api.engine.aiohttp_session import UpstreamHTTPError
+from hindsight_api.engine.token_encoding import count_tokens
 from hindsight_api.knowledge import media
 from hindsight_api.knowledge.embedders import EmbedInput, KnowledgeEmbedder
-from hindsight_api.knowledge.service import _EMBED_ROUND, _Work, get_knowledge_service, run_ingest_task
+from hindsight_api.knowledge.service import (
+    _EMBED_ROUND,
+    JUDGE_CONTEXT_TOKENS,
+    _Work,
+    get_knowledge_service,
+    run_ingest_task,
+)
 from hindsight_api.knowledge.store import StatusUpdate
 
 KB = "/v1/default/knowledge-banks"
 _AXES = ("red", "blue", "key", "password", "invoice", "audio", "video", "green")
-needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
 
 
 class FakeEmbedder(KnowledgeEmbedder):
@@ -64,10 +71,16 @@ class FakeEmbedder(KnowledgeEmbedder):
         self.calls.append(items)
         return [self._one(i) for i in items]
 
-    async def embed_query(self, text: str | None, image: bytes | None = None) -> list[float]:
+    async def embed_query(
+        self, text: str | None, image: bytes | None = None, video: bytes | None = None
+    ) -> list[float]:
+        """One vector for the whole query, as the real models give: here the sum of its parts."""
+        parts = [self._text(text)] if text else []
         if image is not None:
-            return self._one(EmbedInput(modality="image", data=image))
-        return self._norm(self._text(text or ""))
+            parts.append(self._one(EmbedInput(modality="image", data=image)))
+        if video is not None:
+            parts.append(self._one(EmbedInput(modality="video", data=video)))
+        return self._norm([sum(xs) for xs in zip(*parts)] if parts else self._text(""))
 
 
 def _png(color: tuple[int, int, int], size: tuple[int, int] = (64, 64)) -> bytes:
@@ -107,16 +120,28 @@ def _text_pdf(text: str) -> bytes:
 
 
 def _tone(seconds: int, *, video: bool) -> bytes:
-    with __import__("tempfile").TemporaryDirectory() as tmp:
-        out = f"{tmp}/clip.{'mp4' if video else 'm4a'}"
-        args = ["ffmpeg", "-loglevel", "error", "-y"]
-        if video:
-            args += ["-f", "lavfi", "-i", f"testsrc=duration={seconds}:size=160x120:rate=5"]
-        args += ["-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}"]
-        if video:
-            args += ["-c:v", "libx264", "-pix_fmt", "yuv420p"]
-        subprocess.run([*args, "-c:a", "aac", "-shortest", out], check=True)
-        return open(out, "rb").read()
+    """A 440 Hz tone (and a moving test picture), made with PyAV so no ffmpeg program is needed."""
+    import av
+    import numpy as np
+
+    out = io.BytesIO()
+    with av.open(out, "w", format="mp4") as dst:
+        a = dst.add_stream("aac", rate=16000, layout="mono")
+        v = dst.add_stream("libx264", rate=5) if video else None
+        if v is not None:
+            v.width, v.height, v.pix_fmt = 160, 120, "yuv420p"
+            for i in range(seconds * 5):
+                picture = np.full((120, 160, 3), (i * 7) % 255, np.uint8)
+                dst.mux(v.encode(av.VideoFrame.from_ndarray(picture, format="rgb24")))
+            dst.mux(v.encode(None))
+        step = 1024  # AAC frame size
+        samples = np.sin(2 * np.pi * 440 * np.arange(seconds * 16000) / 16000).astype(np.float32)
+        for start in range(0, samples.size, step):
+            frame = av.AudioFrame.from_ndarray(samples[None, start : start + step], format="fltp", layout="mono")
+            frame.sample_rate, frame.pts = 16000, start
+            dst.mux(a.encode(frame))
+        dst.mux(a.encode(None))
+    return out.getvalue()
 
 
 # --- chunking (no database) ---------------------------------------------------------------------
@@ -177,6 +202,22 @@ def test_image_is_kept_as_is_or_converted_when_an_api_would_not_take_it():
         media.split_image(b"not an image")
 
 
+def test_a_video_with_an_odd_height_is_cut_into_windows():
+    import av
+    import numpy as np
+
+    out = io.BytesIO()
+    with av.open(out, "w", format="mp4") as dst:  # mpeg4: libx264 itself cannot make an odd-sized source
+        v = dst.add_stream("mpeg4", rate=5)
+        v.width, v.height, v.pix_fmt = 160, 121, "yuv420p"
+        for i in range(40):
+            picture = np.full((121, 160, 3), (i * 7) % 255, np.uint8)
+            dst.mux(v.encode(av.VideoFrame.from_ndarray(picture, format="rgb24")))
+        dst.mux(v.encode(None))
+    windows = list(media.split_media(out.getvalue(), "video", window_seconds=3, overlap_seconds=0, max_seconds=60))
+    assert len(windows) > 1 and all(w.mime == "video/mp4" and w.data for w in windows)
+
+
 def test_text_is_split_into_token_sized_passages():
     text = "\n\n".join(f"Paragraph {i}. " + "word " * 80 for i in range(10))
     drafts = media.split_text(text, tokens=128)
@@ -184,7 +225,6 @@ def test_text_is_split_into_token_sized_passages():
 
 
 def test_passages_follow_structure_and_keep_exact_order():
-    from hindsight_api.engine.token_encoding import count_tokens
     from hindsight_api.knowledge.text_passages import split_into_passages
 
     para = "The tenant pays rent monthly. Late payment accrues interest. " * 3
@@ -203,13 +243,11 @@ def test_passages_follow_structure_and_keep_exact_order():
     assert any(c.startswith("5. TERMINATION") for c in chunks)
 
 
-@needs_ffmpeg
 def test_audio_and_video_are_cut_into_timed_windows():
     audio = list(
         media.split_media(
             _tone(70, video=False),
             "audio",
-            filename="a.m4a",
             window_seconds=30,
             overlap_seconds=5,
             max_seconds=3600,
@@ -218,15 +256,18 @@ def test_audio_and_video_are_cut_into_timed_windows():
     assert [(d.start_ms, d.modality) for d in audio] == [(0, "audio"), (25000, "audio"), (50000, "audio")]
     assert audio[-1].end_ms == pytest.approx(70000, abs=200)
     video = list(
-        media.split_media(
-            _tone(8, video=True), "video", filename="v.mp4", window_seconds=30, overlap_seconds=5, max_seconds=3600
-        )
+        media.split_media(_tone(8, video=True), "video", window_seconds=30, overlap_seconds=5, max_seconds=3600)
     )
     assert len(video) == 1 and video[0].mime == "video/mp4"
     assert media.decode_video_frames(video[0].data or b"").shape[1:] == (448, 448, 3)
     assert media.decode_audio_pcm(video[0].data or b"").size > 16000 * 7
     with pytest.raises(media.MediaError, match="limit is 5s"):
-        list(media.split_media(_tone(8, video=False), "audio", filename="a.m4a", window_seconds=30, overlap_seconds=5, max_seconds=5))  # fmt: skip
+        list(media.split_media(_tone(8, video=False), "audio", window_seconds=30, overlap_seconds=5, max_seconds=5))  # fmt: skip
+
+
+def test_unreadable_media_is_a_media_error():
+    with pytest.raises(media.MediaError, match="unreadable media"):
+        list(media.split_media(b"not a video", "video", window_seconds=30, overlap_seconds=5, max_seconds=60))
 
 
 # --- HTTP ---------------------------------------------------------------------------------------
@@ -281,6 +322,125 @@ async def test_bank_lifecycle_and_separation_from_memory_banks(api_client, memor
     assert (await api_client.get(f"{KB}/{kb}")).status_code == 404
 
 
+_LONG_TEXT = "\n\n".join(f"Section {n}. " + ("Unrelated filler words. " * 20) for n in range(8))
+
+
+async def _passage_count(client, bank_id: str, document_id: str) -> int:
+    detail = (await client.get(f"{KB}/{bank_id}/documents/{document_id}")).json()
+    assert detail["status"] == "ready", detail
+    return len(detail["passages"])
+
+
+async def test_a_bank_config_starts_on_the_server_defaults_and_shows_no_system_settings(api_client, kb):
+    from hindsight_api.config import get_config
+
+    r = await api_client.get(f"{KB}/{kb}/config")
+    assert r.status_code == 200, r.text
+    c = get_config()
+    assert r.json() == {
+        "bank_id": kb,
+        "config": {
+            "text_passage_tokens": c.kb_text_passage_tokens,
+            "pdf_page_pixels": c.kb_pdf_page_pixels,
+            "pdf_bands": c.kb_pdf_bands,
+            "image_tokens": c.kb_image_tokens,
+            "audio_window_seconds": c.kb_audio_window_seconds,
+            "video_window_seconds": c.kb_video_window_seconds,
+            "media_overlap_seconds": c.kb_media_overlap_seconds,
+            "max_media_seconds": c.kb_max_media_seconds,
+            "max_pdf_pages": c.kb_max_pdf_pages,
+            "disabled_media_types": sorted(c.kb_disabled_media_types),
+        },
+        "overrides": {},
+    }
+    # The embedder and the server's limits are not anybody's to read: the route that told them is gone.
+    assert (await api_client.get(f"{KB}/config")).status_code == 404
+
+
+async def test_a_bank_override_is_applied_at_ingest_and_a_reset_restores_the_default(api_client, kb):
+    await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"document_id": "m", "text": _LONG_TEXT}]})
+    default = await _passage_count(api_client, kb, "m")
+
+    r = await api_client.patch(f"{KB}/{kb}/config", json={"updates": {"text_passage_tokens": 32}})
+    assert r.status_code == 200, r.text
+    assert r.json()["config"]["text_passage_tokens"] == 32 and r.json()["overrides"] == {"text_passage_tokens": 32}
+    assert (await api_client.get(f"{KB}/{kb}/config")).json()["overrides"] == {"text_passage_tokens": 32}
+    # The same text again is not "unchanged": the bank's settings are part of its content hash.
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"document_id": "m", "text": _LONG_TEXT}]})
+    assert r.json()["unchanged_document_ids"] == []
+    assert await _passage_count(api_client, kb, "m") > default
+
+    # Another override merges with the first; null clears one.
+    r = await api_client.patch(f"{KB}/{kb}/config", json={"updates": {"pdf_bands": True}})
+    assert r.json()["overrides"] == {"text_passage_tokens": 32, "pdf_bands": True}
+    r = await api_client.patch(f"{KB}/{kb}/config", json={"updates": {"pdf_bands": None}})
+    assert r.json()["overrides"] == {"text_passage_tokens": 32}
+
+    r = await api_client.delete(f"{KB}/{kb}/config")
+    assert r.status_code == 200 and r.json()["overrides"] == {}
+    assert r.json() == (await api_client.get(f"{KB}/{kb}/config")).json()
+    await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"document_id": "m", "text": _LONG_TEXT}]})
+    assert await _passage_count(api_client, kb, "m") == default
+
+
+async def test_a_bank_override_reaches_the_media_splitters_and_the_embedder(api_client, kb, fake_embedder):
+    r = await api_client.patch(
+        f"{KB}/{kb}/config",
+        json={"updates": {"max_pdf_pages": 1, "image_tokens": 560, "disabled_media_types": ["audio"]}},
+    )
+    assert r.status_code == 200, r.text
+    r = await _upload(
+        api_client, kb, [("two.pdf", _pdf((250, 0, 0), (0, 0, 250)), "application/pdf")], [{"document_id": "p"}]
+    )
+    detail = (await api_client.get(f"{KB}/{kb}/documents/p")).json()
+    assert detail["status"] == "failed" and "the limit is 1" in detail["error"], detail
+    fake_embedder.calls.clear()
+    r = await _upload(api_client, kb, [("red.png", _png((255, 0, 0)), "image/png")], [{"document_id": "red"}])
+    assert r.is_success, r.text
+    assert [i.image_tokens for call in fake_embedder.calls for i in call if i.modality == "image"] == [560]
+    r = await _upload(api_client, kb, [("a.m4a", b"not really audio", "audio/mp4")])
+    assert r.status_code == 415 and "this bank does not ingest" in r.text
+
+
+async def test_a_bank_config_refuses_what_a_bank_may_not_set(api_client, kb):
+    from hindsight_api.config import get_config
+
+    async def refused(updates: dict) -> str:
+        r = await api_client.patch(f"{KB}/{kb}/config", json={"updates": updates})
+        assert r.status_code == 400, r.text
+        return r.json()["detail"]
+
+    # Models, providers, keys and the server's limits are the server's: named back, nothing written.
+    detail = await refused({"embeddings_model": "x", "max_file_mb": 1, "text_passage_tokens": 64})
+    assert "embeddings_model" in detail and "max_file_mb" in detail
+    assert "kb_text_passage_tokens" in await refused({"kb_text_passage_tokens": 64})
+    assert "text_passage_tokens" in await refused({"text_passage_tokens": 0})
+    assert "text_passage_tokens" in await refused({"text_passage_tokens": "64"})
+    assert "image_tokens" in await refused({"image_tokens": 5000})
+    assert "disabled_media_types" in await refused({"disabled_media_types": ["pictures"]})
+    assert "media_overlap_seconds" in await refused({"media_overlap_seconds": 30, "video_window_seconds": 30})
+    over = get_config().kb_max_pdf_pages + 1
+    assert "server's limit" in await refused({"max_pdf_pages": over})
+    assert (await api_client.get(f"{KB}/{kb}/config")).json()["overrides"] == {}
+
+
+async def test_a_bank_config_answers_only_for_its_own_kind_of_bank(api_client, memory, kb, request_context):
+    mem_bank = f"mem-{uuid.uuid4().hex[:8]}"
+    await memory._ensure_bank_exists(mem_bank, request_context)
+    for bank_id in (mem_bank, f"missing-{uuid.uuid4().hex[:8]}"):
+        assert (await api_client.get(f"{KB}/{bank_id}/config")).status_code == 404
+        r = await api_client.patch(f"{KB}/{bank_id}/config", json={"updates": {"text_passage_tokens": 64}})
+        assert r.status_code == 404
+        assert (await api_client.delete(f"{KB}/{bank_id}/config")).status_code == 404
+    # And the memory banks' config route does not read, write or wipe a knowledge bank's settings.
+    await api_client.patch(f"{KB}/{kb}/config", json={"updates": {"text_passage_tokens": 64}})
+    assert (await api_client.get(f"/v1/default/banks/{kb}/config")).status_code == 400
+    r = await api_client.patch(f"/v1/default/banks/{kb}/config", json={"updates": {"retain_chunk_size": 1000}})
+    assert r.status_code == 400 and "knowledge bank" in r.text
+    assert (await api_client.delete(f"/v1/default/banks/{kb}/config")).status_code == 400
+    assert (await api_client.get(f"{KB}/{kb}/config")).json()["overrides"] == {"text_passage_tokens": 64}
+
+
 async def test_files_become_passages_that_search_finds_by_meaning(api_client, kb, fake_embedder):
     r = await _upload(
         api_client,
@@ -305,7 +465,7 @@ async def test_files_become_passages_that_search_finds_by_meaning(api_client, kb
     assert detail["status"] == "ready" and detail["media_type"] == "document" and detail["passage_count"] == 2
     assert [p["page"] for p in detail["passages"]] == [1, 2]
 
-    top = (await _search(api_client, kb, query="red", top_k=3))[0]
+    top = (await _search(api_client, kb, query="red"))[0]
     assert (top["document_id"], top["page"], top["media_type"]) == ("manual", 1, "document")
     assert (await _search(api_client, kb, query="blue"))[0]["page"] == 2
     assert (await _search(api_client, kb, query="green"))[0]["document_id"] == "photo"
@@ -348,6 +508,124 @@ async def test_tag_and_media_type_filters_only_keep_what_the_caller_asked_for(ap
     assert bad.status_code == 422
 
 
+async def test_tags_match_and_tag_groups_follow_memory_recall_rules(api_client, kb):
+    await _upload(
+        api_client,
+        kb,
+        [(f"{n}.png", _png((255 - i, i, 0)), "image/png") for i, n in enumerate("abc")],
+        documents=[
+            {"document_id": "a", "tags": ["cloud", "v2"]},
+            {"document_id": "b", "tags": ["oss"]},
+            {"document_id": "c"},
+        ],
+    )
+
+    async def ids(**body) -> list[str]:
+        return sorted(r["document_id"] for r in await _search(api_client, kb, query="red", **body))
+
+    # any / all keep untagged documents, the _strict modes and exact drop them: as memory recall does.
+    assert await ids(tags=["oss"]) == ["b", "c"]
+    assert await ids(tags=["oss"], tags_match="any_strict") == ["b"]
+    assert await ids(tags=["cloud", "v2"], tags_match="all") == ["a", "c"]
+    assert await ids(tags=["cloud", "v2"], tags_match="all_strict") == ["a"]
+    assert await ids(tags=["cloud"], tags_match="exact") == []
+    assert await ids(tags=["v2", "cloud"], tags_match="exact") == ["a"]
+    assert await ids(tags=[], tags_match="exact") == ["c"]
+
+    strict = lambda *tags: {"tags": list(tags), "match": "any_strict"}  # noqa: E731
+    assert await ids(tag_groups=[{"or": [strict("oss"), strict("v2")]}]) == ["a", "b"]
+    assert await ids(tag_groups=[{"not": strict("oss")}]) == ["a", "c"]
+    assert await ids(tag_groups=[{"and": [strict("cloud"), {"not": strict("oss")}]}]) == ["a"]
+    # Fuzzy leaves resolve against this bank's own document tags.
+    fuzzy = {"tags": ["clouds"], "match": "any_strict", "resolve": "fuzzy"}
+    assert await ids(tag_groups=[fuzzy]) == ["a"]
+    # Tags and groups AND together.
+    assert await ids(tags=["oss"], tags_match="any", tag_groups=[{"not": strict("oss")}]) == ["c"]
+
+
+async def _linked_memory_bank(api_client, kb: str, **settings) -> str:
+    mem_bank = f"mem-{uuid.uuid4().hex[:8]}"
+    await api_client.post(f"/v1/default/banks/{mem_bank}/memories", json={"items": [{"content": "Red cars."}]})
+    r = await api_client.patch(
+        f"/v1/default/banks/{mem_bank}/config", json={"updates": {"knowledge_banks": [kb], **settings}}
+    )
+    assert r.status_code == 200, r.text
+    return mem_bank
+
+
+async def test_reflect_searches_linked_banks_with_its_tags_and_the_banks_media_types(
+    api_client, memory, kb, request_context
+):
+    from hindsight_api.engine.reflect.tools import tool_recall
+
+    await _upload(
+        api_client,
+        kb,
+        [("keys.png", _png((255, 0, 0)), "image/png"), ("notes.txt", b"red notes for team b", "text/plain")],
+        documents=[{"document_id": "keys", "tags": ["team:a"]}, {"document_id": "notes", "tags": ["team:b"]}],
+    )
+
+    async def docs(mem_bank: str, **kwargs) -> list[str]:
+        out = await tool_recall(memory, mem_bank, "red", request_context, include_documents=True, **kwargs)
+        return sorted(d["document_id"] for d in out.get("documents", []))
+
+    tagged = await _linked_memory_bank(api_client, kb)
+    assert await docs(tagged) == ["keys", "notes"]
+    assert await docs(tagged, tags=["team:a"], tags_match="any_strict") == ["keys"]
+    from hindsight_api.engine.search.tags import TagGroupLeaf
+
+    group = [TagGroupLeaf(tags=["team:b"], match="any_strict")]
+    assert await docs(tagged, tag_groups=group) == ["notes"]
+
+    # With apply_tags off, the reflect's tags filter its memories only.
+    untagged = await _linked_memory_bank(api_client, kb, reflect_kb_search_apply_tags=False)
+    assert await docs(untagged, tags=["team:a"], tags_match="any_strict") == ["keys", "notes"]
+
+    text_only = await _linked_memory_bank(api_client, kb, reflect_kb_search_media_types=["text"])
+    assert await docs(text_only) == ["notes"]
+
+    bad = await api_client.patch(
+        f"/v1/default/banks/{text_only}/config", json={"updates": {"reflect_kb_search_media_types": ["hologram"]}}
+    )
+    assert bad.status_code == 400 and "hologram" in bad.text
+    # The pictures are the server's to set, not a bank's.
+    per_bank = await api_client.patch(
+        f"/v1/default/banks/{text_only}/config", json={"updates": {"reflect_kb_search_max_images": 2}}
+    )
+    assert per_bank.status_code == 400 and "reflect_kb_search_max_images" in per_bank.text
+    for bank in (tagged, untagged, text_only):
+        await memory.delete_bank(bank, request_context=request_context)
+
+
+async def test_reflect_hands_the_model_the_pictures_of_image_hits_up_to_its_cap(
+    api_client, memory, kb, request_context
+):
+    from hindsight_api.engine.reflect.tools import KB_IMAGES_KEY, tool_recall
+
+    await _upload(
+        api_client,
+        kb,
+        [
+            ("keys.png", _png((255, 0, 0)), "image/png"),
+            ("door.png", _png((250, 5, 5)), "image/png"),
+            ("notes.txt", b"red notes", "text/plain"),
+        ],
+    )
+    mem_bank = await _linked_memory_bank(api_client, kb)
+
+    out = await tool_recall(memory, mem_bank, "red", request_context, include_documents=True, kb_images=1)
+    labels = [p.label for p in out[KB_IMAGES_KEY]]
+    [picture] = out[KB_IMAGES_KEY]
+    assert picture.media_type == "image/png" and Image.open(io.BytesIO(picture.data)).size[0] > 0
+    # The hit it belongs to says so, under the same label; the text hit and the other image do not.
+    assert [d["picture"] for d in out["documents"] if "picture" in d] == labels
+    assert labels[0].startswith(("Picture of keys.png", "Picture of door.png"))
+
+    none = await tool_recall(memory, mem_bank, "red", request_context, include_documents=True)
+    assert KB_IMAGES_KEY not in none and not any("picture" in d for d in none["documents"])
+    await memory.delete_bank(mem_bank, request_context=request_context)
+
+
 async def test_rewriting_a_document_is_a_noop_when_unchanged_and_a_replace_otherwise(api_client, kb, fake_embedder):
     first = await _upload(api_client, kb, [("p.png", _png((255, 0, 0)), "image/png")], [{"document_id": "p"}])
     assert len(first.json()["operation_ids"]) == 1
@@ -388,7 +666,6 @@ async def test_bad_writes_are_refused_or_reported_never_silently_dropped(api_cli
     assert (await api_client.post(f"{KB}/{kb}/search", json={})).status_code == 400
 
 
-@needs_ffmpeg
 async def test_audio_and_video_passages_carry_their_time_ranges_and_clips(api_client, kb):
     await _upload(
         api_client,
@@ -401,10 +678,21 @@ async def test_audio_and_video_passages_carry_their_time_ranges_and_clips(api_cl
     # 60s windows with 5s overlap (the defaults).
     assert [p["start_ms"] for p in talk["passages"]] == [0, 55000, 110000]
     assert talk["passages"][-1]["end_ms"] == pytest.approx(130000, abs=200)
-    hit = (await _search(api_client, kb, query="video", top_k=1))[0]
+    hit = (await _search(api_client, kb, query="video"))[0]
     assert (hit["document_id"], hit["media_type"], hit["start_ms"]) == ("demo", "video", 0)
     clip = await api_client.get(hit["passage_url"])
     assert clip.status_code == 200 and clip.headers["content-type"] == "video/mp4" and len(clip.content) > 1000
+    # A clip is a query too, alone or with text and an image: all of them make one vector.
+    import base64
+
+    clip64 = base64.b64encode(_tone(3, video=True)).decode()
+    assert (await _search(api_client, kb, query_video=clip64))[0]["document_id"] == "demo"
+    both = await _search(
+        api_client, kb, query="video", query_image=base64.b64encode(_png((255, 0, 0))).decode(), query_video=clip64
+    )
+    assert both[0]["document_id"] == "demo"
+    bad = await api_client.post(f"{KB}/{kb}/search", json={"query_video": "not base64!"})
+    assert bad.status_code == 400 and "query_video" in bad.text
 
 
 async def test_reflect_recall_tool_returns_linked_documents_as_the_authority(api_client, memory, kb, request_context):
@@ -433,6 +721,348 @@ async def test_reflect_recall_tool_returns_linked_documents_as_the_authority(api
     await memory.delete_bank(mem_bank, request_context=request_context)
 
 
+class _JudgeByPicture:
+    """A knowledge reranker that scores the documents it is sent by their pictures: the bluer, the more
+    relevant; a text document, not at all. ``settings`` are the server's knowledge reranker settings."""
+
+    def __init__(self) -> None:
+        self.settings: dict[str, object] = {"kb_reranker_images": True, "kb_reranker_query_images": True}
+        self.pictures: list[Image.Image] = []
+        self.texts: list[str] = []
+        self.requests: list[int] = []  # how many documents each request held
+        self.queries: list[str | dict[str, str]] = []
+
+    async def scores(self, query, documents):
+        self.requests.append(len(documents))
+        self.queries.append(query)
+        scores = []
+        for document in documents:
+            if isinstance(document, str):
+                self.texts.append(document)
+                scores.append(0.0)
+                continue
+            assert document["type"] == "image" and isinstance(document["text"], str)
+            picture = Image.open(io.BytesIO(base64.b64decode(document["b64"]))).convert("RGB")
+            self.pictures.append(picture)
+            scores.append(picture.resize((1, 1)).getpixel((0, 0))[2] / 255)
+        return scores
+
+
+@pytest.fixture
+def judge(memory, monkeypatch):
+    from hindsight_api import config as config_module
+    from hindsight_api.knowledge import service as service_module
+
+    fake = _JudgeByPicture()
+    monkeypatch.setattr(
+        service_module,
+        "get_config",
+        lambda: config_module.StaticConfigProxy(replace(config_module._get_raw_config(), **fake.settings)),
+    )
+    service = get_knowledge_service(memory)
+    previous = service._reranker, service._reranker_resolved
+    service._reranker, service._reranker_resolved = fake, True  # type: ignore[assignment]
+    yield fake
+    service._reranker, service._reranker_resolved = previous
+
+
+async def test_the_reranker_reranks_search_hits_by_their_pictures(api_client, kb, judge):
+    await _upload(
+        api_client,
+        kb,
+        [
+            ("manual.pdf", _pdf((250, 10, 10), (10, 10, 250)), "application/pdf"),
+            ("demo.mp4", _tone(6, video=True), "video/mp4"),
+        ],
+        [{"document_id": "manual"}, {"document_id": "demo"}],
+    )
+    r = await api_client.post(
+        f"{KB}/{kb}/ingest",
+        json={"items": [{"document_id": "faq", "text": "red pages and blue pages", "filename": "faq.md"}]},
+    )
+    assert r.status_code == 200, r.text
+
+    hits = await _search(api_client, kb, query="red")
+    assert {h["document_id"] for h in hits} == {"manual", "demo", "faq"}
+    assert judge.texts == ["red pages and blue pages"]  # a text hit is shown by its text, with no picture
+    # The two pages by their pictures, at most 1024 a side; the video is not shown (four stills ranked
+    # clips worse than search alone), it keeps its search place.
+    sizes = [picture.size for picture in judge.pictures]
+    assert len(sizes) == 2 and all(max(size) <= 1024 for size in sizes)
+    blue = next(p for p in judge.pictures if p.resize((1, 1)).getpixel((0, 0))[2] > 128)
+    assert blue.size != (1024, 1024)  # a page keeps its shape: no video grid was made
+    # All three in one request (they fit), and the blue page leads.
+    assert judge.requests == [3]
+    assert (hits[0]["document_id"], hits[0]["page"]) == ("manual", 2)
+
+    # A text search sends its query as the plain string.
+    assert judge.queries == ["red"]
+
+
+def _count_database_use(monkeypatch, memory) -> dict[str, int]:
+    """Connections the knowledge code takes, statements it runs on them, and file reads, as they happen."""
+    import contextlib
+
+    from hindsight_api.knowledge import service as service_module
+    from hindsight_api.knowledge import store as store_module
+
+    use = {"connections": 0, "statements": 0, "file_reads": 0, "file_batches": 0}
+    real_acquire = store_module.acquire_with_retry
+
+    class Counted:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def __getattr__(self, name):
+            attr = getattr(self._conn, name)
+            if name not in ("fetch", "fetchrow", "fetchval", "execute"):
+                return attr
+
+            async def counted(*args, **kwargs):
+                use["statements"] += 1
+                return await attr(*args, **kwargs)
+
+            return counted
+
+    @contextlib.asynccontextmanager
+    async def acquire(*args, **kwargs):
+        async with real_acquire(*args, **kwargs) as conn:
+            use["connections"] += 1
+            yield Counted(conn)
+
+    monkeypatch.setattr(store_module, "acquire_with_retry", acquire)
+    monkeypatch.setattr(service_module, "acquire_with_retry", acquire)
+    storage = memory._file_storage
+    real_retrieve, real_many = storage.retrieve, storage.retrieve_many
+
+    async def retrieve(key):
+        use["file_reads"] += 1
+        return await real_retrieve(key)
+
+    async def retrieve_many(keys):
+        use["file_batches"] += 1
+        return await real_many(keys)
+
+    monkeypatch.setattr(storage, "retrieve", retrieve)
+    monkeypatch.setattr(storage, "retrieve_many", retrieve_many)
+    return use
+
+
+async def test_a_search_takes_one_connection_and_reads_its_pictures_at_once(api_client, memory, kb, judge, monkeypatch):
+    # The bank check, the keyword words' rarity, the candidates and their scores are one statement, the best
+    # pages' sentence vectors a second, the text around the hits a third: one connection. It was six (and a
+    # transaction for the scan settings), plus one per page picture shown to the reranker, all at once.
+    await _upload(
+        api_client,
+        kb,
+        [("manual.pdf", _pdf((250, 10, 10), (10, 10, 250)), "application/pdf")],
+        [{"document_id": "manual"}],
+    )
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"document_id": "faq", "text": "red pages"}]})
+    assert r.status_code == 200, r.text
+    use = _count_database_use(monkeypatch, memory)
+    hits = await _search(api_client, kb, query="red pages")
+    assert {h["document_id"] for h in hits} == {"manual", "faq"}
+    assert len(judge.pictures) == 2  # both pages shown by their pictures
+    assert use == {"connections": 1, "statements": 3, "file_reads": 0, "file_batches": 1}
+    # A bank that is not a knowledge bank is found out by the same statement.
+    use.update(connections=0, statements=0)
+    assert (await api_client.post(f"{KB}/kb-missing/search", json={"query": "x"})).status_code == 404
+    assert (use["connections"], use["statements"]) == (1, 1)
+    # Fuzzy tags are resolved against the bank's tags first: the bank is checked before, still a 404.
+    fuzzy = {"query": "x", "tag_groups": [{"tags": ["clouds"], "match": "any", "resolve": "fuzzy"}]}
+    assert (await api_client.post(f"{KB}/kb-missing/search", json=fuzzy)).status_code == 404
+
+
+async def test_a_search_by_an_image_sends_the_picture_as_the_query_even_without_text(api_client, kb, judge):
+    await _upload(
+        api_client,
+        kb,
+        [("manual.pdf", _pdf((250, 10, 10), (10, 10, 250)), "application/pdf")],
+        [{"document_id": "manual"}],
+    )
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"document_id": "faq", "text": "some notes"}]})
+    assert r.status_code == 200, r.text
+    photo = _png((0, 0, 255), size=(300, 300))
+    b64 = base64.b64encode(photo).decode()
+
+    await _search(api_client, kb, query_image=b64)
+    (query,) = judge.queries
+    assert isinstance(query, dict) and set(query) == {"type", "b64"} and query["type"] == "image"
+    sent = Image.open(io.BytesIO(base64.b64decode(query["b64"])))
+    assert sent.format == "JPEG" and sent.size == (300, 300)
+    assert judge.requests == [3]  # reranked: the pages and the note in one request
+
+    judge.queries.clear()
+    await _search(api_client, kb, query="blue", query_image=b64)
+    (query,) = judge.queries
+    assert isinstance(query, dict) and query["text"] == "blue" and query["type"] == "image"
+
+    # A reranker that reads no images is sent the text, and an image alone is not reranked.
+    judge.settings["kb_reranker_images"] = False
+    judge.queries.clear()
+    await _search(api_client, kb, query="blue", query_image=b64)
+    assert judge.queries == ["blue"]
+    judge.queries.clear()
+    await _search(api_client, kb, query_image=b64)
+    assert judge.queries == []
+
+
+async def test_the_query_picture_takes_its_share_of_the_rerank_window(api_client, kb, judge):
+    items = [{"document_id": f"note{i}", "text": f"note {i} about the blue key. " + "detail " * 140} for i in range(10)]
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": items})
+    assert r.status_code == 200, r.text
+    await _upload(api_client, kb, [("a.png", _png((0, 0, 255), size=(300, 300)), "image/png")], [{"document_id": "a"}])
+    judge.settings["kb_reranker_max_tokens"] = 4_000
+    image = base64.b64encode(_png((0, 0, 255), size=(300, 300))).decode()
+
+    await _search(api_client, kb, query="blue key", max_tokens=1_000_000)
+    await _search(api_client, kb, query="blue key", query_image=image, max_tokens=1_000_000)
+    by_text, with_picture = judge.requests
+    assert with_picture < by_text  # the picture's tokens come out of what the candidates may hold
+
+
+async def test_a_small_query_picture_is_enlarged_and_an_extreme_strip_left_out(api_client, kb, judge):
+    await _upload(api_client, kb, [("a.png", _png((0, 0, 255), size=(300, 300)), "image/png")], [{"document_id": "a"}])
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"document_id": "faq", "text": "a blue note"}]})
+    assert r.status_code == 200, r.text
+
+    small = base64.b64encode(_png((0, 0, 255), size=(64, 64))).decode()
+    await _search(api_client, kb, query_image=small)
+    (query,) = judge.queries
+    assert Image.open(io.BytesIO(base64.b64decode(query["b64"]))).size == (280, 280)
+
+    # Aspect kept: 100x200 becomes 280x560.
+    judge.queries.clear()
+    await _search(api_client, kb, query_image=base64.b64encode(_png((0, 0, 255), size=(100, 200))).decode())
+    assert Image.open(io.BytesIO(base64.b64decode(judge.queries[0]["b64"]))).size == (280, 560)
+
+    # A 20x2000 strip cannot reach 280 on its short side within 1568 on the long one: left out.
+    judge.queries.clear()
+    strip = base64.b64encode(_png((0, 0, 255), size=(20, 2000))).decode()
+    await _search(api_client, kb, query_image=strip)
+    assert judge.queries == []
+    await _search(api_client, kb, query="blue", query_image=strip)
+    assert judge.queries == ["blue"]
+
+
+async def test_without_query_images_a_search_is_reranked_by_its_text_as_before(api_client, kb, judge):
+    judge.settings["kb_reranker_query_images"] = False
+    await _upload(api_client, kb, [("a.png", _png((0, 0, 255), size=(300, 300)), "image/png")], [{"document_id": "a"}])
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"document_id": "faq", "text": "a blue note"}]})
+    assert r.status_code == 200, r.text
+    image = base64.b64encode(_png((0, 0, 255), size=(300, 300))).decode()
+
+    await _search(api_client, kb, query="blue", query_image=image)
+    assert judge.queries == ["blue"]  # the plain string, as before
+    judge.queries.clear()
+    await _search(api_client, kb, query_image=image)
+    assert judge.queries == []  # no text: not reranked
+
+
+async def test_a_search_by_a_video_is_reranked_by_its_text_only(api_client, kb, judge):
+    await _upload(api_client, kb, [("a.png", _png((0, 0, 255), size=(300, 300)), "image/png")], [{"document_id": "a"}])
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"document_id": "faq", "text": "a blue note"}]})
+    assert r.status_code == 200, r.text
+    clip = base64.b64encode(_tone(6, video=True)).decode()
+    image = base64.b64encode(_png((0, 0, 255), size=(300, 300))).decode()
+
+    await _search(api_client, kb, query_video=clip)
+    await _search(api_client, kb, query_video=clip, query_image=image)
+    assert judge.queries == []
+    await _search(api_client, kb, query="blue", query_video=clip, query_image=image)
+    assert judge.queries == ["blue"]
+
+
+async def test_a_picture_too_small_for_the_reranker_is_judged_by_its_text(api_client, kb, judge):
+    # 64x64: image rerankers take no side under 280 px, and one refused image fails the whole request.
+    await _upload(api_client, kb, [("icon.png", _png((0, 0, 255)), "image/png")], [{"document_id": "icon"}])
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"document_id": "faq", "text": "a blue icon"}]})
+    assert r.status_code == 200, r.text
+
+    hits = await _search(api_client, kb, query="blue icon")
+    assert {h["document_id"] for h in hits} == {"icon", "faq"}
+    assert judge.pictures == []
+
+
+async def test_a_reranker_without_images_judges_pages_by_their_text(api_client, kb, judge):
+    judge.settings["kb_reranker_images"] = False
+    pdf = _text_pdf("Emergency exits are on floor nine")
+    await _upload(api_client, kb, [("exits.pdf", pdf, "application/pdf")], [{"document_id": "exits"}])
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"document_id": "faq", "text": "exits and floors"}]})
+    assert r.status_code == 200, r.text
+
+    r = await api_client.post(f"{KB}/{kb}/search", json={"query": "where are the exits"})
+    assert r.status_code == 200, r.text  # not a 503 for the picture it cannot take
+    assert judge.pictures == []
+    assert "Emergency exits are on floor nine" in judge.texts
+
+
+async def test_the_rerank_fills_one_request_and_a_low_budget_holds_less(api_client, kb, judge, monkeypatch):
+    from hindsight_api.knowledge import service as service_module
+
+    # Ten notes of ~150 tokens and a request of ~600: about three fit it.
+    items = [{"document_id": f"note{i}", "text": f"note {i} about the red key. " + "detail " * 140} for i in range(10)]
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": items})
+    assert r.status_code == 200, r.text
+    judge.settings["kb_reranker_max_tokens"] = 600
+
+    await _search(api_client, kb, query="red key", max_tokens=1_000_000)
+    assert len(judge.requests) == 1 and 1 < judge.requests[0] <= 3  # one request, as deep as it holds
+    shallow = judge.requests[0]
+
+    judge.settings["kb_reranker_max_tokens"] = 100_000
+    monkeypatch.setattr(service_module, "DEFAULT_KB_RERANKER_LOW_TOKENS", 600)
+    for budget, shown in (("low", shallow), ("mid", 10), ("high", 10)):
+        judge.requests.clear()
+        await _search(api_client, kb, query="red key", budget=budget, max_tokens=1_000_000)
+        assert judge.requests == [shown], budget
+
+
+async def test_a_long_page_is_shown_capped_to_the_context_it_gets(api_client, kb, judge):
+    # A PDF page's own text is not trimmed like a text hit's context: uncapped, one long page could
+    # fill the single request every candidate shares.
+    judge.settings["kb_reranker_images"] = False
+    pdf = _text_pdf("Emergency exits " + "floor nine " * 3000)
+    await _upload(api_client, kb, [("exits.pdf", pdf, "application/pdf")], [{"document_id": "exits"}])
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"document_id": "faq", "text": "exits and floors"}]})
+    assert r.status_code == 200, r.text
+
+    await _search(api_client, kb, query="where are the exits")
+    page = next(t for t in judge.texts if "floor nine" in t)
+    assert count_tokens(page) <= JUDGE_CONTEXT_TOKENS < count_tokens("floor nine " * 3000)
+
+
+async def test_pieces_of_one_short_document_are_judged_once(api_client, kb, judge):
+    # A guide long enough for several passages, short enough to be judged whole: every passage would show
+    # the reranker the same text, so it is one candidate.
+    guide = "\n\n".join(f"Step {i}. Rotate the red key in the console. " + "detail " * 60 for i in range(6))
+    items = [{"document_id": "guide", "text": guide}, {"document_id": "note", "text": "a red note"}]
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": items})
+    assert r.status_code == 200, r.text
+    assert (await api_client.get(f"{KB}/{kb}")).json()["passage_count"] > 2  # the guide was split
+
+    hits = await _search(api_client, kb, query="red key", max_tokens=1_000_000)
+    assert {h["document_id"] for h in hits} == {"guide", "note"}
+    assert len(judge.texts) == 2  # the guide once, whole, and the note
+    assert any(text.count("Step") == 6 for text in judge.texts)
+
+
+async def test_a_failing_reranker_is_reported_as_itself(api_client, kb, judge, monkeypatch):
+    r = await api_client.post(
+        f"{KB}/{kb}/ingest",
+        json={"items": [{"document_id": d, "text": f"{d} guide"} for d in ("keys", "billing")]},
+    )
+    assert r.status_code == 200, r.text
+
+    async def down(*args, **kwargs):
+        raise UpstreamHTTPError(400, "bad request", {}, "http://rerank")
+
+    monkeypatch.setattr(judge, "scores", down)
+    r = await api_client.post(f"{KB}/{kb}/search", json={"query": "guide"})
+    assert r.status_code == 503 and "knowledge reranker" in r.json()["detail"], r.text
+
+
 async def test_bank_list_pages_and_searches_by_id(api_client, fake_embedder):
     tag = uuid.uuid4().hex[:8]
     ids = [f"kb-{tag}-{n}" for n in range(3)]
@@ -458,7 +1088,7 @@ async def test_knowledge_banks_are_hidden_when_the_flag_is_off(api_client, memor
     await api_client.post(f"/v1/default/banks/{mem_bank}/memories", json={"items": [{"content": "Red cars."}]})
     await api_client.patch(f"/v1/default/banks/{mem_bank}/config", json={"updates": {"knowledge_banks": [kb]}})
 
-    monkeypatch.setenv("HINDSIGHT_API_ENABLE_KNOWLEDGE_BANKS", "false")
+    monkeypatch.setenv("HINDSIGHT_API_ENABLE_KB", "false")
     clear_config_cache()
     assert (await api_client.get("/v1/version")).json()["features"]["knowledge_banks"] is False
     assert (await api_client.get(KB)).status_code == 404
@@ -468,14 +1098,24 @@ async def test_knowledge_banks_are_hidden_when_the_flag_is_off(api_client, memor
 
     assert "documents" not in await tool_recall(memory, mem_bank, "red", request_context, include_documents=True)
 
-    monkeypatch.setenv("HINDSIGHT_API_ENABLE_KNOWLEDGE_BANKS", "true")
+    monkeypatch.setenv("HINDSIGHT_API_ENABLE_KB", "true")
     clear_config_cache()
     assert (await api_client.get("/v1/version")).json()["features"]["knowledge_banks"] is True
     assert (await api_client.get(f"{KB}/{kb}")).status_code == 200
     await api_client.delete(f"/v1/default/banks/{mem_bank}")
 
 
-async def test_pdf_pages_are_scored_from_image_bands_and_text_layer(api_client, kb, monkeypatch):
+async def _scored(memory, bank_id: str, query: str) -> list:
+    """The ranked hits with their scores: the search response carries ranks only."""
+    from hindsight_api.knowledge.service import SearchRequest
+    from hindsight_api.knowledge.store import SearchFilters
+
+    request = SearchRequest(query=query, query_image=None, filters=SearchFilters())
+    service = get_knowledge_service(memory)
+    return (await service._search(bank_id, request, await service._embed_query(request))).hits
+
+
+async def test_pdf_pages_are_scored_from_image_bands_and_text_layer(api_client, memory, kb, monkeypatch):
     from hindsight_api.config import clear_config_cache
 
     # 200+ characters of words: a real text layer (a near-empty one leans on the image).
@@ -484,14 +1124,61 @@ async def test_pdf_pages_are_scored_from_image_bands_and_text_layer(api_client, 
     doc = (await api_client.get(f"{KB}/{kb}/documents")).json()["documents"][0]
     assert doc["passage_count"] == 1  # one page = one passage, however many vectors it is stored as
     # Text weight 0: the score is the page image (+ bands) alone, which says nothing about invoices to the fake.
-    monkeypatch.setenv("HINDSIGHT_API_KNOWLEDGE_PDF_TEXT_WEIGHT", "0")
+    monkeypatch.setenv("HINDSIGHT_API_KB_PDF_TEXT_WEIGHT", "0")
     clear_config_cache()
-    assert (await _search(api_client, kb, query="invoice"))[0]["score"] < 0.5
+    # The page's own score, before the keyword mix rescales the candidates (one page alone is 1.0 there).
+    assert (await _scored(memory, kb, "invoice"))[0].explain.passage_score < 0.5
     # The default weight brings in the page's text layer (whole page and 128-token units).
-    monkeypatch.setenv("HINDSIGHT_API_KNOWLEDGE_PDF_TEXT_WEIGHT", "0.6")
+    monkeypatch.setenv("HINDSIGHT_API_KB_PDF_TEXT_WEIGHT", "0.6")
     clear_config_cache()
-    top = (await _search(api_client, kb, query="invoice"))[0]
-    assert top["score"] > 0.5 and top["text"] == text and top["page"] == 1
+    top = (await _scored(memory, kb, "invoice"))[0]
+    assert top.explain.passage_score > 0.5 and top.passage.text == text and top.passage.page == 1
+    assert "score" not in (await _search(api_client, kb, query="invoice"))[0]
+
+
+def test_candidates_fill_the_window_in_search_order():
+    from hindsight_api.knowledge.service import fitting
+
+    assert fitting([4, 4, 4], 10) == 2  # the third does not fit
+    assert fitting([4, 7, 2], 10) == 1  # in order: a later small one never jumps ahead
+    assert fitting([12, 3], 10) == 1  # the first always goes, even over the window
+    assert fitting([3, 3], 10) == 2
+
+
+def test_the_scores_reorder_the_candidates_and_leave_a_video_in_place():
+    from hindsight_api.knowledge.service import reranked_order
+
+    assert reranked_order([0, 1, 2], {0: 0.05, 1: 0.05, 2: 0.9}) == [2, 0, 1]  # a tie keeps the search's order
+    # Candidate 1 (a video) was not shown: it keeps its place, the others swap around it.
+    assert reranked_order([0, 1, 2], {0: 0.05, 2: 0.95}) == [2, 1, 0]
+
+
+def test_a_text_hit_is_judged_with_the_passages_around_it():
+    from hindsight_api.knowledge.service import _around
+    from hindsight_api.knowledge.store import KnowledgePassage
+
+    run = [KnowledgePassage(index=i, modality="text", text=f"p{i} " + "word " * 20) for i in range(2, 9)]
+    one = len(_around(run, 5, 10_000).split("\n\n"))
+    assert one == 7  # everything fits: the whole run, in order
+    # A tight budget grows one passage a side, from the hit outwards.
+    assert [t.split()[0] for t in _around(run, 5, 70).split("\n\n")] == ["p4", "p5", "p6"]
+    # At the edge of the document it keeps growing on the side that has passages.
+    assert [t.split()[0] for t in _around(run, 2, 70).split("\n\n")] == ["p2", "p3", "p4"]
+    assert _around(run, 99, 1000) == ""  # a hit outside the run: the caller falls back to its own text
+
+
+def test_a_text_passage_is_also_found_by_its_window():
+    from hindsight_api.knowledge.store import page_score
+
+    text = "\n\n".join(f"Paragraph {i}. " + "word " * 80 for i in range(30))
+    drafts = media.split_text(text, tokens=128)
+    windows = [d.window_text for d in drafts]
+    assert all(windows) and 1 < len(set(windows)) < len(drafts)  # neighbours share a window
+    for d in drafts:
+        assert d.text in (d.window_text or "")
+    assert media.split_text("one short note", tokens=128)[0].window_text is None  # a window of one: none
+    # Its score is the better of itself and its window.
+    assert page_score(0.4, {"window": [0.7]}, 0.6) == 0.7 and page_score(0.8, {"window": [0.7]}, 0.6) == 0.8
 
 
 def test_page_score_follows_the_recipe():
@@ -551,6 +1238,11 @@ async def test_timeseries_counts_documents_and_passages_per_day(api_client, kb):
     assert body["trunc"] == "day"
     assert sum(b["documents"] for b in body["buckets"]) == 2 and sum(b["passages"] for b in body["buckets"]) == 3
     assert (await api_client.get(f"{KB}/{kb}/stats/timeseries", params={"period": "2y"})).status_code == 422
+    # One media type: the PDF alone (a document, its two pages), then the image alone.
+    for media_type, documents, passages in (("document", 1, 2), ("image", 1, 1)):
+        r = await api_client.get(f"{KB}/{kb}/stats/timeseries", params={"period": "7d", "media_type": media_type})
+        buckets = r.json()["buckets"]
+        assert (sum(b["documents"] for b in buckets), sum(b["passages"] for b in buckets)) == (documents, passages)
 
 
 async def test_an_unreachable_remote_embedder_is_a_503_not_a_crash(api_client, kb, fake_embedder, monkeypatch):
@@ -565,27 +1257,34 @@ async def test_an_unreachable_remote_embedder_is_a_503_not_a_crash(api_client, k
 
 
 async def test_text_hits_come_back_with_neighbours_and_overlapping_windows_merge(api_client, kb):
-    paragraphs = [f"Paragraph {i}: " + ("invoice " if i in (4, 5) else "filler ") * 90 for i in range(10)]
+    # Each paragraph fills one passage at the default size (256 tokens), so passage i is paragraph i.
+    paragraphs = [f"Paragraph {i}: " + ("invoice " if i in (4, 5) else "filler ") * 180 for i in range(10)]
     r = await api_client.post(
         f"{KB}/{kb}/ingest",
         json={"items": [{"document_id": "long", "text": "\n\n".join(paragraphs), "filename": "long.md"}]},
     )
     assert r.status_code == 200, r.text
-    hits = await _search(api_client, kb, query="invoice", top_k=2)
-    # Passages 4 and 5 both match; their ±1 windows overlap, so they come back as one hit.
-    top = hits[0]
-    assert top["index"] in (4, 5) and (top["context_first_index"], top["context_last_index"]) == (3, 6)
-    assert "Paragraph 3" in top["context"] and "Paragraph 6" in top["context"]
-    assert (
-        sum(
-            1
-            for h in hits
-            if h["context_first_index"] is not None and h["context_first_index"] <= 5 <= h["context_last_index"]
-        )
-        == 1
-    )
-    plain = await _search(api_client, kb, query="invoice", top_k=3, neighbors=0)
-    assert all(h["context"] is None for h in plain)
+    passages = (await api_client.get(f"{KB}/{kb}/documents/long")).json()["passages"]
+    weight = {p["index"]: count_tokens(p["text"]) for p in passages}
+
+    # Room for four passages: the best invoice passage with one on each side, which holds the other
+    # invoice passage too (it is not repeated), then one more hit alone with what is left.
+    def paragraphs_in(text: str) -> list[int]:
+        return [i for i in range(10) if f"Paragraph {i}:" in text]
+
+    hits = await _search(api_client, kb, query="invoice", max_tokens=sum(weight[i] for i in (3, 4, 5, 6)))
+    assert hits[0]["index"] in (4, 5) and "context" not in hits[0]
+    first = paragraphs_in(hits[0]["text"])  # the hit's text is the run the budget gave it
+    assert {4, 5} <= set(first) and len(first) == 3
+    assert sum(len(paragraphs_in(h["text"])) for h in hits) == 4
+    # Room for everything: every passage comes back once, the other hits as results of their own, and no
+    # result holds more than five passages.
+    wide = await _search(api_client, kb, query="invoice", max_tokens=sum(weight.values()))
+    returned = [i for h in wide for i in paragraphs_in(h["text"])]
+    assert sorted(returned) == list(range(10))
+    assert {4, 5} <= set(paragraphs_in(wide[0]["text"])) and all(len(paragraphs_in(h["text"])) <= 5 for h in wide)
+    # Less than one passage: nothing fits.
+    assert await _search(api_client, kb, query="invoice", max_tokens=1) == []
 
 
 def test_pdfs_split_concurrently_from_many_threads_do_not_crash():
@@ -665,73 +1364,53 @@ async def test_remote_embedder_retries_a_dropped_connection():
     assert calls["n"] == 2
 
 
-def test_language_detection_and_keyword_fusion():
-    from hindsight_api.knowledge.language import detect, text_search_config
+def test_keyword_fusion():
     from hindsight_api.knowledge.store import fuse_keyword
 
-    assert detect("The rotation of the keys is done by the admin in the console") == "english"
-    assert detect("La rotation des clés est faite par l'administrateur dans la console") == "french"
-    assert detect("ERR-4417") is None
-    assert (text_search_config("german"), text_search_config(None)) == ("german", "simple")
     # No keyword hit: dense scores pass through untouched.
-    assert fuse_keyword([0.5, 0.4], [0.0, 0.0], 0.2) == [0.5, 0.4]
+    assert fuse_keyword([0.5, 0.4], [0.0, 0.0], 0.2, [True, True]) == [0.5, 0.4]
     # A keyword hit can lift a slightly weaker dense match over the best one.
-    fused = fuse_keyword([0.50, 0.49, 0.10], [0.0, 1.0, 0.0], 0.2)
+    fused = fuse_keyword([0.50, 0.49, 0.10], [0.0, 1.0, 0.0], 0.2, [True, True, True])
     assert fused[1] > fused[0] > fused[2]
+    # One candidate, or a tie, is the best there is, not the worst.
+    assert fuse_keyword([0.6], [0.3], 0.2, [True]) == [1.0]
+    # A passage with no text scores by meaning alone: the best image is not pushed under matching text.
+    image, text = fuse_keyword([0.9, 0.9, 0.1], [0.0, 1.0, 0.0], 0.2, [False, True, True])[:2]
+    assert image == 1.0 and text == 1.0
 
 
-async def test_keyword_matches_count_only_for_documents_in_the_query_language(api_client, kb):
-    # The fake embedder sees none of its axis words here, so every passage ties on meaning
-    # and only the keyword match can order them.
+async def test_keywords_match_rare_words_in_every_language(api_client, kb):
+    # The fake embedder sees none of its axis words here, so every passage ties on meaning and only
+    # the keyword match orders them. Keywords used to count only in documents of the query's detected
+    # language: the French and Japanese pages, which hold the code, got nothing.
     docs = [
         ("en-hit", "The gateway returns the code zx4417 when the token of the session has ended."),
         ("en-miss", "The gateway returns a timeout when the upstream of the session has ended."),
         ("fr-hit", "La passerelle renvoie le code zx4417 quand le jeton de la session est fini."),
+        ("ja-hit", "ゲートウェイ zx4417"),
+        *((f"filler-{n}", f"The state of the system is the same as the state of the log {n}.") for n in range(8)),
     ]
-    r = await api_client.post(
-        f"{KB}/{kb}/ingest",
-        json={"items": [{"document_id": d, "text": t} for d, t in docs]},
-    )
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"document_id": d, "text": t} for d, t in docs]})
     assert r.status_code == 200, r.text
-    hits = await _search(api_client, kb, query="what does the code zx4417 of the gateway mean", neighbors=0)
-    # en-miss shares only "gateway"; the French page shares the code but not the query's
-    # language, so it gets no keyword credit at all.
-    assert [h["document_id"] for h in hits] == ["en-hit", "en-miss", "fr-hit"]
-    assert hits[0]["score"] > hits[1]["score"] > hits[2]["score"]
+    body = (
+        await api_client.post(
+            f"{KB}/{kb}/search", json={"query": "what does the code zx4417 of the gateway mean", "trace": True}
+        )
+    ).json()
+    trace = body["trace"]
+    # Common words ("the", "of") are left out next to the rare ones, in no language's stopword list.
+    assert "zx4417" in trace["keyword_terms"] and not {"the", "of"} & set(trace["keyword_terms"])
+    keyword = {h["document_id"]: h["keyword"] for h in trace["hits"]}
+    assert keyword["fr-hit"] > 0 and keyword["ja-hit"] > 0 and keyword["filler-0"] == 0
+    assert body["results"][0]["document_id"] == "en-hit"
 
 
-async def test_search_by_pattern_finds_exact_text_and_ranks_it_above_meaning(api_client, kb):
-    r = await api_client.post(
-        f"{KB}/{kb}/ingest",
-        json={
-            "items": [
-                {"document_id": "a", "text": "Retry on err-4417.\n\nDiscount is 50% off."},
-                {"document_id": "b", "text": "ERR-4417 means the token expired."},
-                {"document_id": "c", "text": "Nothing to see; 50 percent here."},
-            ]
-        },
-    )
-    assert r.status_code == 200, r.text
-
-    async def search(**body) -> list[str]:
-        r = await api_client.post(f"{KB}/{kb}/search", json=body)
-        assert r.status_code == 200, r.text
-        return [h["document_id"] for h in r.json()["results"]]
-
-    # A pattern alone: case-insensitive, documents with more matching passages first.
-    assert await search(pattern="ERR-4417") == ["a", "b"]
-    assert await search(pattern="err-4417|50 percent", regex=True) == ["a", "b", "c"]
-    assert await search(pattern="50%") == ["a"]  # % is literal, not a wildcard
-    assert await search(pattern="err-4417", document_ids=["b"]) == ["b"]
-    bad = await api_client.post(f"{KB}/{kb}/search", json={"pattern": "(unclosed", "regex": True})
-    assert bad.status_code == 400 and "invalid regular expression" in bad.text
-    assert (await api_client.post(f"{KB}/{kb}/search", json={})).status_code == 400
-    assert (await api_client.post(f"{KB}/kb-missing/search", json={"pattern": "x"})).status_code == 404
-
-    # With a query, the passage containing the pattern ranks above every passage that is only
-    # similar in meaning, and a document without it still comes back after it.
-    ranked = await search(query="token expired", pattern="50 percent", top_k=3)
-    assert ranked[0] == "c" and "b" in ranked[1:]
+async def test_a_search_needs_a_query_and_a_bank(api_client, kb):
+    r = await api_client.post(f"{KB}/{kb}/search", json={})
+    assert r.status_code == 400 and "query" in r.text
+    assert (await api_client.post(f"{KB}/kb-missing/search", json={"query": "x"})).status_code == 404
+    body = (await api_client.post(f"{KB}/{kb}/search", json={"query": "x"})).json()
+    assert set(body) == {"results", "trace"} and body["trace"] is None  # ranks only, unless a trace is asked
 
 
 def test_running_headers_and_footers_are_not_embedded():
@@ -757,17 +1436,53 @@ def test_the_file_name_is_the_title_unless_it_was_made_up_from_the_id():
     assert title("doc-1", "footstep_gravel_03.wav") == "footstep gravel 03"
     assert title("3f2a", "3f2a.md") is None  # the name a text write gets when it has none
     assert title("x", None) is None
+    # A name with no word in it says nothing about the content (Flickr30k: R@1 79.8 with it, 93.3 without).
+    for meaningless in ("1007129816.jpg", "IMG_4821.JPG", "video7020.mp4", "scan_003.pdf", "deadbeef01.png"):
+        assert title("x", meaningless) is None, meaningless
+    assert title("x", "face.png") == "face"  # a short word that happens to be hex is still a word
 
 
 def test_pdf_page_text_is_packed_by_whole_lines():
-    from hindsight_api.engine.token_encoding import count_tokens
-
     lines = [f"Row {i}: revenue grew in region {i}" for i in range(60)]
     units = media.pack_lines("\r\n".join(lines), tokens=40)
     assert all(count_tokens(u) <= 40 for u in units)
     assert [line for u in units for line in u.split("\n")] == lines  # whole lines, in order, none lost
     long = " ".join(["word"] * 200)
     assert all(count_tokens(u) <= 40 for u in media.pack_lines(long, tokens=40))
+
+
+def test_pdf_sentences_reference_pages_and_text_batches():
+    from hindsight_api.knowledge.embedders import _token_batches
+    from hindsight_api.knowledge.store import is_reference_page
+
+    text = "Employment rose sharply in 2023 across the EU.\nThe share of tempo-\nrary contracts fell to 12.6% (from 15.9%).\nShort.\nAnother sentence follows with enough words to stand alone."
+    assert media.sentences(text) == [
+        "Employment rose sharply in 2023 across the EU.",
+        "The share of temporary contracts fell to 12.6% (from 15.9%).",  # joined across the line break
+        "Short. Another sentence follows with enough words to stand alone.",  # too short alone: merged forward
+    ]
+    references = "\n".join(f"Author {i}, A. ({2000 + i}), 'A title', Journal, vol. {i}, pp. 1-9." for i in range(8))
+    assert is_reference_page(references)
+    assert not is_reference_page("The employment rate (2023) rose.\n" + "Prose without citations here.\n" * 6)
+    # Batches are cut by size, not count: many short sentences share a request, a long page text does not.
+    short = [(i, "s" * 100) for i in range(60)]
+    assert [len(b) for b in _token_batches(short, 8)] == [60]
+    long = [(i, "p" * 5000) for i in range(3)]
+    assert [len(b) for b in _token_batches(long, 8)] == [1, 1, 1]
+    assert sum(len(b) for b in _token_batches([(i, "x") for i in range(200)], 8)) == 200  # nothing lost past the cap
+
+
+def test_a_reference_page_is_demoted_without_squashing_the_other_scores():
+    from hindsight_api.knowledge.store import final_scores
+
+    # Two real pages, the better one with fewer keyword hits, and a reference list. Demoting the list inside
+    # the keyword fusion stretched the dense range so far that keywords alone decided the real pages.
+    dense = [0.80, 0.70, 0.79]
+    keyword = [1.0, 3.0, 9.0]
+    scores = final_scores(dense, keyword, 0.2, reference=[False, False, True], has_text=[True] * 3)
+    assert scores[0] > scores[1] > scores[2]  # dense still ranks the real pages; the list goes last
+    same = final_scores(dense, keyword, 0.2, reference=[False] * 3, has_text=[True] * 3)
+    assert scores[:2] == same[:2]  # the demotion does not move anyone else
 
 
 def test_pages_lean_on_the_image_when_their_text_is_junk_and_on_their_document():
@@ -918,14 +1633,30 @@ def counted(memory, monkeypatch):
             return await _real(*args, **kwargs)
 
         monkeypatch.setattr(store, name, spy)
-    submit = memory._submit_async_operation
+    # Every queued task reaches the task backend, whichever path wrote its row.
+    submit = memory._task_backend.submit_task
 
-    async def submit_spy(*args, **kwargs):
-        payloads.append(kwargs["task_payload"])
-        return await submit(*args, **kwargs)
+    async def submit_spy(payload, *args, **kwargs):
+        if payload.get("type") == "knowledge_ingest":
+            payloads.append(payload)
+        return await submit(payload, *args, **kwargs)
 
-    monkeypatch.setattr(memory, "_submit_async_operation", submit_spy)
+    monkeypatch.setattr(memory._task_backend, "submit_task", submit_spy)
     return counts, payloads
+
+
+async def test_an_ingest_batch_reports_where_its_time_went(api_client, kb, fake_embedder, caplog):
+    items = [{"document_id": f"t{n}", "text": f"note {n} about blue"} for n in range(20)]
+    with caplog.at_level("INFO", logger="hindsight_api.engine.retain.timing"):
+        r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": items})
+    assert r.is_success, r.text
+    lines = [m.getMessage() for m in caplog.records if "[knowledge_ingest-timing]" in m.getMessage()]
+    assert len(lines) == 1 and "docs=20" in lines[0], lines
+    # Every stage a batch passes through is attributed, with its round-trip count.
+    phases = dict(p.split("=", 1) for p in lines[0].split(" | ", 1)[1].split())
+    for phase in ("store.read", "store.status", "file.read", "split", "embed", "store.write"):
+        assert phase in phases, (phase, lines[0])
+    assert phases["file.read"].split("/")[1] == "20c"  # one stored file read per document
 
 
 async def test_an_ingest_of_many_documents_costs_a_fixed_number_of_calls(api_client, kb, fake_embedder, counted):
@@ -954,6 +1685,167 @@ async def test_a_bad_document_fails_alone_and_a_sync_ingest_reports_it(api_clien
     statuses = {d: (await api_client.get(f"{KB}/{kb}/documents/{d}")).json()["status"] for d in ("ok1", "bad", "ok2")}
     assert statuses == {"ok1": "ready", "bad": "failed", "ok2": "ready"}
     assert (await _search(api_client, kb, query="blue"))[0]["document_id"] == "ok2"
+
+
+@pytest.fixture
+def child_bytes(monkeypatch):
+    """Sets the async-ingest child budget, and leaves the config as it found it."""
+
+    from hindsight_api.config import clear_config_cache
+
+    def set_budget(n: int) -> None:
+        monkeypatch.setenv("HINDSIGHT_API_KB_INGEST_CHILD_BYTES", str(n))
+        clear_config_cache()
+
+    yield set_budget
+    monkeypatch.delenv("HINDSIGHT_API_KB_INGEST_CHILD_BYTES", raising=False)
+    clear_config_cache()
+
+
+async def test_an_async_ingest_is_one_parent_split_into_children_by_size(
+    api_client, memory, kb, fake_embedder, counted, child_bytes
+):
+    _, payloads = counted
+    child_bytes(100)
+    small = [{"document_id": f"s{n}", "text": f"small note {n} " + "x" * 20} for n in range(6)]  # 33 B each
+    big = {"document_id": "big", "text": "big " * 100}  # 400 B: over the budget
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": [*small[:3], big, *small[3:]], "async": True})
+    assert r.status_code == 202, r.text
+    # Every document reports the one parent operation.
+    parent = r.json()["operation_ids"][0]
+    assert set(r.json()["operation_ids"]) == {parent}
+    # Children keep the documents in order, never split one, and a document over the budget is alone.
+    assert [[d["document_id"] for d in p["documents"]] for p in payloads] == [
+        ["s0", "s1", "s2"],
+        ["big"],
+        ["s3", "s4", "s5"],
+    ]
+    assert {p["operation_id"] for p in payloads}.isdisjoint({parent})
+    page = (await api_client.get(f"{KB}/{kb}/documents", params={"status": "ready", "limit": 1})).json()
+    assert page["total"] == 7
+    # The parent completes once its children have, as a batch retain's does.
+    from hindsight_api.engine.db_utils import acquire_with_retry
+    from hindsight_api.engine.schema import fq_table
+
+    async with acquire_with_retry(await memory._get_backend()) as conn:
+        rows = await conn.fetch(
+            f"SELECT operation_id, status, result_metadata FROM {fq_table('async_operations')} WHERE bank_id = $1",
+            kb,
+        )
+    by_id = {str(row["operation_id"]): row for row in rows}
+    assert by_id[parent]["status"] == "completed"
+    for p in payloads:
+        meta = by_id[p["operation_id"]]["result_metadata"]
+        meta = json.loads(meta) if isinstance(meta, str) else meta
+        assert meta["parent_operation_id"] == parent and by_id[p["operation_id"]]["status"] == "completed"
+
+
+async def test_a_sync_ingest_is_still_processed_in_one_batch(api_client, kb, fake_embedder, counted, child_bytes):
+    counts, payloads = counted
+    child_bytes(10)
+    items = [{"document_id": f"n{n}", "text": f"note {n} about green"} for n in range(5)]
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": items})
+    assert r.is_success and not any(r.json()["operation_ids"]), r.text
+    # Nothing queued: the five documents are one batch, written once, however small the budget.
+    assert payloads == [] and counts["replace_passages"] == 1
+
+
+@pytest.fixture
+def memory_budget_mb(monkeypatch):
+    """Sets the knowledge-ingest memory budget, and leaves the config as it found it."""
+    from hindsight_api.config import clear_config_cache
+
+    def set_budget(n: int) -> None:
+        monkeypatch.setenv("HINDSIGHT_API_KB_INGEST_MEMORY_BUDGET_MB", str(n))
+        clear_config_cache()
+
+    yield set_budget
+    monkeypatch.delenv("HINDSIGHT_API_KB_INGEST_MEMORY_BUDGET_MB", raising=False)
+    clear_config_cache()
+
+
+def _peak_mb(caplog) -> int:
+    line = next(m.getMessage() for m in caplog.records if "holding at most" in m.getMessage())
+    return int(line.split("holding at most ")[1].split(" MB")[0])
+
+
+async def test_finished_documents_commit_in_groups_as_they_finish(api_client, kb, fake_embedder, counted):
+    from hindsight_api.knowledge import service as service_module
+
+    counts, _ = counted
+    parts = service_module._COMMIT_GROUP_PASSAGES // 10  # passages per document, under the early-commit size
+    assert parts < service_module._EARLY_COMMIT_PASSAGES
+    text = "\n\n".join(f"# Part {n}\n\npassage {n} about red" for n in range(parts))
+    items = [{"document_id": f"g{n}", "text": text + f" {n}"} for n in range(12)]
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": items})
+    assert r.is_success, r.text
+    # 11 documents fill a group, which commits while the last one is cut; that one commits at the end.
+    assert counts["replace_passages"] == 2
+    page = (await api_client.get(f"{KB}/{kb}/documents", params={"status": "ready", "limit": 1})).json()
+    assert page["total"] == 12
+
+
+async def test_a_batch_over_its_memory_budget_commits_as_it_goes_and_stays_under_it(
+    api_client, kb, fake_embedder, counted, memory_budget_mb, caplog
+):
+    counts, _ = counted
+    memory_budget_mb(1)
+    # 60 documents of ~60 KB of text: ~3.6 MB of passages against a 1 MB budget.
+    items = [{"document_id": f"m{n}", "text": f"note {n} about red " + "word " * 12_000} for n in range(60)]
+    with caplog.at_level("INFO", logger="hindsight_api.knowledge.service"):
+        r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": items})
+    assert r.is_success, r.text
+    assert counts["replace_passages"] >= 4  # committed in pieces, not once at the end
+    assert _peak_mb(caplog) <= 1
+    page = (await api_client.get(f"{KB}/{kb}/documents", params={"status": "ready", "limit": 1})).json()
+    assert page["total"] == 60
+
+
+async def test_one_document_over_the_memory_budget_goes_in_staged_pieces(
+    api_client, memory, kb, fake_embedder, memory_budget_mb, caplog, monkeypatch
+):
+    memory_budget_mb(1)
+    store = get_knowledge_service(memory).store
+    pieces: list[int] = []
+    real = store.stage_passages
+
+    async def spy(bank_id, items):
+        pieces.extend(len(i.passages) for i in items)
+        return await real(bank_id, items)
+
+    monkeypatch.setattr(store, "stage_passages", spy)
+    big = {"document_id": "big", "text": "a long report about red " + "word " * 400_000}  # ~2 MB
+    with caplog.at_level("INFO", logger="hindsight_api.knowledge.service"):
+        r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": [big]})
+    assert r.is_success, r.text
+    # Staged in pieces, and never held whole: the batch stays within its budget.
+    assert len(pieces) >= 2
+    assert _peak_mb(caplog) <= 1
+    doc = (await api_client.get(f"{KB}/{kb}/documents/big")).json()
+    passages = (await store.list_passages(kb, ["big"]))["big"]
+    assert doc["status"] == "ready" and doc["passage_count"] == len(passages) > sum(pieces)
+    assert [p.index for p in passages] == list(range(len(passages)))
+
+
+async def test_a_failed_round_stops_a_splitter_waiting_for_memory(
+    api_client, kb, fake_embedder, memory_budget_mb, monkeypatch
+):
+    memory_budget_mb(1)
+    real = fake_embedder.embed_documents
+    calls = {"n": 0}
+
+    async def flaky(items):
+        calls["n"] += 1
+        if calls["n"] >= 2:  # down from the second round on: nothing more commits, so nothing frees room
+            raise RuntimeError("embedder down")
+        return await real(items)
+
+    monkeypatch.setattr(fake_embedder, "embed_documents", flaky)
+    items = [{"document_id": f"f{n}", "text": f"note {n} about red " + "word " * 12_000} for n in range(40)]
+    # The round's failure ends the batch (and reaches the caller); without it the splitter would wait
+    # for room nobody frees, and this would time out.
+    with pytest.raises(RuntimeError, match="embedder down"):
+        await asyncio.wait_for(api_client.post(f"{KB}/{kb}/ingest", json={"items": items}), timeout=60)
 
 
 async def test_a_retried_batch_skips_the_documents_it_already_committed(api_client, memory, kb, fake_embedder, counted):
@@ -1025,6 +1917,132 @@ async def test_writes_for_a_replaced_version_leave_the_newer_one_alone(api_clien
     assert [p.text for p in (await store.list_passages(kb, ["d"]))["d"]] == ["second blue"]
 
 
+def _passages(start: int, *texts: str):
+    from hindsight_api.knowledge.store import KnowledgePassage
+
+    return [
+        KnowledgePassage(index=start + n, modality="text", text=t, embedding=FakeEmbedder._norm(FakeEmbedder._text(t)))
+        for n, t in enumerate(texts)
+    ]
+
+
+async def test_staged_pieces_stay_out_of_sight_until_their_commit(api_client, memory, kb, fake_embedder):
+    from hindsight_api.knowledge.store import PassageReplacement, PassageStage
+
+    store = get_knowledge_service(memory).store
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"document_id": "d", "text": "old blue"}]})
+    assert r.status_code == 200, r.text
+    key = (await store.get_documents(kb, ["d"]))["d"].storage_key
+    assert await store.stage_passages(kb, [PassageStage("d", _passages(0, "new red one", "new red two"), key)]) == []
+    assert await store.stage_passages(kb, [PassageStage("d", _passages(2, "new red three"), key, staged=2)]) == []
+    # Until the commit, every read sees the version it replaces, whole.
+    assert [p.text for p in (await store.list_passages(kb, ["d"]))["d"]] == ["old blue"]
+    assert [h["text"] for h in await _search(api_client, kb, query="red")] in ([], ["old blue"])
+    done = await store.replace_passages(kb, [PassageReplacement("d", _passages(3, "new red four"), key, staged=3)])
+    assert done.skipped_document_ids == []
+    texts = [p.text for p in (await store.list_passages(kb, ["d"]))["d"]]
+    assert texts == ["new red one", "new red two", "new red three", "new red four"]
+    assert (await store.get_documents(kb, ["d"]))["d"].passage_count == 4
+    assert "old blue" not in [h["text"] for h in await _search(api_client, kb, query="blue")]
+
+
+async def test_a_piece_for_a_replaced_file_is_skipped(api_client, memory, kb):
+    from hindsight_api.knowledge.store import PassageStage
+
+    store = get_knowledge_service(memory).store
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"document_id": "d", "text": "old blue"}]})
+    assert r.status_code == 200, r.text
+    assert await store.stage_passages(kb, [PassageStage("d", _passages(0, "stale red"), "gone")]) == ["d"]
+    assert await store.stage_passages(kb, [PassageStage("nope", _passages(0, "x"))]) == ["nope"]
+
+
+async def test_what_an_ingest_that_never_committed_staged_is_dropped(api_client, memory, kb, fake_embedder):
+    from hindsight_api.knowledge.store import PassageReplacement, PassageStage
+
+    store = get_knowledge_service(memory).store
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"document_id": "d", "text": "old blue"}]})
+    assert r.status_code == 200, r.text
+    key = (await store.get_documents(kb, ["d"]))["d"].storage_key
+    # An ingest staged five passages and died before committing them.
+    await store.stage_passages(kb, [PassageStage("d", _passages(0, *(f"lost red {n}" for n in range(5))), key)])
+    # A version started over (a staged=0 piece) drops them...
+    await store.stage_passages(kb, [PassageStage("d", _passages(0, "kept red"), key)])
+    await store.replace_passages(kb, [PassageReplacement("d", [], key, staged=1)])
+    assert [p.text for p in (await store.list_passages(kb, ["d"]))["d"]] == ["kept red"]
+    # ...and so does a version written in one go, which never names them.
+    await store.stage_passages(kb, [PassageStage("d", _passages(0, *(f"lost red {n}" for n in range(5))), key)])
+    await store.replace_passages(kb, [PassageReplacement("d", _passages(0, "one blue", "two blue"), key)])
+    assert [p.text for p in (await store.list_passages(kb, ["d"]))["d"]] == ["one blue", "two blue"]
+    hits = await _search(api_client, kb, query="red")
+    assert not any("lost" in h["text"] or "kept" in h["text"] for h in hits), hits
+
+
+async def test_a_document_that_fails_drops_what_it_staged(api_client, memory, kb, fake_embedder):
+    from hindsight_api.knowledge.store import PassageReplacement, PassageStage, StatusUpdate
+
+    store = get_knowledge_service(memory).store
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"document_id": "d", "text": "old blue"}]})
+    assert r.status_code == 200, r.text
+    key = (await store.get_documents(kb, ["d"]))["d"].storage_key
+    await store.stage_passages(kb, [PassageStage("d", _passages(0, *(f"lost red {n}" for n in range(3))), key)])
+    # A failure for another version (an older file) leaves what this one staged.
+    await store.set_statuses(kb, [StatusUpdate("d", "failed", "boom", "some-other-key")])
+    await store.replace_passages(kb, [PassageReplacement("d", [], key, staged=3)])
+    assert len((await store.list_passages(kb, ["d"]))["d"]) == 3
+    # Failing for good drops it: a commit naming the staged pieces finds none. The store has no read of
+    # staged rows, so a commit that would move them in is how the test sees they are gone.
+    await store.stage_passages(kb, [PassageStage("d", _passages(0, *(f"lost red {n}" for n in range(3))), key)])
+    await store.set_statuses(kb, [StatusUpdate("d", "failed", "boom", key)])
+    assert (await store.get_documents(kb, ["d"]))["d"].status == "failed"
+    await store.replace_passages(kb, [PassageReplacement("d", [], key, staged=3)])
+    assert (await store.list_passages(kb, ["d"]))["d"] == []
+
+
+async def test_a_file_replaced_while_its_ingest_reads_it_is_skipped_not_retried(
+    api_client, memory, kb, fake_embedder, monkeypatch
+):
+    from hindsight_api.knowledge import media
+    from hindsight_api.knowledge.service import _Work
+    from hindsight_api.knowledge.store import StatusUpdate
+
+    service = get_knowledge_service(memory)
+    store = service.store
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"document_id": "d", "text": "old blue"}]})
+    assert r.status_code == 200, r.text
+    old_key = (await store.get_documents(kb, ["d"]))["d"].storage_key
+    await store.set_statuses(kb, [StatusUpdate("d", "pending", None, old_key)])  # as if its task were queued
+    real = memory._file_storage.retrieve
+    replaced = False
+
+    async def retrieve(key: str) -> bytes:
+        # The newer upload lands between the batch's check and its read, deleting the old file.
+        nonlocal replaced
+        if key == old_key and not replaced:
+            replaced = True
+            r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"document_id": "d", "text": "new red"}]})
+            assert r.status_code == 200, r.text
+            raise FileNotFoundError(key)
+        return await real(key)
+
+    monkeypatch.setattr(memory._file_storage, "retrieve", retrieve)
+    await service.process_batch(kb, [_Work("d", old_key)])  # no error, so no retry
+    doc = (await store.get_documents(kb, ["d"]))["d"]
+    assert doc.status == "ready" and doc.storage_key != old_key
+    assert [p.text for p in (await store.list_passages(kb, ["d"]))["d"]] == ["new red"]
+
+    # Gone under the current version, the file cannot come back: the document fails, once.
+    await store.set_statuses(kb, [StatusUpdate("d", "pending", None, doc.storage_key)])
+
+    async def gone(key: str) -> bytes:
+        raise FileNotFoundError(key)
+
+    monkeypatch.setattr(memory._file_storage, "retrieve", gone)
+    with pytest.raises(media.MediaError):  # with retries left, a transient error would leave it pending
+        await service.process_batch(kb, [_Work("d", doc.storage_key)], retries_left=True)
+    failed = (await store.get_documents(kb, ["d"]))["d"]
+    assert failed.status == "failed" and doc.storage_key in (failed.error or "")
+
+
 async def test_renaming_a_file_ingests_it_again(api_client, kb):
     for name in ("a.md", "b.md"):
         r = await api_client.post(
@@ -1034,20 +2052,28 @@ async def test_renaming_a_file_ingests_it_again(api_client, kb):
     assert (await api_client.get(f"{KB}/{kb}/documents/d")).json()["filename"] == "b.md"
 
 
-async def test_neighbour_windows_that_grow_into_each_other_are_merged(api_client, memory, kb):
+async def test_each_hit_gets_its_own_result_and_none_holds_more_than_five_passages(api_client, memory, kb):
     from hindsight_api.knowledge.store import SearchHit
 
-    text = "\n\n".join(f"# Part {n}\n\npassage {n} red" for n in range(8))
-    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"document_id": "w", "text": text}]})
+    text = "\n\n".join(f"# Part {n}\n\npassage {n} red" for n in range(10))
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"document_id": "f", "text": text}]})
     assert r.status_code == 200, r.text
     service = get_knowledge_service(memory)
-    document = (await service.store.get_documents(kb, ["w"]))["w"]
-    passages = (await service.store.list_passages(kb, ["w"]))["w"]
-    assert len(passages) >= 6
-    # Hits at 0, then 4, then 2: windows 0-1 and 3-5, which passage 2's window 1-3 joins into one.
-    hits = [SearchHit(passages[i], document, 1.0 - i / 10) for i in (0, 4, 2)]
-    items = await service._with_context(kb, hits, 1)
-    assert [(i.context_first, i.context_last) for i in items] == [(0, 5)]
+    document = (await service.store.get_documents(kb, ["f"]))["f"]
+    passages = (await service.store.list_passages(kb, ["f"]))["f"]
+    weight = [count_tokens(p.text or "") for p in passages]
+    # Hits at 2 (best), 7, then 5: each is a result of its own with its free neighbours (5 gets 4, as 6 is
+    # 7's). A window used to grow to take in a nearby hit and fold into the next: one whole-document result.
+    hits = [SearchHit(passages[i], document, 1.0 - n / 10) for n, i in enumerate((2, 7, 5))]
+    nearby = {("f", p.index): p for p in passages}
+    items = service._within_budget(hits, nearby, sum(weight[1:9])).items
+    assert [(i.hit.passage.index, i.context_first, i.context_last) for i in items] == [(2, 1, 3), (7, 6, 8), (5, 4, 5)]
+    # A hit already inside a better result comes back there, and nothing grows.
+    items = service._within_budget([hits[0], SearchHit(passages[3], document, 0.5)], nearby, sum(weight[1:4])).items
+    assert [(i.hit.passage.index, i.context_first, i.context_last) for i in items] == [(2, 1, 3)]
+    # Leftover budget widens a result to five passages at most, however much is left.
+    items = service._within_budget([hits[0]], nearby, sum(weight)).items
+    assert [(i.context_first, i.context_last) for i in items] == [(0, 4)]
 
 
 async def test_a_document_replaced_during_its_batch_is_not_committed(memory, kb, monkeypatch):
@@ -1100,11 +2126,14 @@ async def test_a_refused_document_stops_being_split(api_client, kb, fake_embedde
 
     monkeypatch.setattr(service_module, "_next_draft", counting)
     monkeypatch.setattr(fake_embedder, "embed_documents", refuse)
-    text = "\n\n".join(f"# Part {n}\n\npassage {n}" for n in range(5 * _EMBED_ROUND))
+    rounds = 4 * (service_module._EMBED_ROUNDS_IN_FLIGHT + 1)
+    text = "\n\n".join(f"# Part {n}\n\npassage {n}" for n in range(rounds * _EMBED_ROUND))
     r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"document_id": "long", "text": text}]})
     assert r.status_code == 400, r.text
-    # One round pulled, then refused: the other four rounds' passages were never cut.
-    assert pulled["n"] == _EMBED_ROUND
+    # The splitter runs ahead of the embedder by at most the rounds in flight; once the first round is
+    # refused it stops, so most of the document's passages were never cut.
+    assert pulled["n"] <= (service_module._EMBED_ROUNDS_IN_FLIGHT + 1) * _EMBED_ROUND + 1
+    assert pulled["n"] < rounds * _EMBED_ROUND // 2
 
 
 async def test_a_new_content_type_ingests_the_same_file_again(api_client, kb):
@@ -1113,3 +2142,475 @@ async def test_a_new_content_type_ingests_the_same_file_again(api_client, kb):
     again = await _upload(api_client, kb, [("n.txt", b"red notes", "text/markdown")], [{"document_id": "n"}])
     assert again.json()["unchanged_document_ids"] == []
     assert (await api_client.get(f"{KB}/{kb}/documents/n")).json()["content_type"] == "text/markdown"
+
+
+async def _run_as_worker(memory, poller, child: dict, retry_count: int) -> dict:
+    """Run a queued child operation the way the worker would, on its ``retry_count``-th attempt, and read
+    back its operation row. Raw SQL on purpose: the row is marked claimed (as a worker's claim would mark
+    it) so the poller's terminal write applies, and no API exposes ``retry_count`` or the defer counts."""
+    from hindsight_api.worker.poller import ClaimedTask
+
+    pool = await memory._get_pool()
+    await pool.execute(
+        "UPDATE async_operations SET status = 'processing', worker_id = 'kb-worker', claimed_at = now() "
+        "WHERE operation_id = $1",
+        uuid.UUID(child["operation_id"]),
+    )
+    await poller.execute_task(
+        ClaimedTask(operation_id=child["operation_id"], task_dict={**child, "_retry_count": retry_count}, schema=None)
+    )
+    assert await poller.wait_for_active_tasks(timeout=30.0)
+    row = await pool.fetchrow(
+        "SELECT status, retry_count, result_metadata FROM async_operations WHERE operation_id = $1",
+        uuid.UUID(child["operation_id"]),
+    )
+    meta = row["result_metadata"]
+    return {**dict(row), "result_metadata": json.loads(meta) if isinstance(meta, str) else meta}
+
+
+@pytest.mark.xdist_group("worker_tests")
+async def test_a_rate_limited_embedder_defers_the_batch_instead_of_failing_it(
+    api_client, memory, kb, fake_embedder, counted, monkeypatch
+):
+    from hindsight_api.engine.aiohttp_session import UpstreamHTTPError
+    from hindsight_api.worker import WorkerPoller
+
+    _, payloads = counted
+    items = [{"document_id": f"r{n}", "text": f"note {n} about red"} for n in range(3)]
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": items, "async": True})
+    assert r.status_code == 202, r.text
+    child = payloads[0]
+    service = get_knowledge_service(memory)
+    # Run the child again as the worker would, its documents back to pending, against an embedder that
+    # keeps answering 429 after its own retries.
+    await service.store.set_statuses(kb, [StatusUpdate(i["document_id"], "pending") for i in items])
+
+    async def busy(_items):
+        raise UpstreamHTTPError(429, "Too Many Requests", {}, "http://gateway/v1/embeddings")
+
+    monkeypatch.setattr(fake_embedder, "embed_documents", busy)
+    poller = WorkerPoller(backend=await memory._get_backend(), worker_id="kb-worker", executor=memory.execute_task)
+
+    async def attempt(retry_count: int) -> dict:
+        return await _run_as_worker(memory, poller, child, retry_count)
+
+    # On its last retry, too: a rate limit is "not now", not a failure, so nothing is used up or lost.
+    row = await attempt(retry_count=3)
+    assert row["status"] == "pending" and (row["retry_count"] or 0) == 0, row
+    assert row["result_metadata"]["rate_limit_defers"] == 1
+    assert {d.status for d in (await service.store.get_documents(kb, [i["document_id"] for i in items])).values()} == {
+        "pending"
+    }
+    assert (await attempt(retry_count=0))["result_metadata"]["rate_limit_defers"] == 2  # counted, and backing off
+
+    # Anything else still uses up a retry, as before.
+    async def broken(_items):
+        raise UpstreamHTTPError(500, "Internal Server Error", {}, "http://gateway/v1/embeddings")
+
+    monkeypatch.setattr(fake_embedder, "embed_documents", broken)
+    row = await attempt(retry_count=0)
+    assert row["status"] == "pending" and row["retry_count"] == 1, row
+
+
+async def test_a_store_shedding_an_upload_answers_503_with_retry_after(api_client, memory, kb, monkeypatch):
+    from hindsight_api.engine.memories.base import StoreWriteUnavailable
+
+    store = get_knowledge_service(memory).store
+
+    async def shed(*_a, **_k):
+        raise StoreWriteUnavailable("fold behind: the bank's indexing is behind its writers")
+
+    monkeypatch.setattr(store, "put_documents", shed)
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"document_id": "s", "text": "x"}], "async": True})
+    # "Not now", which a bulk ingest retries, rather than a 500 that says the request is broken.
+    assert r.status_code == 503 and r.headers["retry-after"] == "30", r.text
+
+
+@pytest.mark.xdist_group("worker_tests")
+async def test_a_store_shedding_a_batch_defers_it_without_using_a_retry(
+    api_client, memory, kb, fake_embedder, counted, monkeypatch
+):
+    from hindsight_api.worker import WorkerPoller
+
+    _, payloads = counted
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"document_id": "b", "text": "red"}], "async": True})
+    assert r.status_code == 202, r.text
+    child = payloads[0]
+    service = get_knowledge_service(memory)
+    await service.store.set_statuses(kb, [StatusUpdate("b", "pending")])
+
+    async def shed(*_a, **_k):
+        raise RuntimeError("Write: fold behind: un-folded tail holds 15603736 bytes, over the write bound")
+
+    monkeypatch.setattr(service.store, "replace_passages", shed)
+    poller = WorkerPoller(backend=await memory._get_backend(), worker_id="kb-worker", executor=memory.execute_task)
+    row = await _run_as_worker(memory, poller, child, retry_count=0)
+    # Deferred, not retried: the backlog clears by itself, and a counted retry is how a long ingest's
+    # batches ran out of attempts while it did.
+    assert row["status"] == "pending" and (row["retry_count"] or 0) == 0, row
+    assert (await service.store.get_documents(kb, ["b"]))["b"].status == "pending"
+
+
+async def test_a_batch_that_fails_for_good_fails_its_documents_not_leaves_them_pending(
+    api_client, memory, kb, fake_embedder, monkeypatch
+):
+    store = get_knowledge_service(memory).store
+
+    async def other_size(*_a, **_k):
+        raise ValueError("knowledge bank holds vectors of 768 dimensions, but this ingest makes 384")
+
+    monkeypatch.setattr(store, "replace_passages", other_size)
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"document_id": "v", "text": "red"}], "async": True})
+    assert r.status_code == 202, r.text
+    # The engine does not retry a ValueError, so a pending document would wait for ever.
+    doc = (await api_client.get(f"{KB}/{kb}/documents/v")).json()
+    assert doc["status"] == "failed" and "768 dimensions" in (doc["error"] or ""), doc
+
+
+def test_an_engine_with_a_knowledge_service_can_still_be_freed():
+    """The service is kept on its engine, not in a process-wide map: a weak map whose value (the service)
+    held its own key (the engine) kept every engine a test made alive until the CI runner ran out of memory."""
+    import gc
+    import weakref
+
+    class _Engine:
+        _knowledge_service = None
+
+    engine = _Engine()
+    service = get_knowledge_service(engine)  # type: ignore[arg-type]
+    assert get_knowledge_service(engine) is service  # type: ignore[arg-type]  # one per engine
+    gone = weakref.ref(engine)
+    del engine, service
+    gc.collect()
+    assert gone() is None
+
+
+async def test_media_hits_cost_a_fixed_amount_of_the_budget(api_client, kb):
+    from hindsight_api.knowledge.service import MEDIA_HIT_TOKENS
+
+    for n, color in enumerate(((255, 0, 0), (0, 0, 255), (0, 255, 0))):
+        await _upload(api_client, kb, [(f"swatch{n}.png", _png(color), "image/png")], [{"document_id": f"swatch{n}"}])
+    # Images carry no text: each costs MEDIA_HIT_TOKENS, so this budget holds two of the three.
+    hits = await _search(api_client, kb, query="red", max_tokens=2 * MEDIA_HIT_TOKENS)
+    assert len(hits) == 2
+    assert len(await _search(api_client, kb, query="red", max_tokens=3 * MEDIA_HIT_TOKENS)) == 3
+
+
+async def test_a_small_bank_finds_its_passages_next_to_a_big_one(api_client, memory, kb, monkeypatch):
+    """A small bank's search walks its own vectors, not a big bank's (#6607).
+
+    With one HNSW index shared by every bank, a generic plan (statistics taken while one big bank
+    filled the table) scanned it filtered to the small bank and, among thousands of equal vectors,
+    found none of its passages. Every acquire here forces generic plans, the worst case: the
+    per-bank index cannot serve one, so the small bank is scanned exactly.
+    """
+    from contextlib import asynccontextmanager
+
+    from hindsight_api.engine.db_utils import acquire_with_retry
+    from hindsight_api.knowledge import store as store_module
+
+    big = f"kb-big-{uuid.uuid4().hex[:8]}"
+    assert (await api_client.post(KB, json={"bank_id": big})).status_code == 200
+    try:
+        async with acquire_with_retry(await memory._get_backend()) as conn:
+            await conn.execute(
+                "INSERT INTO kb_documents (bank_id, document_id, content_type, media_type, content_hash, "
+                "passage_count) VALUES ($1, 'd', 'text/plain', 'text', 'h', 3000)",
+                big,
+            )
+            await conn.execute(
+                "INSERT INTO kb_passages (bank_id, document_id, idx, modality, embedding) "
+                "SELECT $1, 'd', i, 'text', $2::vector FROM generate_series(1, 3000) i",
+                big,
+                str(FakeEmbedder._norm([1.0] * len(_AXES))),
+            )
+            await conn.execute("ANALYZE kb_passages")
+        for n, color in enumerate(((255, 0, 0), (0, 0, 255), (0, 255, 0))):
+            await _upload(api_client, kb, [(f"swatch{n}.png", _png(color), "image/png")], [{"document_id": f"s{n}"}])
+
+        real_acquire = store_module.acquire_with_retry
+
+        @asynccontextmanager
+        async def generic_plans(pool):
+            async with real_acquire(pool) as conn:
+                await conn.execute("SET plan_cache_mode = force_generic_plan")
+                yield conn
+
+        monkeypatch.setattr(store_module, "acquire_with_retry", generic_plans)
+        hits = await _search(api_client, kb, query="red", max_tokens=1_000_000)
+        assert {h["document_id"] for h in hits} == {"s0", "s1", "s2"}
+    finally:
+        await api_client.delete(f"{KB}/{big}")
+
+
+async def test_the_search_budget_sets_how_deep_it_ranks(api_client, kb):
+    from hindsight_api.knowledge.service import SEARCH_CANDIDATES
+
+    items = [{"document_id": f"n{i}", "text": f"note {i} about red"} for i in range(SEARCH_CANDIDATES["low"] + 10)]
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": items[:100]})
+    assert r.status_code == 200, r.text
+    deep = {"query": "red", "max_tokens": 1_000_000}
+    assert len(await _search(api_client, kb, budget="low", **deep)) == SEARCH_CANDIDATES["low"]
+    assert len(await _search(api_client, kb, **deep)) == len(items)  # mid, the default, holds them all
+    bad = await api_client.post(f"{KB}/{kb}/search", json={"query": "red", "budget": "huge"})
+    assert bad.status_code == 422
+
+
+async def test_a_text_with_a_nul_byte_is_stored_and_spares_its_batch(api_client, kb):
+    # Postgres text cannot hold NUL: one such text used to fail every document ingested with it.
+    r = await api_client.post(
+        f"{KB}/{kb}/ingest",
+        json={"items": [{"document_id": "nul", "text": "debt\x00 ratio"}, {"document_id": "ok", "text": "fine"}]},
+    )
+    assert r.status_code == 200, r.text
+    for doc in ("nul", "ok"):
+        detail = (await api_client.get(f"{KB}/{kb}/documents/{doc}")).json()
+        assert detail["status"] == "ready", detail
+    assert (await api_client.get(f"{KB}/{kb}/documents/nul")).json()["passages"][0]["text"] == "debt ratio"
+
+
+async def test_a_bank_bigger_than_one_delete_batch_is_deleted_whole(api_client, memory, kb, monkeypatch):
+    # A big bank is deleted a batch of documents at a time: one cascading statement over all of them
+    # ran past the command timeout on a 100k-document bank.
+    from hindsight_api.knowledge import service as service_mod
+
+    monkeypatch.setattr(service_mod, "DELETE_BATCH_DOCUMENTS", 2)
+    store = get_knowledge_service(memory).store
+    batches: list[int] = []
+    delete_some = store.delete_some_documents
+
+    async def counted(bank_id, limit):
+        batches.append(await delete_some(bank_id, limit))
+        return batches[-1]
+
+    monkeypatch.setattr(store, "delete_some_documents", counted)
+    items = [{"document_id": f"d{i}", "text": f"text number {i}"} for i in range(5)]
+    assert (await api_client.post(f"{KB}/{kb}/ingest", json={"items": items})).status_code == 200
+    assert (await api_client.delete(f"{KB}/{kb}")).status_code == 200
+    assert batches == [2, 2, 1, 0]
+    assert (await api_client.get(f"{KB}/{kb}")).status_code == 404
+
+
+async def test_a_bank_is_deleted_while_the_embedder_is_unreachable(api_client, memory, kb, monkeypatch):
+    # The store's first-use setup asks the embedder for its size; a delete touches no vector and must
+    # not need it (a gateway outage turned a delete into a 503).
+    embedder = get_knowledge_service(memory).embedder
+
+    async def unreachable(*_a, **_k):
+        import aiohttp
+
+        raise aiohttp.ClientConnectionError("gateway down")
+
+    monkeypatch.setattr(embedder, "dimension", 0)
+    monkeypatch.setattr(embedder, "embed_query", unreachable)
+    assert (await api_client.get(f"{KB}/{kb}/documents")).status_code == 503
+    assert (await api_client.delete(f"{KB}/{kb}")).status_code == 200
+
+
+async def test_reflect_reads_the_linked_banks_through_the_knowledge_search(api_client, memory, kb, request_context):
+    # Reflect's recall tool gets what POST /search gives for the same question: a keyword match, with
+    # the passages around it. It used to run its own meaning-only top-5 with no text around a hit.
+    from hindsight_api.engine.reflect.tools import tool_recall
+
+    paragraphs = [f"Paragraph {i}: " + ("invoice " if i == 4 else "filler ") * 180 for i in range(10)]
+    r = await api_client.post(
+        f"{KB}/{kb}/ingest",
+        json={"items": [{"document_id": "long", "text": "\n\n".join(paragraphs), "filename": "long.md"}]},
+    )
+    assert r.status_code == 200, r.text
+    mem_bank = f"mem-{uuid.uuid4().hex[:8]}"
+    await api_client.post(f"/v1/default/banks/{mem_bank}/memories", json={"items": [{"content": "Invoices are due."}]})
+    # A linked bank that is gone is skipped, not a failed reflect.
+    links = {"updates": {"knowledge_banks": [kb, f"gone-{uuid.uuid4().hex[:6]}"]}}
+    assert (await api_client.patch(f"/v1/default/banks/{mem_bank}/config", json=links)).status_code == 200
+
+    out = await tool_recall(memory, mem_bank, "invoice", request_context, max_tokens=4096, include_documents=True)
+    searched = await _search(api_client, kb, query="invoice", max_tokens=4096)
+    assert [d["text"] for d in out["documents"]] == [h["text"] for h in searched]
+    first = out["documents"][0]["text"]
+    assert "Paragraph 4:" in first and "Paragraph 3:" in first and "Paragraph 5:" in first
+    await memory.delete_bank(mem_bank, request_context=request_context)
+
+
+async def test_a_bank_says_when_its_documents_last_changed(api_client, kb):
+    # The bank list shows it beside the size, as the memory bank list shows its last write.
+    assert (await api_client.get(f"{KB}/{kb}")).json()["last_document_at"] is None
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"document_id": "a", "text": "hello"}]})
+    assert r.status_code == 200, r.text
+    changed = (await api_client.get(f"{KB}/{kb}")).json()["last_document_at"]
+    listed = {b["bank_id"]: b for b in (await api_client.get(KB, params={"q": kb})).json()["banks"]}
+    assert changed is not None and listed[kb]["last_document_at"] == changed
+
+
+def test_a_heading_waits_for_its_content_instead_of_standing_alone():
+    # "## Observations" alone outranked every real answer to "hindsight": a few words nearly equal a
+    # short query. A heading now joins what follows it, a cut paragraph's first sentences included.
+    from hindsight_api.knowledge.text_passages import split_into_passages
+
+    doc = "## Observations\n\n### Recent\n\n" + "The worker retried the batch. " * 40
+    chunks = split_into_passages(doc, passage_size=64)
+    assert chunks[0].startswith("## Observations\n\n### Recent\n\nThe worker")
+    assert all(count_tokens(c) <= 64 for c in chunks)
+    assert not any(c.strip().startswith("#") and "\n" not in c.strip() for c in chunks)
+
+
+async def test_a_traced_search_explains_every_rank_and_what_the_budget_kept(api_client, kb):
+    paragraphs = [
+        f"Paragraph {i}: " + ("the invoice is in the box " if i == 4 else "this is the filler of it ") * 30
+        for i in range(10)
+    ]
+    r = await api_client.post(
+        f"{KB}/{kb}/ingest",
+        json={"items": [{"document_id": "long", "text": "\n\n".join(paragraphs), "filename": "long.md"}]},
+    )
+    assert r.status_code == 200, r.text
+    # One word: keywords run for any query, in any language.
+    body = (
+        await api_client.post(f"{KB}/{kb}/search", json={"query": "invoice", "max_tokens": 1200, "trace": True})
+    ).json()
+    trace = body["trace"]
+    assert "invoice" in trace["keyword_terms"]
+    assert trace["candidates"] >= len(trace["hits"]) > 0 and 0 < trace["tokens_used"] <= 1200
+    assert {"embed", "store.search", "context"} <= set(trace["timings_ms"])
+    hits = trace["hits"]
+    assert [h["rank"] for h in hits] == list(range(1, len(hits) + 1))
+    assert [h["score"] for h in hits] == sorted((h["score"] for h in hits), reverse=True)
+    top = hits[0]
+    assert top["index"] == 4 and top["keyword"] > 0 and "keyword" in top["found_by"] and top["result_rank"] == 1
+    # Its neighbours came back inside its text, so they are merged into it, not results of their own.
+    merged = [h for h in hits if h["outcome"] == "merged"]
+    returned_ranks = {h["rank"] for h in hits if h["outcome"] == "returned"}
+    assert merged and all(h["merged_into_rank"] in returned_ranks for h in merged)
+    returned = [h for h in hits if h["outcome"] == "returned"]
+    assert [h["result_rank"] for h in returned] == list(range(1, len(body["results"]) + 1))
+    assert any(h["outcome"] == "over_budget" for h in hits)
+    # Step 1: each candidate search's own list, best first; the keyword one found the invoice paragraph.
+    arms = {a["name"]: a["results"] for a in trace["candidate_searches"]}
+    assert {"vector", "keyword"} <= set(arms) and arms["keyword"][0]["index"] == 4
+    assert all([r["score"] for r in a] == sorted((r["score"] for r in a), reverse=True) for a in arms.values())
+    # Step 4: the budget's steps, in order, add up to what the results weigh.
+    steps = trace["budget_steps"]
+    assert steps[0]["rank"] == 1 and steps[0]["action"] == "window" and (steps[0]["first"], steps[0]["last"]) == (3, 5)
+    assert [s["total"] for s in steps] == sorted(s["total"] for s in steps)
+    assert steps[-1]["total"] == trace["tokens_used"] == sum(s["tokens"] for s in steps)
+    assert any(s["action"] == "widened" for s in steps) or any(s["action"] == "skipped" for s in steps)
+    # The depth cut: a low budget keeps the top 50 of what was scored.
+    low = (
+        await api_client.post(
+            f"{KB}/{kb}/search", json={"query": "invoice", "max_tokens": 1200, "budget": "low", "trace": True}
+        )
+    ).json()["trace"]
+    assert low["depth"] == min(50, len(low["hits"]))
+
+
+async def test_a_bank_delete_does_not_wait_forever_on_held_documents(api_client, memory, kb, monkeypatch):
+    # A document some transaction never lets go of is skipped by every batch; after the wait the banks
+    # row's cascade takes it, rather than the delete sleeping a second at a time forever.
+    from hindsight_api.knowledge import service as service_mod
+
+    store = get_knowledge_service(memory).store
+    assert (await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"text": "held"}]})).status_code == 200
+
+    async def always_held(bank_id, limit):
+        return 0
+
+    monkeypatch.setattr(store, "delete_some_documents", always_held)
+    monkeypatch.setattr(service_mod, "DELETE_WAIT_SECONDS", 0)
+    assert (await api_client.delete(f"{KB}/{kb}")).status_code == 200
+    assert (await api_client.get(f"{KB}/{kb}")).status_code == 404
+
+
+async def test_reflect_searches_linked_banks_at_the_servers_budget(
+    api_client, memory, kb, request_context, monkeypatch
+):
+    from hindsight_api.config import _parse_reflect_kb_search_budget, clear_config_cache
+    from hindsight_api.engine.reflect.tools import tool_recall
+
+    await _upload(api_client, kb, [("keys.png", _png((255, 0, 0)), "image/png")])
+    mem_bank = await _linked_memory_bank(api_client, kb)
+    service = get_knowledge_service(memory)
+    budgets: list[str] = []
+    search = service.search
+
+    async def spy(bank_id, request, request_context, trace=None):
+        budgets.append(request.budget)
+        return await search(bank_id, request, request_context, trace)
+
+    monkeypatch.setattr(service, "search", spy)
+    await tool_recall(memory, mem_bank, "red", request_context, include_documents=True)
+    monkeypatch.setenv("HINDSIGHT_API_REFLECT_KB_SEARCH_BUDGET", "high")
+    clear_config_cache()
+    await tool_recall(memory, mem_bank, "red", request_context, include_documents=True)
+    monkeypatch.delenv("HINDSIGHT_API_REFLECT_KB_SEARCH_BUDGET")
+    clear_config_cache()
+
+    assert budgets == ["mid", "high"]
+    with pytest.raises(ValueError, match="REFLECT_KB_SEARCH_BUDGET"):
+        _parse_reflect_kb_search_budget("deep")
+    await memory.delete_bank(mem_bank, request_context=request_context)
+
+
+async def test_re_ingesting_with_reordered_tags_is_unchanged(api_client, kb):
+    """#6591: the same tags in another order are not a change, so nothing is re-indexed."""
+    r = await api_client.post(
+        f"{KB}/{kb}/ingest", json={"items": [{"document_id": "a", "text": "red", "tags": ["x", "y"]}]}
+    )
+    assert r.status_code == 200, r.text
+    r = await api_client.post(
+        f"{KB}/{kb}/ingest", json={"items": [{"document_id": "a", "text": "red", "tags": ["y", "x"]}]}
+    )
+    assert r.json()["unchanged_document_ids"] == ["a"]
+
+
+async def test_each_bank_has_its_own_vector_index_that_its_search_uses(api_client, memory, kb, fake_embedder):
+    """A bank's search walks only its own vectors, not every bank's (one shared index returned short
+    once other banks' vectors crowded out the filtered ones)."""
+    from hindsight_api.engine.db_utils import acquire_with_retry
+    from hindsight_api.engine.schema import fq_table
+
+    other = f"kb-{uuid.uuid4().hex[:8]}"
+    assert (await api_client.post(KB, json={"bank_id": other})).status_code == 200
+    r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"document_id": "a", "text": "red key"}]})
+    assert r.status_code == 200, r.text
+
+    # The catalog, directly: which indexes exist is a storage fact no API reports.
+    async def indexes(bank_id: str) -> list[str]:
+        async with acquire_with_retry(await memory._get_backend()) as conn:
+            rows = await conn.fetch(
+                "SELECT indexname FROM pg_indexes WHERE tablename IN ('kb_passages', 'kb_passage_vectors') "
+                "AND indexdef LIKE '%hnsw%' AND indexdef LIKE $1",
+                f"%bank_id = '{bank_id}'%",
+            )
+            return sorted(r["indexname"] for r in rows)
+
+    names = await indexes(kb)
+    assert len(names) == 2 and len(await indexes(other)) == 2 and set(names).isdisjoint(await indexes(other))
+
+    async with acquire_with_retry(await memory._get_backend()) as conn, conn.transaction():
+        # A one-row bank is cheaper by its B-tree and a sort; with both off only a usable vector index is left.
+        await conn.execute("SET LOCAL enable_seqscan = off")
+        await conn.execute("SET LOCAL enable_sort = off")
+        vector = str(fake_embedder._norm([1.0] * fake_embedder.dimension))
+        plan = "\n".join(
+            r[0]
+            for r in await conn.fetch(
+                f"EXPLAIN SELECT idx FROM {fq_table('kb_passages')} x WHERE x.bank_id = $2 "
+                "ORDER BY x.embedding <=> $1::vector LIMIT 10",
+                vector,
+                kb,
+            )
+        )
+    assert any(n in plan for n in names), plan
+
+    assert (await api_client.delete(f"{KB}/{kb}")).status_code == 200
+    assert await indexes(kb) == [] and len(await indexes(other)) == 2
+    await api_client.delete(f"{KB}/{other}")
+
+
+def test_overlapping_ranges_around_hits_are_read_once():
+    from hindsight_api.knowledge.store import _merged_ranges
+
+    spans = [("b", 0, 2), ("a", 5, 9), ("a", 0, 4), ("a", 12, 14), ("a", 8, 11)]
+    # Touching (0-4, 5-9) and overlapping (5-9, 8-11) spans of one document join; another document's never do.
+    assert _merged_ranges(spans) == [("a", 0, 14), ("b", 0, 2)]
+    assert _merged_ranges([("a", 0, 2), ("a", 4, 6)]) == [("a", 0, 2), ("a", 4, 6)]

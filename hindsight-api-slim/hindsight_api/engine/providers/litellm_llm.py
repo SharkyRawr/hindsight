@@ -36,6 +36,7 @@ from hindsight_api.engine.providers.openai_compatible_llm import (
     record_retried_attempt,
     visible_token_usage,
 )
+from hindsight_api.engine.providers.tools_via_schema import native_call_reply
 from hindsight_api.engine.remote_retry import is_transient_remote_error, jittered_backoff
 from hindsight_api.engine.response_models import TokenUsage
 from hindsight_api.engine.structured_output import provider_json_schema, strict_json_schema
@@ -116,6 +117,19 @@ def _is_retryable(exc: BaseException) -> bool:
     if isinstance(exc, ProviderResponseError):
         return exc.retryable
     return is_transient_remote_error(exc)
+
+
+def _with_cached_system(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The messages with the system prompt marked for Claude's prompt cache.
+
+    The system prompt (with any prompt-injected schema) is the prefix every call of a scope
+    shares, as ``anthropic_llm`` marks it. Below the model's minimum cacheable length a marker
+    is ignored at no cost. A copy: the list is the caller's.
+    """
+    if not messages or messages[0].get("role") != "system" or not isinstance(messages[0].get("content"), str):
+        return messages
+    system = {"type": "text", "text": messages[0]["content"], "cache_control": {"type": "ephemeral"}}
+    return [{**messages[0], "content": [system]}, *messages[1:]]
 
 
 class LiteLLMLLM(LLMInterface):
@@ -301,6 +315,17 @@ class LiteLLMLLM(LLMInterface):
         """Issue a chat completion. Subclasses override to route via ``litellm.Router``."""
         return await self._litellm.acompletion(**kwargs)
 
+    def caches_marked_prefix(self) -> bool:
+        """A Claude model (Bedrock, Vertex, Anthropic) caches up to a ``cache_control`` part,
+        which LiteLLM turns into the provider's own marker (a Bedrock ``cachePoint``).
+
+        ``HINDSIGHT_API_LLM_LITELLM_PROMPT_CACHE`` overrides the name check both ways: a Claude model
+        behind an ARN or a proxy alias has no "claude" in its name."""
+        override = get_config().llm_litellm_prompt_cache
+        if override is not None:
+            return override
+        return "claude" in self.model.lower()
+
     def _resolve_completion_model(self, response: Any) -> str:
         """
         Return the model name to record in metrics/tracing.
@@ -359,11 +384,15 @@ class LiteLLMLLM(LLMInterface):
                     },
                 }
 
+        if self.caches_marked_prefix():
+            call_kwargs["messages"] = _with_cached_system(call_kwargs["messages"])
+
         last_exception = None
         # Kept outside the try so the final invalid-JSON log can name it (#5443).
         finish_reason = None
 
         for attempt in range(max_retries + 1):
+            attempt_started = time.perf_counter()
             try:
                 async with attempt_context() if attempt_context is not None else nullcontext():
                     set_stage(f"llm.{self._stage_label}.{scope}.attempt={attempt + 1}/{max_retries + 1}")
@@ -379,7 +408,7 @@ class LiteLLMLLM(LLMInterface):
                 choice = response.choices[0]
                 _raise_if_generation_failed(response, choice, provider=self.provider, model=self.model, scope=scope)
                 message = choice.message
-                content = message.content or ""
+                content = message.content or native_call_reply(response_format, message.tool_calls) or ""
                 finish_reason = choice.finish_reason
                 model_name = self._resolve_completion_model(response)
 
@@ -497,6 +526,14 @@ class LiteLLMLLM(LLMInterface):
                     logger.warning(
                         f"LiteLLM call exceeded timeout={self.timeout}s ({exc_name}, scope={scope}), retrying..."
                     )
+                    record_retried_attempt(
+                        provider=self.provider,
+                        model=self.model,
+                        scope=scope,
+                        messages=messages,
+                        error=e,
+                        started=attempt_started,
+                    )
                     backoff = min(initial_backoff * (2**attempt), max_backoff)
                     await asyncio.sleep(backoff)
                     continue
@@ -525,7 +562,7 @@ class LiteLLMLLM(LLMInterface):
                             scope=scope,
                             messages=messages,
                             error=e,
-                            started=start_time,
+                            started=attempt_started,
                         )
                     await asyncio.sleep(jittered_backoff(attempt, initial_backoff, max_backoff))
                     continue

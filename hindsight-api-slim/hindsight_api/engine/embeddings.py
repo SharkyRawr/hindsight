@@ -515,8 +515,8 @@ class LocalSTEmbeddings(Embeddings):
             return [emb.tolist() for emb in embeddings]
         finally:
             # Only reclaim the GPU allocator pool here, and only when actually on a
-            # GPU (opt-in MPS/CUDA/XPU). encode() runs in tight retain loops, so a
-            # gc.collect()/malloc_trim on every call is too costly on the CPU default
+            # GPU (CUDA/XPU). encode() runs in tight retain loops, so a malloc_trim
+            # on every call is too costly on the CPU default
             # — and unnecessary: refcounting frees the small transient buffers
             # immediately and the allocator reuses them for the next batch. (The
             # reranker keeps its per-batch heap trim for the #1717 CPU case; it runs
@@ -950,7 +950,7 @@ class RemoteTEIEmbeddings(Embeddings):
 
             logger.info(f"Embeddings: TEI provider initialized (model: {self._model_id}, dim: {self._dimension})")
         except _HTTP_ERRORS as e:
-            raise RuntimeError(f"Failed to connect to TEI server at {self.base_url}: {e}")
+            raise RuntimeError(f"Failed to connect to TEI server at {self.base_url}: {e}") from e
 
     async def encode(self, texts: list[str]) -> list[list[float]]:
         """
@@ -979,7 +979,7 @@ class RemoteTEIEmbeddings(Embeddings):
                 json={"inputs": batch},
             )
         except _HTTP_ERRORS as e:
-            raise RuntimeError(f"TEI embedding request failed: {e}")
+            raise RuntimeError(f"TEI embedding request failed: {e}") from e
 
 
 # OpenAI's insufficient_quota 429 carries no reset time, so a quota-exhausted

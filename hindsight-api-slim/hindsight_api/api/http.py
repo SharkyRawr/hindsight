@@ -19,17 +19,19 @@ import uuid
 from collections.abc import Awaitable, Iterator, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from enum import StrEnum
 from types import FrameType
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 from urllib.parse import quote, unquote
 
 import orjson
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
-from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from hindsight_api.api.admission import AdmissionAbandoned, AdmissionRejected, build_controller_from_config
+from hindsight_api.api.content_disposition import content_disposition
 from hindsight_api.api.disconnect import ClientDisconnectCancellationMiddleware, get_scope_cancellation_token
+from hindsight_api.api.gzip_offload import OffloadingGZipMiddleware
 from hindsight_api.api.observability import HttpObservabilityMiddleware
 from hindsight_api.api.passthrough_headers import collect_passthrough_headers
 from hindsight_api.api.unknown_params import UnknownParamsRoute, use_unknown_params_routes
@@ -44,6 +46,7 @@ from hindsight_api.engine.audit import (
 )
 from hindsight_api.engine.document_history import DocumentHistoryResponse
 from hindsight_api.engine.llm_trace import LLMCallType, LLMRequestListResponse, LLMRequestStatsResponse, LLMStatsSplit
+from hindsight_api.engine.observation_tree import TreeFolder
 from hindsight_api.extensions import AuthenticationError, PrecheckContext, PrecheckOperation
 
 
@@ -196,6 +199,7 @@ from hindsight_api.engine.bank_templates import (
     validate_bank_template,
 )
 from hindsight_api.engine.embeddings import is_embedding_model_mismatch
+from hindsight_api.engine.llm_interface import ProviderContentPolicyError
 from hindsight_api.engine.memories.base import StoreWriteUnavailable
 from hindsight_api.engine.memory_engine import (
     KEEP_PARENT,
@@ -297,10 +301,12 @@ logger = logging.getLogger(__name__)
 def _internal_error(exc: Exception, where: str) -> HTTPException:
     """Log an unhandled handler exception with its traceback, and map it to a 500.
 
-    Three failures keep their own status instead: a validator rejection (the
+    Four failures keep their own status instead: a validator rejection (the
     validator's code — routes that forgot to catch it used to answer 500, #5448),
-    a store that shed the request (503), and client text the database cannot
-    store, such as a NUL byte (400 — every route answered 500 for it, #6231).
+    a store that shed the request (503), client text the database cannot
+    store, such as a NUL byte (400 — every route answered 500 for it, #6231),
+    and content the LLM provider refused on policy grounds (422, logged as a
+    warning: the caller's content, not a server fault).
 
     Every route's catch-all used to do this inline — 72 byte-identical copies of
     the same four lines, plus seven near-copies that logged the traceback without
@@ -325,6 +331,10 @@ def _internal_error(exc: Exception, where: str) -> HTTPException:
     unstorable = _unstorable_text(exc)
     if unstorable is not None:
         return unstorable
+    refused = _content_refused(exc)
+    if refused is not None:
+        logger.warning(f"Content refused by the LLM provider in {where}, answering 422: {exc}")
+        return refused
     logger.error(f"Error in {where}: {exc}\n\nTraceback:\n{traceback.format_exc()}")
     return HTTPException(status_code=500, detail=str(exc))
 
@@ -358,9 +368,25 @@ def _unstorable_text(exc: BaseException) -> HTTPException | None:
     return None
 
 
+def _content_refused(exc: BaseException) -> HTTPException | None:
+    """The 422 for content the LLM provider refused on policy grounds, or None if that is not what failed.
+
+    A refusal is a deterministic verdict on the content the caller sent: the same input earns the same
+    refusal on every attempt (#3690). Answering it with a 500 tells a client the server is broken and
+    invites a retry that can only fail again, and it counts toward 5xx error-rate alerting, so one
+    caller sending refused content looks like an outage.
+
+    Walks the cause/context chain because the engine wraps the provider's error before a route sees it.
+    """
+    for cur in _exception_chain(exc):
+        if isinstance(cur, ProviderContentPolicyError):
+            return HTTPException(status_code=422, detail=str(cur))
+    return None
+
+
 def _expected_failure(exc: BaseException) -> HTTPException | None:
-    """The 503 or 400 for a failure that is not a server bug, for catch-alls that build their own 500."""
-    return _store_unavailable(exc) or _unstorable_text(exc)
+    """The 503, 400 or 422 for a failure that is not a server bug, for catch-alls that build their own 500."""
+    return _store_unavailable(exc) or _unstorable_text(exc) or _content_refused(exc)
 
 
 def _store_unavailable(exc: BaseException) -> HTTPException | None:
@@ -783,6 +809,62 @@ class EntityListItem(BaseModel):
     first_seen: str | None = None
     last_seen: str | None = None
     metadata: dict[str, Any] | None = None
+
+
+class ObservationTreeObservation(BaseModel):
+    """An observation as the observation tree lists it."""
+
+    id: str
+    text: str
+    proof_count: int = Field(description="How many source memories back it.")
+    occurred_start: datetime | None = None
+    occurred_end: datetime | None = None
+    mentioned_at: datetime | None = None
+    updated_at: datetime | None = None
+    tags: list[str]
+
+
+class ObservationTreeFileKind(StrEnum):
+    """What a observation-tree file is. A named enum, not a Literal: inline enums are named after
+    their field by the generated Rust client, and ``kind`` already names the page node enum
+    there (an inline ``kind`` here took the name and broke the CLI's ``Kind::Folder``)."""
+
+    INDEX = "index"
+    TOPIC = "topic"
+
+
+class ObservationTreeFile(BaseModel):
+    """A markdown file in the observation tree: a folder's index.md or one topic (an OKF concept)."""
+
+    path: str = Field(description="Path from the tree root, e.g. `gemma/vllm.md` or `gemma/index.md`.")
+    name: str
+    kind: ObservationTreeFileKind = Field(
+        description="`index`: a folder's overview (OKF's reserved `index.md`) and best-supported observations. `topic`: every observation in one topic."
+    )
+    title: str
+    observation_count: int = Field(description="Observations in the topic, or in the whole folder for an index.")
+    about: list[str] = Field(description="The entities that set this topic apart from its siblings.")
+    related: list[str] = Field(description="Paths of related topic files elsewhere in the tree.")
+    observations: list[ObservationTreeObservation] = Field(description="What the file lists, best-supported first.")
+    content: str = Field(description="The same file as markdown, with dates and source counts on every line.")
+
+
+class ObservationTreeFolder(BaseModel):
+    """A topic folder in the observation tree."""
+
+    path: str = Field(description="Path from the tree root; empty for the root.")
+    name: str
+    title: str = Field(description="Human-readable topic name.")
+    observation_count: int
+    folders: list["ObservationTreeFolder"]
+    files: list[ObservationTreeFile]
+
+
+def _observation_tree_json(tree: TreeFolder) -> str:
+    """The observation tree as the response body. Read straight off the engine's dataclasses: a
+    large bank's tree is megabytes of text, and ``dataclasses.asdict`` would deep-copy all of it
+    first."""
+    return ObservationTreeFolder.model_validate(tree, from_attributes=True).model_dump_json()
 
 
 class EntityListResponse(BaseModel):
@@ -1739,6 +1821,12 @@ class ReflectToolCall(BaseModel):
     )
     duration_ms: int = Field(description="Execution time in milliseconds")
     iteration: int = Field(default=0, description="Iteration number (1-based) when this tool was called")
+    # Epoch milliseconds overflow int32: without format int64 the Go client decodes into int32 and fails.
+    started_at_ms: int = Field(
+        default=0,
+        description="When the call started, in Unix epoch milliseconds",
+        json_schema_extra={"format": "int64"},
+    )
 
 
 class ReflectLLMCall(BaseModel):
@@ -1746,6 +1834,12 @@ class ReflectLLMCall(BaseModel):
 
     scope: str = Field(description="Call scope: agent_1, agent_2, final, etc.")
     duration_ms: int = Field(description="Execution time in milliseconds")
+    # Epoch milliseconds overflow int32: without format int64 the Go client decodes into int32 and fails.
+    started_at_ms: int = Field(
+        default=0,
+        description="When the call started, in Unix epoch milliseconds",
+        json_schema_extra={"format": "int64"},
+    )
 
 
 class ReflectBasedOn(BaseModel):
@@ -4133,7 +4227,7 @@ class CreateWebhookRequest(BaseModel):
     secret: str | None = Field(default=None, description="HMAC-SHA256 signing secret (optional)")
     event_types: list[str] = Field(
         default=["consolidation.completed"],
-        description="List of event types to deliver. Supported: 'retain.completed', 'consolidation.completed', 'memory_defense.triggered'.",
+        description="List of event types to deliver. Supported: 'retain.completed', 'consolidation.completed', 'memory_defense.triggered', 'mental_model.refreshed'.",
     )
     enabled: bool = Field(default=True, description="Whether this webhook is active")
     http_config: WebhookHttpConfig = Field(
@@ -4576,7 +4670,7 @@ def create_app(
     # A negative floor drops the middleware entirely.
     gzip_min_size = get_config().gzip_min_size
     if gzip_min_size >= 0:
-        app.add_middleware(GZipMiddleware, minimum_size=gzip_min_size)
+        app.add_middleware(OffloadingGZipMiddleware, minimum_size=gzip_min_size)
 
     # ---------------------------------------------------------------------------
     # Patch OpenAPI schema: align ValidationError with Pydantic v2 error format
@@ -5026,7 +5120,7 @@ def _register_routes(app: FastAPI):
                 file_upload_api=config.enable_file_upload_api,
                 document_export_api=config.enable_document_export_api,
                 document_import_api=config.enable_document_import_api,
-                knowledge_banks=config.enable_knowledge_banks,
+                knowledge_banks=config.enable_kb,
                 audit_log=config.audit_log_enabled,
                 llm_trace=config.llm_trace_enabled,
                 store_document_text=config.store_document_text,
@@ -5844,11 +5938,15 @@ def _register_routes(app: FastAPI):
                         input=tc.input,
                         output=tc.output if include_output else None,
                         duration_ms=tc.duration_ms,
+                        started_at_ms=tc.started_at_ms,
                         iteration=tc.iteration,
                     )
                     for tc in core_result.tool_trace
                 ]
-                llm_calls = [ReflectLLMCall(scope=lc.scope, duration_ms=lc.duration_ms) for lc in core_result.llm_trace]
+                llm_calls = [
+                    ReflectLLMCall(scope=lc.scope, duration_ms=lc.duration_ms, started_at_ms=lc.started_at_ms)
+                    for lc in core_result.llm_trace
+                ]
                 trace_result = ReflectTrace(
                     tool_calls=tool_calls,
                     llm_calls=llm_calls,
@@ -6107,6 +6205,54 @@ def _register_routes(app: FastAPI):
             raise
         except Exception as e:
             raise _internal_error(e, f"/v1/default/banks/{bank_id}/entities")
+
+    @app.get(
+        "/v1/default/banks/{bank_id}/observations/tree",
+        response_model=ObservationTreeFolder,
+        summary="Get the observation tree",
+        description=(
+            "The bank's observations, everything it has learned, as a bundle of markdown files an agent can list, read and grep "
+            "like any folder, or that can be exported and mounted. Observations are grouped by the entities they "
+            "are about into a bounded tree of topics: each topic is one file listing every observation in it, "
+            "and each folder has an `index.md` with its topics and best-supported observations. The bundle "
+            "follows the Open Knowledge Format (https://okf.md/spec/). Built on request, deterministically, so "
+            "a file keeps its path as the bank changes. Experimental."
+        ),
+        operation_id="get_observation_tree",
+        tags=["Memory"],
+        responses=_BANK_NOT_FOUND_RESPONSES,
+    )
+    async def api_get_observation_tree(
+        bank_id: str,
+        tags: list[str] | None = Query(
+            default=None,
+            description="Only group observations carrying these tags (the scope), as in recall.",
+        ),
+        tags_match: TagsMatch = Query(default="any", description="How `tags` match (same modes as recall)."),
+        tag_groups: str | None = Query(default=None, description=_TAG_GROUPS_QUERY_DESCRIPTION),
+        request_context: RequestContext = Depends(get_request_context),
+    ):
+        """Return the observation tree for a bank, optionally for one tag scope."""
+        try:
+            tree = await app.state.memory.get_observation_tree(
+                bank_id,
+                tags=tags,
+                tags_match=tags_match,
+                tag_groups=_parse_tag_groups_query(tag_groups, tags),
+                request_context=request_context,
+            )
+            # Validated and encoded off the event loop, like the build: for a large bank this is
+            # seconds of CPU that would otherwise hold every other request on this worker. Returned
+            # as a ready body so FastAPI does not validate and encode it a second time on the loop.
+            return Response(
+                content=await asyncio.to_thread(_observation_tree_json, tree), media_type="application/json"
+            )
+        except OperationValidationError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.reason)
+        except (AuthenticationError, HTTPException):
+            raise
+        except Exception as e:
+            raise _internal_error(e, f"/v1/default/banks/{bank_id}/observations/tree")
 
     @app.get(
         "/v1/default/banks/{bank_id}/entities/graph",
@@ -8944,7 +9090,7 @@ def _register_routes(app: FastAPI):
             if file_info is None:
                 raise HTTPException(status_code=404, detail="File not found")
 
-            headers = {"Content-Disposition": f'attachment; filename="{bank_id}-documents.zip"'}
+            headers = {"Content-Disposition": content_disposition("attachment", f"{bank_id}-documents.zip")}
             if file_info.size is not None:
                 headers["Content-Length"] = str(file_info.size)
 

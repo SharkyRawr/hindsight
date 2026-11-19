@@ -7,6 +7,7 @@ Configuration via environment variables - see hindsight_api.config for all env v
 """
 
 import asyncio
+import base64
 import contextvars
 import logging
 import os
@@ -14,7 +15,7 @@ import threading
 import time
 import warnings
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, TypeVar, cast
 
@@ -65,7 +66,14 @@ from ..config import (
 )
 from .aiohttp_session import LoopLocal, LoopLocalSession, UpstreamHTTPError, per_phase_timeout, raise_for_status
 from .bank_attribution import reranker_bank_attribution_headers
-from .decision_model import overflowed_window, record_decision_call
+from .decision_model import (
+    JEV_IMAGE_FORMATS,
+    JEV_IMAGES_HEADER,
+    jev_accepts,
+    overflowed_window,
+    record_decision_call,
+)
+from .decision_rerank_interface import EvidenceImage
 from .llm_trace import RERANK_SCOPE, trace_model_call
 from .local_device import (
     LOCAL_MODEL_BUILD_LOCK,
@@ -302,8 +310,8 @@ class LocalSTCrossEncoder(CrossEncoderModel):
             trust_remote_code: Allow loading models with custom code (security risk).
                               Required for some models like jina-reranker-v2-base-multilingual.
                               Default: False (disabled for security)
-            fp16: Use FP16 (half precision) inference. Faster on CUDA,
-                  may be slower on CPU. Default: False (opt-in via env var).
+            fp16: Use FP16 (half precision) inference. Faster on CUDA; on CPU
+                  it halves memory but may not be faster. Default: False (opt-in via env var).
             bucket_batching: Sort pairs by token length before batching to reduce
                             padding waste. 36-54% speedup, quality-identical.
                             Default: False (opt-in via env var).
@@ -421,11 +429,17 @@ class LocalSTCrossEncoder(CrossEncoderModel):
 
             self._device_type = resolve_model_device_type(self._model)
 
-            # FP16 inference: convert model weights to half precision.
-            # Empirically validated: 27-36% faster on MPS, quality-identical (20/20 overlap).
-            if self.fp16 and self._device_type != "cpu":
+            # FP16 inference: convert model weights to half precision. On CUDA it is
+            # faster. It used to be skipped on CPU because it is not faster there, but
+            # it still halves the weights' RAM, and #6453 measured identical top-10
+            # rankings for bge-reranker-v2-m3, so the opt-in now applies on CPU too.
+            # The smoke test below catches a CPU that cannot run it.
+            if self.fp16:
                 self._model.model.half()
-                logger.info("Reranker: FP16 inference enabled")
+                if self._device_type == "cpu":
+                    logger.info("Reranker: FP16 inference enabled on CPU (halves memory, may not be faster)")
+                else:
+                    logger.info("Reranker: FP16 inference enabled")
 
             # Smoke-test the fully configured model (after any FP16 conversion). NaN logits
             # are sanitized to 0.0 downstream, so startup is the last point at which a model
@@ -676,7 +690,7 @@ class RemoteTEICrossEncoder(CrossEncoderModel):
             self._model_id = info.get("model_id", "unknown")
             logger.info(f"Reranker: TEI provider initialized (model: {self._model_id})")
         except (aiohttp.ClientError, UpstreamHTTPError, TimeoutError) as e:
-            raise RuntimeError(f"Failed to connect to TEI server at {self.base_url}: {e}")
+            raise RuntimeError(f"Failed to connect to TEI server at {self.base_url}: {e}") from e
 
     async def _rerank_query_group(
         self,
@@ -700,7 +714,7 @@ class RemoteTEICrossEncoder(CrossEncoderModel):
             # TEI returns results sorted by score descending, with original index
             return [(result["index"], result["score"]) for result in results]
         except (aiohttp.ClientError, UpstreamHTTPError, TimeoutError) as e:
-            raise RuntimeError(f"TEI rerank request failed: {e}")
+            raise RuntimeError(f"TEI rerank request failed: {e}") from e
 
     async def _predict_async(self, pairs: list[tuple[str, str]]) -> list[float]:
         """Async implementation of predict that runs requests in parallel with backpressure."""
@@ -762,7 +776,7 @@ class RemoteTEICrossEncoder(CrossEncoderModel):
         return await self._predict_async(pairs)
 
 
-class _CohereCompatibleRerankClient:
+class CohereCompatibleRerankClient:
     """
     Internal HTTP client for Cohere-compatible /rerank endpoints.
 
@@ -818,32 +832,39 @@ class _CohereCompatibleRerankClient:
         all_scores = [0.0] * len(pairs)
 
         for query, indexed_texts in query_groups.items():
-            texts = [text for _, text in indexed_texts]
-            indices = [idx for idx, _ in indexed_texts]
-
-            body: dict[str, object] = {
-                "model": self.model,
-                "query": query,
-                "documents": texts,
-                "return_documents": False,
-            }
-            if self.include_top_n:
-                body["top_n"] = len(texts)
-
-            async with self._session.get().post(
-                self.rerank_url,
-                headers=reranker_bank_attribution_headers(),
-                json=body,
-            ) as response:
-                await raise_for_status(response)
-                result = await response.json(content_type=None)
-
-            for item in result.get("results", []):
-                original_idx = item["index"]
-                score = item["relevance_score"]
-                all_scores[indices[original_idx]] = score
+            texts: list[str | dict[str, str]] = [text for _, text in indexed_texts]
+            for (idx, _), score in zip(indexed_texts, await self.scores(query, texts), strict=True):
+                all_scores[idx] = score
 
         return all_scores
+
+    async def scores(self, query: str | dict[str, str], documents: list[str | dict[str, str]]) -> list[float]:
+        """One request: each document's relevance score, aligned with ``documents``, 0.0 for one the
+        endpoint left out. A document is a text, or an object for endpoints that take one (an image
+        document, ``{"type": "image", "b64": ..., "text": ...}``, for a reranker that reads pictures).
+        The query is a text, or the same kind of object (``text`` optional) when the search is by a
+        picture, for a reranker that reads pictures."""
+        body: dict[str, object] = {
+            "model": self.model,
+            "query": query,
+            "documents": documents,
+            "return_documents": False,
+        }
+        if self.include_top_n:
+            body["top_n"] = len(documents)
+
+        async with self._session.get().post(
+            self.rerank_url,
+            headers=reranker_bank_attribution_headers(),
+            json=body,
+        ) as response:
+            await raise_for_status(response)
+            result = await response.json(content_type=None)
+
+        scores = [0.0] * len(documents)
+        for item in result.get("results", []):
+            scores[item["index"]] = item["relevance_score"]
+        return scores
 
 
 class CohereCrossEncoder(CrossEncoderModel):
@@ -886,8 +907,8 @@ class CohereCrossEncoder(CrossEncoderModel):
         # Used when base_url is set (Azure AI Foundry and other Cohere-compatible hosts).
         # Azure endpoints already include the full invoke path, so rerank_url == base_url
         # and top_n is omitted to match the existing Azure contract.
-        self._http_client: _CohereCompatibleRerankClient | None = (
-            _CohereCompatibleRerankClient(
+        self._http_client: CohereCompatibleRerankClient | None = (
+            CohereCompatibleRerankClient(
                 api_key=api_key,
                 model=model,
                 rerank_url=base_url,
@@ -997,7 +1018,7 @@ class ZeroEntropyCrossEncoder(CrossEncoderModel):
     ):
         self.model = model
         self.base_url = base_url.rstrip("/") if base_url else self.DEFAULT_BASE_URL
-        self._client = _CohereCompatibleRerankClient(
+        self._client = CohereCompatibleRerankClient(
             api_key=api_key,
             model=model,
             rerank_url=f"{self.base_url}{self.RERANK_PATH}",
@@ -1025,7 +1046,7 @@ class SiliconFlowCrossEncoder(CrossEncoderModel):
 
     SiliconFlow (https://siliconflow.cn) exposes a Cohere-compatible /rerank
     endpoint. Shares the HTTP client with ZeroEntropy/Cohere-custom-endpoint
-    via _CohereCompatibleRerankClient.
+    via CohereCompatibleRerankClient.
     """
 
     RERANK_PATH = "/rerank"
@@ -1039,7 +1060,7 @@ class SiliconFlowCrossEncoder(CrossEncoderModel):
     ):
         self.model = model
         self.base_url = base_url.rstrip("/")
-        self._client = _CohereCompatibleRerankClient(
+        self._client = CohereCompatibleRerankClient(
             api_key=api_key,
             model=model,
             rerank_url=f"{self.base_url}{self.RERANK_PATH}",
@@ -1084,7 +1105,7 @@ class NvidiaCrossEncoder(CrossEncoderModel):
     """
     NVIDIA NIM cross-encoder using the native reranking API.
 
-    Not Cohere-compatible, so it cannot reuse _CohereCompatibleRerankClient:
+    Not Cohere-compatible, so it cannot reuse CohereCompatibleRerankClient:
     the path carries the model (/retrieval/<model>/reranking), the query is
     {"text": ...}, each passage is {"text": ...}, and the response is
     rankings[].logit — a raw logit, not a 0..1 relevance_score. Raw logits are
@@ -1276,7 +1297,8 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
     # absorbs JSON framing and most cross-tokenizer divergence, but not all of it: on
     # mixed-script text Jev counts twice what we do (#5715). A request Jev still finds
     # too long is rebuilt at half the budget (see _within_window), down to
-    # MIN_QUESTION_TOKENS.
+    # MIN_QUESTION_TOKENS. The default only: reflect passes the configured window
+    # (max_question_tokens), since a smaller one refused every first request (#6659).
     MAX_QUESTION_TOKENS = 26_000
     # Three halvings: 26k -> 3.25k covers an 8x divergence, well past the 2x measured.
     # A request still refused there will never fit, so it fails rather than retrying on.
@@ -1309,17 +1331,29 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
         prune_candidates: bool = DEFAULT_RERANKER_TYPESAFE_PRUNE_CANDIDATES,
         shortlist: int | None = None,
         min_keep: int | None = None,
+        vision: bool = False,
+        max_question_tokens: int | None = None,
+        tokenizer: str | None = None,
     ):
         if shortlist is not None:
             self.SHORTLIST = shortlist
         if min_keep is not None:
             self.MIN_KEEP = min_keep
+        # The window of the model the endpoint serves (HINDSIGHT_API_DECISION_MODEL_MAX_REQUEST_TOKENS):
+        # a smaller one would otherwise refuse every first request and halve down from 26k (#6659).
+        if max_question_tokens is not None:
+            self.MAX_QUESTION_TOKENS = max_question_tokens
+        # The vocabulary those budgets are counted in (HINDSIGHT_API_DECISION_MODEL_TOKENIZER);
+        # None counts with HINDSIGHT_API_TOKENIZER_ENCODING.
+        self.tokenizer = tokenizer
         # Tolerate an unset-but-present value ("VAR=" in a compose file, or a config
         # built with every field zeroed) by falling back to the default.
         self.model = model or DEFAULT_RERANKER_TYPESAFE_MODEL
         self.base_url = (base_url or DEFAULT_RERANKER_TYPESAFE_BASE_URL).rstrip("/")
         self.timeout = timeout
         self.prunes_candidates = bool(prune_candidates)
+        # Whether the sufficiency question is shown the evidence's pictures (HINDSIGHT_API_DECISION_MODEL_VISION).
+        self.vision = vision
         # CrossLoopSemaphore, not asyncio.Semaphore: one encoder instance is built at
         # startup and reached from every loop in the process (worker threads run their
         # own via asyncio.run), and an asyncio.Semaphore binds to whichever loop first
@@ -1343,7 +1377,7 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
             f"(prune_candidates={self.prunes_candidates})"
         )
 
-    async def _ask(self, body: dict, scope: str) -> dict:
+    async def _ask(self, body: dict, scope: str, headers: dict[str, str] | None = None) -> dict:
         """One System One request, traced under ``scope`` like any LLM call."""
         started = time.monotonic()
         result: dict | None = None
@@ -1352,7 +1386,7 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
             async with self._semaphore:
                 async with self._session.get().post(
                     f"{self.base_url}{self.SYSTEMONE_PATH}",
-                    headers=reranker_bank_attribution_headers(),
+                    headers={**reranker_bank_attribution_headers(), **(headers or {})},
                     json=body,
                 ) as response:
                     await raise_for_status(response)
@@ -1367,7 +1401,8 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
                 provider=self.provider_name,
                 model=self.model,
                 scope=scope,
-                request=body,
+                # The trace keeps which pictures went, not their bytes.
+                request={**body, "assets": dict.fromkeys(body["assets"], "<image>")} if "assets" in body else body,
                 response=result if isinstance(result, dict) else None,
                 input_tokens=(usage.get("input_tokens") or 0) if isinstance(usage, dict) else 0,
                 started=started,
@@ -1426,9 +1461,9 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
             return []
 
         # Available token budget for candidate options in one choice question.
-        state_tokens = count_tokens(f"Question: {query}")
+        state_tokens = count_tokens(f"Question: {query}", self.tokenizer)
         # +30: cushion for the question's JSON framing (type, keys) around the instructions.
-        instr_tokens = count_tokens(f"{_RANK_INSTRUCTIONS_PREFIX}{query}") + 30
+        instr_tokens = count_tokens(f"{_RANK_INSTRUCTIONS_PREFIX}{query}", self.tokenizer) + 30
         net_budget = max(50, budget - state_tokens - instr_tokens)
 
         # Pre-truncate outlier documents that individually exceed the question budget,
@@ -1436,11 +1471,11 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
         effective_docs = list(docs)
         doc_tokens: dict[int, int] = {}
         for index in indices:
-            t = count_tokens(effective_docs[index])
+            t = count_tokens(effective_docs[index], self.tokenizer)
             if t + _OPTION_KEY_OVERHEAD > net_budget:
                 cap = max(10, net_budget - _OPTION_KEY_OVERHEAD)
-                effective_docs[index] = truncate_to_tokens(effective_docs[index], cap).text
-                t = count_tokens(effective_docs[index])
+                effective_docs[index] = truncate_to_tokens(effective_docs[index], cap, self.tokenizer).text
+                t = count_tokens(effective_docs[index], self.tokenizer)
             doc_tokens[index] = t
 
         # Pack candidates into groups bounded by MAX_OPTIONS and net_budget.
@@ -1493,7 +1528,7 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
             cap = max(10, (net_budget - len(finalists) * _OPTION_KEY_OVERHEAD) // len(finalists))
             for idx in finalists:
                 if doc_tokens[idx] > cap:
-                    effective_docs[idx] = truncate_to_tokens(effective_docs[idx], cap).text
+                    effective_docs[idx] = truncate_to_tokens(effective_docs[idx], cap, self.tokenizer).text
 
         ranked_finalists = await self._rank_once(query, effective_docs, finalists)
         return ranked_finalists + rest
@@ -1506,26 +1541,57 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
         "The evidence fully answers the question",
     ]
 
-    async def evidence_is_sufficient(self, query: str, evidence: str) -> bool:
+    async def evidence_is_sufficient(
+        self, query: str, evidence: str, *, pictures: Sequence[EvidenceImage] = ()
+    ) -> bool:
         """Whether ``evidence`` already answers ``query``: one Score question.
 
         Used by a decision-orchestrated reflect to skip the LLM turns that would otherwise decide to keep
         searching. A Score, not a yes/no Choice, for the reason the cut uses one: the
         levels are ordered, and "partly" must not be rounded up to "yes".
+
+        ``pictures`` (the knowledge-bank pictures the evidence names by label) are shown too when
+        ``vision`` is on, as image assets each referenced after its label; the ones Jev would refuse
+        are left out.
         """
+        shown = [p for p in pictures if jev_accepts(p.media_type, p.data)] if self.vision else []
+        references = {f"[[picture-{i + 1}]]": picture for i, picture in enumerate(shown)}
+        pictures_text = "".join(f"\n{p.label}: {ref}" for ref, p in references.items())
+        assets = {
+            ref: {
+                "type": "image",
+                "format": JEV_IMAGE_FORMATS[p.media_type],
+                "data_base64": base64.b64encode(p.data).decode(),
+            }
+            for ref, p in references.items()
+        }
         overhead = (
-            count_tokens(_SUFFICIENCY_INSTRUCTIONS) + sum(count_tokens(level) for level in self.SUFFICIENCY_LEVELS) + 50
+            count_tokens(_SUFFICIENCY_INSTRUCTIONS, self.tokenizer)
+            + sum(count_tokens(level, self.tokenizer) for level in self.SUFFICIENCY_LEVELS)
+            + 50
         )
         prefix = f"Question: {query}\n\nEvidence:\n"
         policy = self.retry_policy or RetryPolicy()
 
         async def ask(question_budget: int) -> dict:
-            budget = max(100, question_budget - overhead - count_tokens(prefix))
+            # The pictures' own tokens are Jev's to count: a request it finds too long is rebuilt smaller.
+            budget = max(
+                100,
+                question_budget
+                - overhead
+                - count_tokens(prefix, self.tokenizer)
+                - count_tokens(pictures_text, self.tokenizer),
+            )
             # ponytail: keeps the head of the evidence; the agent's own results come
             # first (pages, then observations, then facts), so the tail is raw facts.
-            fitted = truncate_to_tokens(evidence, budget).text if count_tokens(evidence) > budget else evidence
+            fitted = (
+                truncate_to_tokens(evidence, budget, self.tokenizer).text
+                if count_tokens(evidence, self.tokenizer) > budget
+                else evidence
+            )
             body = {
-                "state": f"{prefix}{fitted}",
+                "state": f"{prefix}{fitted}" + (f"\n\nPictures:{pictures_text}" if assets else ""),
+                **({"assets": assets} if assets else {}),
                 "model": self.model,
                 "questions": {
                     "sufficient": {
@@ -1538,7 +1604,7 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
             # Retried as the page-impact question is: a rate limit read as "not enough" bought
             # the agent turns the decision model exists to save.
             return await acall_with_retry(
-                lambda: self._ask(body, "decision_evidence_sufficiency"),
+                lambda: self._ask(body, "decision_evidence_sufficiency", JEV_IMAGES_HEADER if assets else None),
                 policy=policy,
                 budget=policy.new_budget(),
                 provider=self.provider_name,
@@ -1567,9 +1633,9 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
         """
         prefix = f"Page topic: {topic}\n\nNew memory: {memory}\n\nThe page as it reads now:\n"
         overhead = (
-            count_tokens(_PAGE_IMPACT_INSTRUCTIONS)
-            + sum(count_tokens(option) for option in _PAGE_IMPACT_OPTIONS.values())
-            + count_tokens(prefix)
+            count_tokens(_PAGE_IMPACT_INSTRUCTIONS, self.tokenizer)
+            + sum(count_tokens(option, self.tokenizer) for option in _PAGE_IMPACT_OPTIONS.values())
+            + count_tokens(prefix, self.tokenizer)
             + 50
         )
         policy = self.retry_policy or RetryPolicy()
@@ -1578,7 +1644,11 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
             budget = max(100, question_budget - overhead)
             # ponytail: keeps the head of the page (its first sections); a page past
             # ~25k tokens is already far over its own budget.
-            fitted = truncate_to_tokens(page, budget).text if count_tokens(page) > budget else page
+            fitted = (
+                truncate_to_tokens(page, budget, self.tokenizer).text
+                if count_tokens(page, self.tokenizer) > budget
+                else page
+            )
             body = {
                 "state": f"{prefix}{fitted}",
                 "model": self.model,
@@ -1612,19 +1682,24 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
             return 0
 
         # Instructions and levels are fixed, plus a cushion for the request's JSON framing.
-        cut_overhead = count_tokens(_CUT_INSTRUCTIONS) + sum(count_tokens(c) for c in self.CUT_LEVELS) + 50
+        cut_overhead = (
+            count_tokens(_CUT_INSTRUCTIONS, self.tokenizer)
+            + sum(count_tokens(c, self.tokenizer) for c in self.CUT_LEVELS)
+            + 50
+        )
         prefix = f"Question: {query}\n\nCandidates, already ranked best first:\n"
-        prefix_tokens = count_tokens(prefix)
+        prefix_tokens = count_tokens(prefix, self.tokenizer)
         available_listing_tokens = max(100, budget - cut_overhead - prefix_tokens)
 
         # Truncate shortlist documents if they exceed the available listing budget
         shortlist_docs = [docs[index] for index in shortlist]
-        shortlist_tokens = [count_tokens(d) for d in shortlist_docs]
+        shortlist_tokens = [count_tokens(d, self.tokenizer) for d in shortlist_docs]
         total_shortlist_tokens = sum(shortlist_tokens) + len(shortlist) * _LISTING_ITEM_OVERHEAD
         if total_shortlist_tokens > available_listing_tokens:
             cap = max(10, (available_listing_tokens - len(shortlist) * _LISTING_ITEM_OVERHEAD) // len(shortlist))
             shortlist_docs = [
-                truncate_to_tokens(d, cap).text if t > cap else d for d, t in zip(shortlist_docs, shortlist_tokens)
+                truncate_to_tokens(d, cap, self.tokenizer).text if t > cap else d
+                for d, t in zip(shortlist_docs, shortlist_tokens)
             ]
 
         listing = "\n\n".join(f"[{position + 1}] {shortlist_docs[position]}" for position in range(len(shortlist)))
@@ -1653,8 +1728,8 @@ class TypeSafeCrossEncoder(CrossEncoderModel):
         # bounded query, preventing context overflow in _cut and eliminating semantic drift.
         max_allowed_query = max(50, (self.MAX_QUESTION_TOKENS - 200) // 2)
         effective_query_cap = min(_MAX_QUERY_TOKENS, max_allowed_query)
-        if count_tokens(query) > effective_query_cap:
-            query = truncate_to_tokens(query, effective_query_cap).text
+        if count_tokens(query, self.tokenizer) > effective_query_cap:
+            query = truncate_to_tokens(query, effective_query_cap, self.tokenizer).text
 
         order = await self._within_window(lambda budget: self._rank(query, docs, indices, budget))
         keep = (
@@ -2643,7 +2718,7 @@ class AlibabaCloudCrossEncoder(CrossEncoderModel):
         timeout: float = 60.0,
     ):
         self.model = model
-        self._client = _CohereCompatibleRerankClient(
+        self._client = CohereCompatibleRerankClient(
             api_key=api_key,
             model=model,
             rerank_url=self.RERANK_URL,
@@ -2816,7 +2891,7 @@ _RERANKER_PROVIDERS_WITHOUT_RETRY = {
 }
 
 
-def _reranker_retry_policy() -> RetryPolicy:
+def reranker_retry_policy() -> RetryPolicy:
     """Build the reranker retry policy from resolved configuration."""
     from ..config import get_config
 
@@ -2850,7 +2925,7 @@ def create_cross_encoder(member: RerankerMemberConfig) -> CrossEncoderModel:
     encoder = _create_cross_encoder_backend(member)
     encoder.max_tokens_per_candidate = member.max_tokens_per_candidate
     if member.provider.lower() not in _RERANKER_PROVIDERS_WITHOUT_RETRY:
-        encoder.retry_policy = _reranker_retry_policy()
+        encoder.retry_policy = reranker_retry_policy()
     return encoder
 
 

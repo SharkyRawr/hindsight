@@ -185,7 +185,7 @@ which is what records the current pin.
 hermes memory setup    # select "hindsight"
 ```
 
-The setup wizard installs nothing (dependencies come with the plugin), walks you through configuration, and offers to seed the bank with a **starter memory template** (a curated set of dispositions/instructions for common agent roles) — you can skip it, and it warns before overwriting an already-configured bank.
+The setup wizard installs nothing (dependencies come with the plugin), walks you through configuration, and offers to seed the bank with a **starter memory template** (a curated set of dispositions/instructions for common agent roles) — you can skip it, and it warns before overwriting an already-configured bank. A template's mental models refresh once an hour, each at its own minute, rather than after every consolidation, and an hour with nothing new costs nothing. To move an existing bank to that schedule, set a `refresh_cron` on each mental model in the control plane.
 
 Or manually (cloud mode with defaults):
 ```bash
@@ -251,8 +251,8 @@ Some keys also accept an older name: `apiKey` for `api_key`, `budget` for `recal
 | `additional_banks` | — | Extra banks to write to and recall from, in priority order. |
 | `recall_additional_banks` | — | Extra banks to recall from but never write to, searched after the write banks. Alias `recallAdditionalBanks`, the name the Claude Code integration uses. A bank also listed in `additional_banks` stays writable. |
 | `trusted_project_dirs` | — | Absolute folders whose git repositories may choose their own bank with a `.hindsight/config.toml`. Empty by default, so a cloned repository cannot redirect your memory. |
-| `bank_mission` | — | Read but not applied to the bank. To set a bank's reflect mission, use the bank's config (control plane or `PATCH /v1/default/banks/{bank_id}/config`). |
-| `bank_retain_mission` | — | Read but not applied to the bank. To set a bank's retain mission, use the bank's config, as above. |
+
+A bank's missions, dispositions, mental models and directives come from a [bank template](/templates), which `hermes memory setup` offers to apply, or from the bank's config (control plane or `PATCH /v1/default/banks/{bank_id}/config`). The old `bank_mission` and `bank_retain_mission` keys were never applied and are no longer read.
 
 #### Multiple banks
 

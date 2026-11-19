@@ -800,6 +800,10 @@ class KnowledgeBankReadOperation(StrEnum):
     GET_KNOWLEDGE_BANK_DOCUMENT = "get_knowledge_bank_document"
     #: Also checked, as the caller, for each knowledge bank a memory bank links when reflect reads it.
     SEARCH_KNOWLEDGE_BANK = "search_knowledge_bank"
+    #: The bank's ingest settings (``GET /knowledge-banks/{bank_id}/config``).
+    GET_KNOWLEDGE_BANK_CONFIG = "get_knowledge_bank_config"
+    #: The bank's document tags with their counts (``GET /knowledge-banks/{bank_id}/tags``).
+    LIST_KNOWLEDGE_BANK_TAGS = "list_knowledge_bank_tags"
 
 
 class KnowledgeBankWriteOperation(StrEnum):
@@ -808,6 +812,8 @@ class KnowledgeBankWriteOperation(StrEnum):
     INGEST_KNOWLEDGE_BANK = "ingest_knowledge_bank"
     DELETE_KNOWLEDGE_BANK_DOCUMENT = "delete_knowledge_bank_document"
     DELETE_KNOWLEDGE_BANK = "delete_knowledge_bank"
+    UPDATE_KNOWLEDGE_BANK_CONFIG = "update_knowledge_bank_config"
+    RESET_KNOWLEDGE_BANK_CONFIG = "reset_knowledge_bank_config"
 
 
 @dataclass
@@ -837,6 +843,56 @@ class KnowledgeBankListContext:
     #: Each with ``bank_id`` and ``created_at``.
     banks: list[dict]
     request_context: "RequestContext"
+
+
+@dataclass
+class KnowledgeBankSearchResult:
+    """Result context for the post-search hook.
+
+    Fired after a knowledge-bank search returns, so an extension can meter it by
+    what the results weigh. ``results_tokens`` is the same figure a trace reports as
+    ``tokens_used`` (the tokens of the returned passages' text), whether or not the
+    caller asked for a trace. Fired only for a search that returned.
+    """
+
+    bank_id: str
+    query: str
+    request_context: "RequestContext"
+    results_tokens: int
+    result_count: int
+
+
+@dataclass
+class KnowledgeBankIngestResult:
+    """Result context for the post-ingest hook.
+
+    Fired after a batch of knowledge-bank documents commits, with how many passages became
+    searchable (``passages``), so an extension can meter ingestion by passage. Ingestion runs
+    in the worker, which has no RequestContext, so the tenant is carried directly (from the
+    caller recorded when the ingest was queued).
+    """
+
+    bank_id: str
+    tenant_id: str | None
+    api_key_id: str | None
+    passages: int
+    #: The document(s)' billable content size (text tokens, or media bytes at a fixed rate).
+    content_tokens: int = 0
+
+
+@dataclass
+class KnowledgeBankDeleteResult:
+    """Result context for the post-delete hook.
+
+    Fired after a knowledge-bank document (or a whole bank) is deleted, with how many passages
+    went with it (``passages``), so an extension that tracks stored passages can decrement.
+    """
+
+    bank_id: str
+    request_context: "RequestContext"
+    passages: int
+    #: The content tokens that went with the deleted passages, for storage metering to decrement.
+    content_tokens: int = 0
 
 
 @dataclass
@@ -1539,6 +1595,25 @@ class OperationValidatorExtension(Extension, ABC):
     async def filter_knowledge_bank_list(self, ctx: KnowledgeBankListContext) -> BankListResult:
         """Filter the knowledge bank list; runs only when knowledge_bank_list_scope returns None."""
         return BankListResult(banks=ctx.banks)
+
+    async def on_knowledge_bank_search_complete(self, result: KnowledgeBankSearchResult) -> None:
+        """Called after a knowledge-bank search returns, with what its results weigh.
+
+        The read gate (validate_knowledge_bank_read) runs before the search and sees only the
+        bank and operation; this fires after, so an extension that meters search by its output
+        tokens (``result.results_tokens``) has the figure it needs. Default: do nothing.
+        """
+        return None
+
+    async def on_knowledge_bank_ingest_complete(self, result: KnowledgeBankIngestResult) -> None:
+        """Called after a batch of knowledge-bank documents commits, with how many passages
+        became searchable, so an extension can meter ingestion by passage. Default: do nothing."""
+        return None
+
+    async def on_knowledge_bank_delete_complete(self, result: KnowledgeBankDeleteResult) -> None:
+        """Called after a knowledge-bank document or bank is deleted, with how many passages went
+        with it, so an extension tracking stored passages can decrement. Default: do nothing."""
+        return None
 
     async def filter_mcp_tools(
         self,
