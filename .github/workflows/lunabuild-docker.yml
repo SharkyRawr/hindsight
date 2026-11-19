@@ -1,0 +1,34 @@
+name: Lunabuild Docker image
+
+on:
+  push:
+    branches: [lunabuild]
+  workflow_dispatch:
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/lunabuild'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Build standalone image
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:lunabuild"
+          docker build --platform linux/amd64 --target standalone \
+            --file docker/standalone/Dockerfile \
+            --build-arg PRELOAD_ML_MODELS=false \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --tag "$image" .
+
+      - name: Publish to GitHub Container Registry
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker push "ghcr.io/${GITHUB_REPOSITORY,,}:lunabuild"
