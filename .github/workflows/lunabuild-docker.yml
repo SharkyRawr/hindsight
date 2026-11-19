@@ -12,6 +12,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     steps:
       - name: Check out the triggering commit
         run: |
@@ -30,10 +32,35 @@ jobs:
         run: |
           # Use a dedicated builder and push directly so the image carries both attestations.
           docker buildx create --driver docker-container --use
-          image="ghcr.io/${GITHUB_REPOSITORY,,}:lunabuild"
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
           docker buildx build --platform linux/amd64 --target standalone \
             --file docker/standalone/Dockerfile \
             --build-arg PRELOAD_ML_MODELS=false \
             --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
             --sbom=true --provenance=mode=max --push \
-            --tag "$image" .
+            --metadata-file "$RUNNER_TEMP/build.json" --tag "$image:lunabuild" .
+
+      - name: Publish signed provenance and SBOM to GitHub
+        working-directory: ${{ runner.temp }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          digest=$(jq -er '."containerimage.digest" | select(test("^sha256:[0-9a-f]{64}$"))' build.json)
+          docker buildx imagetools inspect "$image@$digest" --format '{{json .SBOM.SPDX}}' > sbom.json
+
+          # This repository allows only local Actions. Use GitHub's signing library directly.
+          npm install --ignore-scripts --no-save @actions/attest@3.2.0
+          IMAGE="$image" SHA256="${digest#sha256:}" node --input-type=module <<'JS'
+          import { attest, attestProvenance } from '@actions/attest'
+          import { readFileSync } from 'node:fs'
+
+          const sbom = JSON.parse(readFileSync('sbom.json', 'utf8'))
+          if (!sbom?.spdxVersion) throw new Error('Buildx returned no SPDX document')
+          const options = {
+            subjects: [{ name: process.env.IMAGE, digest: { sha256: process.env.SHA256 } }],
+            token: process.env.GH_TOKEN
+          }
+          await attestProvenance(options)
+          await attest({ ...options, predicateType: 'https://spdx.dev/Document', predicate: sbom })
+          JS
