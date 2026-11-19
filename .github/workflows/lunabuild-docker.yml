@@ -13,9 +13,11 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
+      - name: Check out the triggering commit
+        run: |
+          git init .
+          git fetch --depth=1 "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
 
       - name: Build standalone image
         run: |
