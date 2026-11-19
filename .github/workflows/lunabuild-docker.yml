@@ -16,21 +16,24 @@ jobs:
       - name: Check out the triggering commit
         run: |
           git init .
-          git fetch --depth=1 "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" "$GITHUB_SHA"
+          git remote add origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "$GITHUB_SHA"
           git checkout --detach FETCH_HEAD
 
-      - name: Build standalone image
-        run: |
-          image="ghcr.io/${GITHUB_REPOSITORY,,}:lunabuild"
-          docker build --platform linux/amd64 --target standalone \
-            --file docker/standalone/Dockerfile \
-            --build-arg PRELOAD_ML_MODELS=false \
-            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
-            --tag "$image" .
-
-      - name: Publish to GitHub Container Registry
+      - name: Log in to GitHub Container Registry
         env:
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-          docker push "ghcr.io/${GITHUB_REPOSITORY,,}:lunabuild"
+
+      - name: Build and publish standalone image with attestations
+        run: |
+          # Use a dedicated builder and push directly so the image carries both attestations.
+          docker buildx create --driver docker-container --use
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:lunabuild"
+          docker buildx build --platform linux/amd64 --target standalone \
+            --file docker/standalone/Dockerfile \
+            --build-arg PRELOAD_ML_MODELS=false \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --sbom=true --provenance=mode=max --push \
+            --tag "$image" .
