@@ -392,6 +392,7 @@ class CodexLLM(LLMInterface):
         return self._auth_manager.account_id
 
     def _build_request_headers(self) -> dict[str, str]:
+        # Omit browser Origin: compatible Codex gateways reject it as a cross-origin request.
         return {
             "Authorization": f"Bearer {self.access_token}",
             "Content-Type": "application/json",
@@ -403,7 +404,6 @@ class CodexLLM(LLMInterface):
             # it, so the backend evidently ignores the other spelling.
             "ChatGPT-Account-ID": self.account_id,
             "User-Agent": _CODEX_USER_AGENT,
-            "Origin": "https://chatgpt.com",
             "originator": _CODEX_ORIGINATOR,
         }
 

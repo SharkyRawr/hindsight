@@ -705,7 +705,7 @@ async def test_call_reactively_refreshes_on_401_and_retries(tmp_path: Path, monk
     assert llm.access_token == new_access
     assert sent_headers[0]["Authorization"] == f"Bearer {fresh}"
     assert sent_headers[1]["Authorization"] == f"Bearer {new_access}"
-    for header_name in ("Content-Type", "ChatGPT-Account-ID", "User-Agent", "Origin", "originator"):
+    for header_name in ("Content-Type", "ChatGPT-Account-ID", "User-Agent", "originator"):
         assert sent_headers[1][header_name] == sent_headers[0][header_name]
 
 

@@ -25,6 +25,7 @@ def build_llm() -> CodexLLM:
 def assert_codex_request_identity(headers: Mapping[str, str]) -> None:
     assert headers["originator"] == "codex_cli_rs"
     assert headers["User-Agent"] == "codex_cli_rs/0.0.0 (Hindsight)"
+    assert "Origin" not in headers
 
 
 @pytest.mark.asyncio
