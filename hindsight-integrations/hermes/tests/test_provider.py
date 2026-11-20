@@ -1031,3 +1031,77 @@ def test_cloud_mode_with_a_key_or_a_keyless_external_server_is_available(hermes_
     _write_config(hermes_env, {"mode": "local_external", "api_url": "http://localhost:8888"})
     provider = plugin.HindsightMemoryProvider()
     assert provider.is_available() is True and provider.unavailable_reason() == ""
+
+
+def test_reflect_budget_is_set_apart_from_recall(provider):
+    """#6246: raising recall to mid dragged reflect to mid too, past the server timeout on a big bank."""
+    instance, fake = provider(
+        {"recall_budget": "mid", "reflect_budget": "low", "recall_sync": True, "recall_prefetch_method": "reflect"},
+        client=FakeClient(recall_texts=["fact"], reflect_text="synthesis"),
+    )
+    instance.handle_tool_call("hindsight_recall", {"query": "q"})
+    instance.handle_tool_call("hindsight_reflect", {"query": "q"})
+    instance.prefetch("q")
+    assert fake.recalls[0]["budget"] == "mid"
+    assert [call["budget"] for call in fake.reflects] == ["low", "low"]  # tool and reflect prefetch
+    instance.shutdown()
+
+
+@pytest.mark.parametrize("reflect_budget", [None, "", "huge"])
+def test_an_unset_or_invalid_reflect_budget_follows_recall(provider, reflect_budget):
+    config = {"recall_budget": "high"} | ({} if reflect_budget is None else {"reflect_budget": reflect_budget})
+    instance, fake = provider(config, client=FakeClient(reflect_text="synthesis"))
+    instance.handle_tool_call("hindsight_reflect", {"query": "q"})
+    assert fake.reflects[0]["budget"] == "high"
+    instance.shutdown()
+
+
+def test_cron_runs_do_not_auto_recall_but_keep_the_tools(provider):
+    """#6145: every cron query was Hermes' fixed cron notice, so each fire injected ~4k tokens of
+    memories unrelated to the job."""
+    for recall_sync in (True, False):
+        cron, fake = provider({"recall_sync": recall_sync}, agent_context="cron", client=FakeClient(recall_texts=["f"]))
+        cron.queue_prefetch("[IMPORTANT: You are running as a scheduled cron job. ...")
+        assert cron.prefetch("[IMPORTANT: You are running as a scheduled cron job. ...") == ""
+        assert fake.recalls == []
+        cron.handle_tool_call("hindsight_recall", {"query": "last digest"})
+        assert len(fake.recalls) == 1
+        cron.shutdown()
+
+
+def test_recall_cron_opts_cron_runs_back_in(provider):
+    cron, fake = provider({"recall_cron": True, "recall_sync": True}, agent_context="cron", client=FakeClient(["f"]))
+    assert "f" in cron.prefetch("job prompt")
+    cron.shutdown()
+
+
+def test_a_kanban_worker_reads_but_never_writes(provider):
+    """#6124: skipping auto-retain alone still let the tool and the built-in memory mirror write
+    worker task chatter into the profile's shared bank."""
+    worker, fake = provider({"recall_sync": True}, agent_context="kanban", client=FakeClient(recall_texts=["f"]))
+    assert "hindsight_retain" not in {schema["name"] for schema in worker.get_tool_schemas()}
+    assert "hindsight_retain" not in worker.system_prompt_block()
+    assert "f" in worker.prefetch("work kanban task t_1")  # it still reads the bank
+    assert "retain_kanban" in worker.handle_tool_call("hindsight_retain", {"content": "task report"})
+    worker.on_memory_write("add", "memory", "a fact from the worker")
+    worker.sync_turn("work kanban task t_1", "done")
+    worker.shutdown()
+    assert fake.retains == []
+
+
+def test_retain_kanban_lets_workers_write(provider):
+    """#6419: where the dispatcher retains nothing, the workers' runs are the only record."""
+    worker, fake = provider({"retain_kanban": True}, agent_context="kanban")
+    assert "hindsight_retain" in {schema["name"] for schema in worker.get_tool_schemas()}
+    worker.sync_turn("work kanban task t_1", "done")
+    worker.handle_tool_call("hindsight_retain", {"content": "task report"})
+    worker.on_memory_write("add", "memory", "a fact from the worker")
+    worker.shutdown()
+    assert len(fake.retains) == 3
+
+
+def test_retain_kanban_never_lets_sub_agents_write_automatically(provider):
+    child, fake = provider({"retain_kanban": True}, agent_context="subagent")
+    child.sync_turn("delegated", "done")
+    child.shutdown()
+    assert fake.retains == []
