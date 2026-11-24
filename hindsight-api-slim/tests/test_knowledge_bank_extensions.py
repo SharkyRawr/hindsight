@@ -7,6 +7,7 @@ the validator sees and what a strategy's output becomes, not retrieval quality.
 
 import json
 import uuid
+from dataclasses import dataclass
 
 import pytest
 
@@ -14,6 +15,7 @@ from hindsight_api.config import clear_config_cache
 from hindsight_api.extensions import (
     BankListResult,
     BankListScope,
+    KnowledgeBankReadContext,
     KnowledgeBankReadOperation,
     KnowledgeBankWriteOperation,
     OperationValidatorExtension,
@@ -27,7 +29,7 @@ from hindsight_api.knowledge.ingest_strategy import (
     OutputFile,
     OutputPassage,
 )
-from tests.test_knowledge_banks import KB, _png, _search, _upload, fake_embedder, kb  # noqa: F401  (fixtures)
+from tests.test_knowledge_banks import KB, _png, _search, _upload, fake_embedder, judge, kb  # noqa: F401  (fixtures)
 
 # --- access control (operation validator) ---------------------------------------------------------
 
@@ -124,6 +126,13 @@ async def test_every_knowledge_bank_operation_goes_through_its_own_hook(api_clie
         assert r.status_code == 200, r.text
         assert (await api_client.get(f"{KB}/{kb}/documents/red/file")).status_code == 200
         assert (await api_client.get(f"{KB}/{kb}/documents/red/passages/0/media")).status_code == 200
+        r = await api_client.get(f"{KB}/{kb}/operations")
+        assert r.status_code == 200 and r.json()["total"] > 0, r.text
+        missing_op = f"{KB}/{kb}/operations/{uuid.uuid4()}"
+        assert (await api_client.get(missing_op)).json()["status"] == "not_found"
+        assert (await api_client.delete(missing_op)).status_code == 404
+        assert (await api_client.post(f"{missing_op}/retry")).status_code == 404
+        assert (await api_client.delete(f"{missing_op}/delete")).status_code == 404
         assert [op for bank, op in validator.seen if bank == kb] == [
             KnowledgeBankReadOperation.GET_KNOWLEDGE_BANK,
             KnowledgeBankReadOperation.LIST_KNOWLEDGE_BANK_DOCUMENTS,
@@ -138,6 +147,11 @@ async def test_every_knowledge_bank_operation_goes_through_its_own_hook(api_clie
             KnowledgeBankReadOperation.GET_KNOWLEDGE_BANK,
             KnowledgeBankReadOperation.GET_KNOWLEDGE_BANK_DOCUMENT,
             KnowledgeBankReadOperation.GET_KNOWLEDGE_BANK_DOCUMENT,
+            KnowledgeBankReadOperation.LIST_KNOWLEDGE_BANK_OPERATIONS,
+            KnowledgeBankReadOperation.GET_KNOWLEDGE_BANK_OPERATION,
+            KnowledgeBankWriteOperation.CANCEL_KNOWLEDGE_BANK_OPERATION,
+            KnowledgeBankWriteOperation.RETRY_KNOWLEDGE_BANK_OPERATION,
+            KnowledgeBankWriteOperation.DELETE_KNOWLEDGE_BANK_OPERATION,
         ]
 
         # A rejected bank answers the validator's status, never a 404 that would say it exists.
@@ -155,6 +169,16 @@ async def test_every_knowledge_bank_operation_goes_through_its_own_hook(api_clie
             api_client.get(f"{KB}/{secret}/config"),
             api_client.patch(f"{KB}/{secret}/config", json={"updates": {"text_passage_tokens": 64}}),
             api_client.delete(f"{KB}/{secret}/config"),
+            api_client.get(f"{KB}/{secret}/operations"),
+            api_client.get(f"{KB}/{secret}/operations/{uuid.uuid4()}"),
+            api_client.delete(f"{KB}/{secret}/operations/{uuid.uuid4()}"),
+            api_client.post(f"{KB}/{secret}/operations/{uuid.uuid4()}/retry"),
+            api_client.delete(f"{KB}/{secret}/operations/{uuid.uuid4()}/delete"),
+            # The memory-bank routes refuse a knowledge bank, but only after its own hook: a caller
+            # it rejects gets the rejection, never a 400 that says the bank is a knowledge bank.
+            api_client.get(f"/v1/default/banks/{secret}/operations"),
+            api_client.get(f"/v1/default/banks/{secret}/config"),
+            api_client.delete(f"/v1/default/banks/{secret}"),
             api_client.delete(f"{KB}/{secret}"),
             api_client.post(KB, json={"bank_id": f"secret-{uuid.uuid4().hex[:8]}"}),
         ):
@@ -217,6 +241,56 @@ async def test_completion_hooks_fire_with_their_work_size(api_client, kb, instal
         install_validator(None)
 
 
+@dataclass
+class SearchHooks:
+    rerank: bool | None
+    reranked: bool
+
+
+class RecordsSearches(RecordsCompletions):
+    """Also records the read gate's context, so a test sees both search hooks."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reads: list[KnowledgeBankReadContext] = []
+
+    async def validate_knowledge_bank_read(self, ctx: KnowledgeBankReadContext) -> ValidationResult:
+        self.reads.append(ctx)
+        return ValidationResult.accept()
+
+
+async def test_both_search_hooks_see_whether_the_search_is_reranked(api_client, kb, judge, install_validator):  # noqa: F811
+    validator = install_validator(RecordsSearches())
+    assert isinstance(validator, RecordsSearches)
+    try:
+        r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"document_id": "a", "text": "a blue note"}]})
+        assert r.status_code == 200, r.text
+
+        async def hooks(**body) -> SearchHooks:
+            validator.reads.clear()
+            validator.searches.clear()
+            await _search(api_client, kb, **body)
+            (read,) = [c for c in validator.reads if c.operation == KnowledgeBankReadOperation.SEARCH_KNOWLEDGE_BANK]
+            (done,) = validator.searches
+            return SearchHooks(rerank=read.rerank, reranked=done.reranked)
+
+        # One hit: the search is to be reranked, but there is nothing to compare, so no request is sent.
+        assert await hooks(query="blue") == SearchHooks(rerank=True, reranked=False)
+        assert judge.requests == []
+        r = await api_client.post(f"{KB}/{kb}/ingest", json={"items": [{"document_id": "b", "text": "another blue"}]})
+        assert r.status_code == 200, r.text
+        assert await hooks(query="blue") == SearchHooks(rerank=True, reranked=True)
+        assert await hooks(query="blue", enable_reranking=False) == SearchHooks(rerank=False, reranked=False)
+        assert judge.requests == [2]
+
+        # Any other read carries no rerank decision.
+        validator.reads.clear()
+        assert (await api_client.get(f"{KB}/{kb}/documents")).status_code == 200
+        assert [c.rerank for c in validator.reads] == [None]
+    finally:
+        install_validator(None)
+
+
 class RaisesInCompletions(_Accepting):
     """Every completion hook raises — metering must stay best-effort: the operation still succeeds."""
 
@@ -257,11 +331,22 @@ async def test_memory_bank_hooks_never_apply_to_a_knowledge_bank(api_client, ins
         assert r.is_success, r.text
         assert (await api_client.get(f"{KB}/{bank_id}/documents/d")).status_code == 200
         assert bank_id in [b["bank_id"] for b in (await api_client.get(KB)).json()["banks"]]
-        # Through the memory-bank config routes, a caller the validator rejects is rejected (403), and
-        # does not learn from a 400 that the bank is a knowledge bank.
-        memory_config = f"/v1/default/banks/{bank_id}/config"
-        assert (await api_client.patch(memory_config, json={"updates": {"retain_mission": "x"}})).status_code == 403
-        assert (await api_client.delete(memory_config)).status_code == 403
+        # Its background jobs are its own, under the knowledge-bank API: the memory hooks that reject
+        # everything do not stop the owner from watching an ingest (a file upload always queues one).
+        r = await _upload(api_client, bank_id, [("red.png", _png((255, 0, 0)), "image/png")], [{"document_id": "red"}])
+        assert r.is_success, r.text
+        r = await api_client.get(f"{KB}/{bank_id}/operations")
+        assert r.status_code == 200 and r.json()["total"] > 0, r.text
+        op_id = r.json()["operations"][0]["id"]
+        assert (await api_client.get(f"{KB}/{bank_id}/operations/{op_id}")).status_code == 200
+        # The memory-bank routes refuse a knowledge bank before any memory hook runs: a 400 that
+        # points at the knowledge-bank API, not the memory hooks' 403.
+        for call in (
+            api_client.patch(f"/v1/default/banks/{bank_id}/config", json={"updates": {"retain_mission": "x"}}),
+            api_client.get(f"/v1/default/banks/{bank_id}/operations"),
+        ):
+            r = await call
+            assert r.status_code == 400 and "is a knowledge bank" in r.json()["detail"], r.text
         assert (await api_client.delete(f"{KB}/{bank_id}")).status_code == 200
     finally:
         install_validator(None)

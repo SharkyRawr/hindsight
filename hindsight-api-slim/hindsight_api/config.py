@@ -846,6 +846,7 @@ ENV_MCP_ENABLED = "HINDSIGHT_API_MCP_ENABLED"
 ENV_MCP_ENABLED_TOOLS = "HINDSIGHT_API_MCP_ENABLED_TOOLS"
 ENV_MCP_STATELESS = "HINDSIGHT_API_MCP_STATELESS"
 ENV_MCP_INSTRUCTIONS = "HINDSIGHT_API_MCP_INSTRUCTIONS"
+ENV_MCP_SERVER_INSTRUCTIONS = "HINDSIGHT_API_MCP_SERVER_INSTRUCTIONS"
 ENV_MCP_AUTH_TOKEN = "HINDSIGHT_API_MCP_AUTH_TOKEN"
 ENV_ENABLE_BANK_CONFIG_API = "HINDSIGHT_API_ENABLE_BANK_CONFIG_API"
 ENV_ENABLE_BANK_LLM_HEALTH = "HINDSIGHT_API_ENABLE_BANK_LLM_HEALTH"
@@ -864,6 +865,8 @@ ENV_ADMISSION_REFLECT_MAX_IN_FLIGHT = "HINDSIGHT_API_ADMISSION_REFLECT_MAX_IN_FL
 ENV_ADMISSION_REFLECT_MAX_WAIT_MS = "HINDSIGHT_API_ADMISSION_REFLECT_MAX_WAIT_MS"
 ENV_ADMISSION_RETAIN_MAX_IN_FLIGHT = "HINDSIGHT_API_ADMISSION_RETAIN_MAX_IN_FLIGHT"
 ENV_ADMISSION_RETAIN_MAX_WAIT_MS = "HINDSIGHT_API_ADMISSION_RETAIN_MAX_WAIT_MS"
+ENV_ADMISSION_KB_SEARCH_MAX_IN_FLIGHT = "HINDSIGHT_API_ADMISSION_KB_SEARCH_MAX_IN_FLIGHT"
+ENV_ADMISSION_KB_SEARCH_MAX_WAIT_MS = "HINDSIGHT_API_ADMISSION_KB_SEARCH_MAX_WAIT_MS"
 ENV_RECALL_CONNECTION_BUDGET = "HINDSIGHT_API_RECALL_CONNECTION_BUDGET"
 ENV_RECALL_MAX_QUERY_TOKENS = "HINDSIGHT_API_RECALL_MAX_QUERY_TOKENS"
 ENV_RECALL_DIAGNOSTIC_PHASES = "HINDSIGHT_API_RECALL_DIAGNOSTIC_PHASES"
@@ -913,6 +916,10 @@ ENV_LLM_CODEX_HOME = "HINDSIGHT_API_LLM_CODEX_HOME"
 # chatgpt provider (Sign in with ChatGPT) credential directory: holds
 # credentials.json and this host's host_id. Server-level only.
 ENV_LLM_CHATGPT_HOME = "HINDSIGHT_API_LLM_CHATGPT_HOME"
+
+# claude-code provider: a settings file (e.g. an apiKeyHelper) the spawned CLI
+# loads despite its isolation (issue #6500). Server-level only.
+ENV_LLM_CLAUDE_CODE_SETTINGS = "HINDSIGHT_API_LLM_CLAUDE_CODE_SETTINGS"
 
 # xai-oauth provider. The token store is written by the `login` entrypoint and read on
 # every call; the rest exist so a deployment can point at a different OAuth app.
@@ -1023,6 +1030,8 @@ ENV_KB_RERANKER_MAX_TOKENS = "HINDSIGHT_API_KB_RERANKER_MAX_TOKENS"
 ENV_KB_RERANKER_TOKENIZER = "HINDSIGHT_API_KB_RERANKER_TOKENIZER"
 ENV_KB_RERANKER_IMAGES = "HINDSIGHT_API_KB_RERANKER_IMAGES"
 ENV_KB_RERANKER_QUERY_IMAGES = "HINDSIGHT_API_KB_RERANKER_QUERY_IMAGES"
+# Whether a search that leaves enable_reranking unset is reranked; false: only an explicit true reranks.
+ENV_KB_ENABLE_RERANKING = "HINDSIGHT_API_KB_ENABLE_RERANKING"
 # Media types (document, image, audio, video, text) this server refuses to ingest, comma-separated,
 # whatever its embedder could embed: e.g. "video,audio" to skip the cost of decoding clips.
 ENV_KB_DISABLED_MEDIA_TYPES = "HINDSIGHT_API_KB_DISABLED_MEDIA_TYPES"
@@ -1030,7 +1039,9 @@ ENV_KB_IMAGE_TOKENS = "HINDSIGHT_API_KB_IMAGE_TOKENS"
 ENV_KB_MAX_FILE_MB = "HINDSIGHT_API_KB_MAX_FILE_MB"
 ENV_KB_MAX_FILE_MB_BY_MEDIA_TYPE = "HINDSIGHT_API_KB_MAX_FILE_MB_BY_MEDIA_TYPE"
 ENV_KB_MAX_IMAGE_MEGAPIXELS = "HINDSIGHT_API_KB_MAX_IMAGE_MEGAPIXELS"
+ENV_KB_WORKER_MEMORY_MB = "HINDSIGHT_API_KB_WORKER_MEMORY_MB"
 ENV_KB_MAX_MEDIA_SECONDS = "HINDSIGHT_API_KB_MAX_MEDIA_SECONDS"
+ENV_KB_MAX_VIDEO_WORK_SECONDS = "HINDSIGHT_API_KB_MAX_VIDEO_WORK_SECONDS"
 ENV_KB_MAX_PDF_PAGES = "HINDSIGHT_API_KB_MAX_PDF_PAGES"
 ENV_KB_AUDIO_WINDOW_SECONDS = "HINDSIGHT_API_KB_AUDIO_WINDOW_SECONDS"
 ENV_KB_VIDEO_WINDOW_SECONDS = "HINDSIGHT_API_KB_VIDEO_WINDOW_SECONDS"
@@ -1285,6 +1296,7 @@ ENV_RECALL_STRATEGY_BOOSTS = "HINDSIGHT_API_RECALL_STRATEGY_BOOSTS"
 ENV_RECENCY_DECAY_FUNCTION = "HINDSIGHT_API_RECENCY_DECAY_FUNCTION"
 ENV_RECENCY_DECAY_LINEAR_WINDOW_DAYS = "HINDSIGHT_API_RECENCY_DECAY_LINEAR_WINDOW_DAYS"
 ENV_RECENCY_DECAY_HALFLIFE_DAYS = "HINDSIGHT_API_RECENCY_DECAY_HALFLIFE_DAYS"
+ENV_RECENCY_ALPHA = "HINDSIGHT_API_RECENCY_ALPHA"
 
 # Audit log settings
 # AUDIT_LOG_ENABLED is the deployment-wide default and is overridable per bank
@@ -1348,6 +1360,7 @@ PROVIDER_DEFAULT_MODELS = {
     "chatgpt": "gpt-6-luna",
     "claude-code": "claude-sonnet-5-5",
     "cursor": "auto",
+    "antigravity": "gemini-3.8-flash-low",
     "github-copilot": "gpt-5.6-terra",
     "mock": "mock-model",
     "none": "none",
@@ -1438,6 +1451,9 @@ DEFAULT_LLM_CODEX_HOME = None
 
 # chatgpt credentials directory (None = ~/.hindsight/chatgpt)
 DEFAULT_LLM_CHATGPT_HOME = None
+
+# claude-code settings file (None = the CLI loads no settings file)
+DEFAULT_LLM_CLAUDE_CODE_SETTINGS = None
 
 # Vertex AI defaults
 DEFAULT_LLM_VERTEXAI_PROJECT_ID = None  # Required for Vertex AI
@@ -1586,6 +1602,8 @@ DEFAULT_RECENCY_DECAY_FUNCTION = "linear"
 DEFAULT_RECENCY_DECAY_LINEAR_WINDOW_DAYS = 365.0
 # Exponential: age (days) at which the recency signal is neutral (0.5).
 DEFAULT_RECENCY_DECAY_HALFLIFE_DAYS = 90.0
+# How much recency can move a recall score: at most ±(alpha/2). 0.2 → ±10%.
+DEFAULT_RECENCY_ALPHA = 0.2
 # Retrieval arms that can be boosted; mirrors fusion.py source_names.
 RECALL_STRATEGY_NAMES = ("semantic", "bm25", "graph", "temporal")
 # User-facing priority levels. Kept in sync with recall_boost.BOOST_LEVELS by a
@@ -1795,8 +1813,8 @@ DECISION_MODEL_PROVIDER_DEFAULTS = {
     "openai": _DecisionProviderDefaults(model="gpt-6-luna", base_url="https://api.openai.com"),
 }
 DECISION_MODEL_PROVIDERS = ("none", *DECISION_MODEL_PROVIDER_DEFAULTS)
-# Providers whose endpoint is System One itself (<base_url>/v1/systemone), which reflect's
-# client (TypeSafeCrossEncoder) speaks.
+# Providers whose endpoint is System One itself (<base_url>/v1/systemone): the ones reflect's
+# decision-orchestrated mode runs on (MemoryEngine._reflect_decision_model).
 SYSTEM_ONE_DECISION_MODEL_PROVIDERS = frozenset({"hindsight", "typesafe"})
 DEFAULT_DECISION_MODEL_PROVIDER = "none"
 DEFAULT_DECISION_MODEL_TIMEOUT = 60.0
@@ -1913,6 +1931,12 @@ DEFAULT_MCP_ENABLED = True
 DEFAULT_MCP_ENABLED_TOOLS: list[str] | None = None  # None = all tools enabled
 DEFAULT_MCP_STATELESS = False  # False = stateful (supports SSE/GET); True = stateless (POST-only)
 DEFAULT_MCP_INSTRUCTIONS = None
+# Text sent to MCP clients as the server instructions of the initialize response, so a
+# connecting agent learns how to use the bank without a hand-pasted prompt. Per bank.
+DEFAULT_MCP_SERVER_INSTRUCTIONS = None
+# Upper bound on mcp_server_instructions. Clients place the text in the model's context on
+# every connection, so it is kept to a size a system prompt can carry.
+MCP_SERVER_INSTRUCTIONS_MAX_CHARS = 4000
 DEFAULT_ENABLE_BANK_CONFIG_API = True
 # Dry-run extraction is a preview tool that makes a real LLM call but stores nothing. Enabled by
 # default; set HINDSIGHT_API_ENABLE_DRY_RUN_EXTRACT=false to remove the endpoint (e.g. to cap
@@ -1977,6 +2001,11 @@ DEFAULT_ADMISSION_REFLECT_MAX_WAIT_MS = 5000
 DEFAULT_ADMISSION_RETAIN_IN_FLIGHT_PER_CORE = 32
 DEFAULT_ADMISSION_RETAIN_MAX_IN_FLIGHT = 0
 DEFAULT_ADMISSION_RETAIN_MAX_WAIT_MS = 2000
+# Knowledge-bank search is a read like recall (embed the query, search, maybe rerank),
+# so it gets recall's depth and patience.
+DEFAULT_ADMISSION_KB_SEARCH_IN_FLIGHT_PER_CORE = 16
+DEFAULT_ADMISSION_KB_SEARCH_MAX_IN_FLIGHT = 0
+DEFAULT_ADMISSION_KB_SEARCH_MAX_WAIT_MS = 30000
 DEFAULT_RECALL_CONNECTION_BUDGET = 4  # Max concurrent DB connections per recall operation
 DEFAULT_RECALL_MAX_QUERY_TOKENS = 500  # Maximum tokens allowed in recall query
 DEFAULT_RECALL_DIAGNOSTIC_PHASES = True  # Record the subset (diagnostic=true) recall phase metrics
@@ -2122,7 +2151,15 @@ DEFAULT_KB_MAX_FILE_MB = 500
 # Pillow's own refusal threshold (2 x its 89 MP decompression-bomb warning): a 5 MB PNG can be 30000 x 30000
 # pixels, and decoding it is memory by pixels (3-4 bytes each, twice over while converting), not by file size.
 DEFAULT_KB_MAX_IMAGE_MEGAPIXELS = 178
+# The most memory (address space) one worker process converting an Office file or rendering a PDF may take;
+# 0 sizes it from the machine: half the container's memory limit (or of the RAM) plus 1 GB, a worker's own
+# footprint at rest. A 42 KB .xls that declares 16.7M cells grew a worker until the container ran out.
+DEFAULT_KB_WORKER_MEMORY_MB = 0
 DEFAULT_KB_MAX_MEDIA_SECONDS = 7200  # 2h of audio/video per file
+# Cutting a video costs CPU by its frames and their pixels, not by its length or size: a 500 MB file can hold
+# two hours of 4K at 60 fps, eight times the work of two hours of 1080p at 30. The limit is the work of
+# this many seconds of 1080p 30 fps video (media.py); 0 turns it off.
+DEFAULT_KB_MAX_VIDEO_WORK_SECONDS = 7200
 DEFAULT_KB_MAX_PDF_PAGES = 2000
 DEFAULT_KB_AUDIO_WINDOW_SECONDS = 60
 DEFAULT_KB_VIDEO_WINDOW_SECONDS = 30
@@ -2139,8 +2176,11 @@ DEFAULT_KB_KEYWORD_WEIGHT = 0.2
 # Structure-aware passages. 128 was best on LegalBench-RAG at a fixed budget of returned text (CHUNKING.md);
 # 256 beat it on every benchmark launch uses (EmbeddingGemma 2): SciFact 83.7 -> 84.2 nDCG@10,
 # EnterpriseRAG search 66.1 -> 67.6 (recall@10 77.1 -> 81.5), with half the passages. 512 led on
-# SciFact alone (85.6) and lost 3 points on EnterpriseRAG's per-category mean.
-DEFAULT_KB_TEXT_PASSAGE_TOKENS = 256
+# SciFact alone (85.6) and lost 3 points on EnterpriseRAG's per-category mean. 512 again with each text
+# titled by its opening and its best documents scored whole: LegalBench-RAG recall@5 80.9 -> 86.1 on its
+# first 50 questions per set (mergers 46.4 -> 60.7: a clause is no longer cut in two). EnterpriseRAG and
+# SciFact not yet rerun at 512 with these.
+DEFAULT_KB_TEXT_PASSAGE_TOKENS = 512
 # An async knowledge ingest is split into child operations of about this many bytes of stored files,
 # each its own worker task, so one big upload spreads across every free slot. Bytes, because the
 # passage count is only known once a file is split; a file over the budget is a child on its own.
@@ -2160,9 +2200,9 @@ DEFAULT_DEFAULT_TIMEZONE = "UTC"  # IANA zone a retain timestamp with no UTC off
 # Document transfer defaults (export/import enabled by default; gated independently)
 DEFAULT_ENABLE_DOCUMENT_EXPORT_API = True
 DEFAULT_ENABLE_DOCUMENT_IMPORT_API = True
-# Knowledge banks ship hidden while they are being built: off, their HTTP routes answer 404, their
-# reflect ignores linked knowledge banks and the UI hides them.
-DEFAULT_ENABLE_KB = False
+# Off, the knowledge bank HTTP routes answer 404, reflect ignores linked knowledge banks and the UI
+# hides them.
+DEFAULT_ENABLE_KB = True
 
 # Observations defaults (consolidated knowledge from facts)
 DEFAULT_ENABLE_OBSERVATIONS = True  # Observations enabled by default
@@ -3677,6 +3717,11 @@ class HindsightConfig:
     llm_strict_schema_retain: bool
     llm_strict_schema_reflect: bool
     llm_strict_schema_consolidation: bool
+    # Reflect's tool turns (every loop turn and the closing ``done``). Held to the schema
+    # unless HINDSIGHT_API_LLM_STRICT_SCHEMA_REFLECT says false: they always were, and small
+    # models need it to follow a forced turn, so the global default (false) does not reach
+    # them. A model that runs away under the grammar is taken off it with that flag (#6673).
+    llm_strict_schema_reflect_tool_turns: bool = field(default=True, kw_only=True)
     llm_supports_string_pattern: bool = field(
         default=DEFAULT_LLM_SUPPORTS_STRING_PATTERN,
         kw_only=True,
@@ -3731,6 +3776,10 @@ class HindsightConfig:
     # chatgpt credential directory (None = ~/.hindsight/chatgpt). Server-level
     # only, for the same reason as llm_codex_home.
     llm_chatgpt_home: str | None
+
+    # claude-code settings file passed to the spawned CLI (None = none). Server-level
+    # only: an apiKeyHelper in it runs a command, so a bank must not point at one.
+    llm_claude_code_settings: str | None
 
     # Vertex AI configuration
     llm_vertexai_project_id: str | None
@@ -3928,6 +3977,7 @@ class HindsightConfig:
     recency_decay_function: str
     recency_decay_linear_window_days: float
     recency_decay_halflife_days: float
+    recency_alpha: float
     reranker_cohere_api_key: str | None
     reranker_cohere_model: str
     reranker_cohere_base_url: str | None
@@ -4022,6 +4072,8 @@ class HindsightConfig:
     admission_reflect_max_wait_seconds: float
     admission_retain_max_in_flight: int
     admission_retain_max_wait_seconds: float
+    admission_kb_search_max_in_flight: int
+    admission_kb_search_max_wait_seconds: float
     recall_connection_budget: int
     recall_max_query_tokens: int
     recall_diagnostic_phases: bool
@@ -4086,7 +4138,7 @@ class HindsightConfig:
     enable_file_upload_api: bool
     file_delete_after_retain: bool
     store_document_text: bool  # When False, store NULL original_text / empty chunk_text
-    default_timezone: str  # IANA zone for retain times that carry no UTC offset
+    default_timezone: str  # IANA zone for retain times with no UTC offset, and for times shown to the LLM
     enable_document_export_api: bool
     enable_document_import_api: bool
     enable_kb: bool
@@ -4436,6 +4488,8 @@ class HindsightConfig:
     # Also send the picture of a search by an image as the rerank query (an image object, not a string);
     # needs kb_reranker_images. Off: the query goes as its text, and a search with no text is not reranked.
     kb_reranker_query_images: bool = False
+    # What a search that leaves enable_reranking unset gets; false: only an explicit true reranks.
+    kb_enable_reranking: bool = True
     kb_disabled_media_types: frozenset[str] = frozenset()
     #: The "text" knowledge provider's own embeddings config (HINDSIGHT_API_KB_TEXT_EMBEDDINGS_*),
     #: or None to use the memory banks' embedder.
@@ -4445,7 +4499,9 @@ class HindsightConfig:
     #: Per media type, in place of kb_max_file_mb (server-only, like it: a bank cannot raise either).
     kb_max_file_mb_by_media_type: dict[str, int] = field(default_factory=dict)
     kb_max_image_megapixels: int = DEFAULT_KB_MAX_IMAGE_MEGAPIXELS
+    kb_worker_memory_mb: int = DEFAULT_KB_WORKER_MEMORY_MB
     kb_max_media_seconds: int = DEFAULT_KB_MAX_MEDIA_SECONDS
+    kb_max_video_work_seconds: int = DEFAULT_KB_MAX_VIDEO_WORK_SECONDS
     kb_max_pdf_pages: int = DEFAULT_KB_MAX_PDF_PAGES
     kb_audio_window_seconds: int = DEFAULT_KB_AUDIO_WINDOW_SECONDS
     kb_video_window_seconds: int = DEFAULT_KB_VIDEO_WINDOW_SECONDS
@@ -4469,6 +4525,8 @@ class HindsightConfig:
     reflect_kb_search_images: bool = DEFAULT_REFLECT_KB_SEARCH_IMAGES
     reflect_kb_search_max_images: int = DEFAULT_REFLECT_KB_SEARCH_MAX_IMAGES
     reflect_kb_search_budget: str = DEFAULT_REFLECT_KB_SEARCH_BUDGET
+    # Per bank: the instructions an MCP client receives in the initialize response (None = none)
+    mcp_server_instructions: str | None = DEFAULT_MCP_SERVER_INSTRUCTIONS
 
     # Class-level sets for configuration categorization
 
@@ -4554,6 +4612,8 @@ class HindsightConfig:
         "kb_reranker_url",
         # chatgpt: points at a directory holding an OAuth grant.
         "llm_chatgpt_home",
+        # claude-code: a settings file whose apiKeyHelper mints the auth key.
+        "llm_claude_code_settings",
     }
 
     # CONFIGURABLE_FIELDS: Safe behavioral settings that can be customized per-tenant/bank
@@ -4562,6 +4622,8 @@ class HindsightConfig:
     _CONFIGURABLE_FIELDS = {
         # MCP tool access control
         "mcp_enabled_tools",
+        # Instructions sent to MCP clients when they connect to the bank
+        "mcp_server_instructions",
         # Audit logging on/off, per bank. The actions allowlist and retention
         # window remain server-level and are deliberately not configurable.
         "audit_log_enabled",
@@ -4827,6 +4889,8 @@ class HindsightConfig:
                 f"Invalid entity_trgm_similarity_threshold: {self.entity_trgm_similarity_threshold}. "
                 "Must be greater than 0 and at most 1."
             )
+        if not (0.0 <= self.recency_alpha <= 1.0):
+            raise ValueError(f"Invalid recency_alpha: {self.recency_alpha}. Must be between 0 and 1.")
         if not (0.0 < self.entity_intrabatch_merge_similarity <= 1.0):
             raise ValueError(
                 f"Invalid entity_intrabatch_merge_similarity: {self.entity_intrabatch_merge_similarity}. "
@@ -5127,6 +5191,8 @@ class HindsightConfig:
             llm_strict_schema_retain=_resolve_operation_strict_schema(ENV_LLM_STRICT_SCHEMA_RETAIN),
             llm_strict_schema_reflect=_resolve_operation_strict_schema(ENV_LLM_STRICT_SCHEMA_REFLECT),
             llm_strict_schema_consolidation=_resolve_operation_strict_schema(ENV_LLM_STRICT_SCHEMA_CONSOLIDATION),
+            llm_strict_schema_reflect_tool_turns=os.getenv(ENV_LLM_STRICT_SCHEMA_REFLECT, "true").strip().lower()
+            in ("true", "1"),
             llm_supports_string_pattern=_parse_boolean_env(
                 ENV_LLM_SUPPORTS_STRING_PATTERN,
                 DEFAULT_LLM_SUPPORTS_STRING_PATTERN,
@@ -5170,6 +5236,8 @@ class HindsightConfig:
             # Codex (ChatGPT OAuth) credentials directory
             llm_codex_home=os.getenv(ENV_LLM_CODEX_HOME) or DEFAULT_LLM_CODEX_HOME,
             llm_chatgpt_home=os.getenv(ENV_LLM_CHATGPT_HOME, "").strip() or DEFAULT_LLM_CHATGPT_HOME,
+            llm_claude_code_settings=os.getenv(ENV_LLM_CLAUDE_CODE_SETTINGS, "").strip()
+            or DEFAULT_LLM_CLAUDE_CODE_SETTINGS,
             # Vertex AI
             llm_vertexai_project_id=os.getenv(ENV_LLM_VERTEXAI_PROJECT_ID) or DEFAULT_LLM_VERTEXAI_PROJECT_ID,
             llm_vertexai_region=os.getenv(ENV_LLM_VERTEXAI_REGION, DEFAULT_LLM_VERTEXAI_REGION),
@@ -5600,6 +5668,7 @@ class HindsightConfig:
             recency_decay_halflife_days=float(
                 os.getenv(ENV_RECENCY_DECAY_HALFLIFE_DAYS, str(DEFAULT_RECENCY_DECAY_HALFLIFE_DAYS))
             ),
+            recency_alpha=float(os.getenv(ENV_RECENCY_ALPHA, str(DEFAULT_RECENCY_ALPHA))),
             # Cohere reranker (with backward-compatible fallback to shared API key)
             reranker_cohere_api_key=os.getenv(ENV_RERANKER_COHERE_API_KEY) or os.getenv(ENV_COHERE_API_KEY),
             reranker_cohere_model=os.getenv(ENV_RERANKER_COHERE_MODEL, DEFAULT_RERANKER_COHERE_MODEL),
@@ -5806,6 +5875,20 @@ class HindsightConfig:
                 os.getenv(ENV_ADMISSION_RETAIN_MAX_WAIT_MS, str(DEFAULT_ADMISSION_RETAIN_MAX_WAIT_MS))
             )
             / 1000.0,
+            admission_kb_search_max_in_flight=admission_in_flight_for(
+                int(
+                    os.getenv(
+                        ENV_ADMISSION_KB_SEARCH_MAX_IN_FLIGHT,
+                        str(DEFAULT_ADMISSION_KB_SEARCH_MAX_IN_FLIGHT),
+                    )
+                ),
+                DEFAULT_ADMISSION_KB_SEARCH_IN_FLIGHT_PER_CORE,
+                int(os.getenv(ENV_WORKERS, "1")),
+            ),
+            admission_kb_search_max_wait_seconds=float(
+                os.getenv(ENV_ADMISSION_KB_SEARCH_MAX_WAIT_MS, str(DEFAULT_ADMISSION_KB_SEARCH_MAX_WAIT_MS))
+            )
+            / 1000.0,
             recall_connection_budget=int(
                 os.getenv(ENV_RECALL_CONNECTION_BUDGET, str(DEFAULT_RECALL_CONNECTION_BUDGET))
             ),
@@ -5965,12 +6048,17 @@ class HindsightConfig:
             kb_reranker_tokenizer=os.getenv(ENV_KB_RERANKER_TOKENIZER) or None,
             kb_reranker_images=_parse_boolean_env(ENV_KB_RERANKER_IMAGES, True),
             kb_reranker_query_images=_parse_boolean_env(ENV_KB_RERANKER_QUERY_IMAGES, False),
+            kb_enable_reranking=_parse_boolean_env(ENV_KB_ENABLE_RERANKING, True),
             kb_image_tokens=int(os.getenv(ENV_KB_IMAGE_TOKENS, str(DEFAULT_KB_IMAGE_TOKENS))),
             kb_disabled_media_types=_parse_kb_media_types(os.getenv(ENV_KB_DISABLED_MEDIA_TYPES)),
             kb_max_file_mb=int(os.getenv(ENV_KB_MAX_FILE_MB, str(DEFAULT_KB_MAX_FILE_MB))),
             kb_max_file_mb_by_media_type=_parse_kb_size_limits(os.getenv(ENV_KB_MAX_FILE_MB_BY_MEDIA_TYPE)),
             kb_max_image_megapixels=int(os.getenv(ENV_KB_MAX_IMAGE_MEGAPIXELS, str(DEFAULT_KB_MAX_IMAGE_MEGAPIXELS))),
+            kb_worker_memory_mb=int(os.getenv(ENV_KB_WORKER_MEMORY_MB, str(DEFAULT_KB_WORKER_MEMORY_MB))),
             kb_max_media_seconds=int(os.getenv(ENV_KB_MAX_MEDIA_SECONDS, str(DEFAULT_KB_MAX_MEDIA_SECONDS))),
+            kb_max_video_work_seconds=int(
+                os.getenv(ENV_KB_MAX_VIDEO_WORK_SECONDS, str(DEFAULT_KB_MAX_VIDEO_WORK_SECONDS))
+            ),
             kb_max_pdf_pages=int(os.getenv(ENV_KB_MAX_PDF_PAGES, str(DEFAULT_KB_MAX_PDF_PAGES))),
             kb_audio_window_seconds=int(os.getenv(ENV_KB_AUDIO_WINDOW_SECONDS, str(DEFAULT_KB_AUDIO_WINDOW_SECONDS))),
             kb_video_window_seconds=int(os.getenv(ENV_KB_VIDEO_WINDOW_SECONDS, str(DEFAULT_KB_VIDEO_WINDOW_SECONDS))),
@@ -5999,6 +6087,7 @@ class HindsightConfig:
             ).lower()
             == "true",
             reflect_kb_search_budget=_parse_reflect_kb_search_budget(os.getenv(ENV_REFLECT_KB_SEARCH_BUDGET)),
+            mcp_server_instructions=os.getenv(ENV_MCP_SERVER_INSTRUCTIONS) or DEFAULT_MCP_SERVER_INSTRUCTIONS,
             reflect_kb_search_max_images=int(
                 os.getenv(ENV_REFLECT_KB_SEARCH_MAX_IMAGES, str(DEFAULT_REFLECT_KB_SEARCH_MAX_IMAGES))
             ),

@@ -169,18 +169,27 @@ async def _acquire_permits(stack: AsyncExitStack, scope: str) -> None:
     slow LLM call can be attributed to queueing rather than to the provider --
     the two are otherwise indistinguishable in the reported duration (#3881).
     """
+    from ..schema_context import get_current_bank_id, get_current_schema
     from ..worker.background import in_background_task
-    from .llm_trace import record_queue_wait
+    from .llm_trace import current_call_metadata, current_trace_context, record_queue_wait
     from .permit_wait import waiting_for_permit
 
     # Calls from a background worker task yield the next free permit to any waiting
     # live request.
     background = in_background_task()
+    # Waiters take turns by tenant, then bank, so one bank's big document does not
+    # make every other bank's calls wait behind all of its chunks. Inside a bank, the
+    # document closest to done goes first.
+    tenant = get_current_schema()
+    trace_ctx = current_trace_context()
+    bank = (trace_ctx.bank_id if trace_ctx is not None else None) or get_current_bank_id()
+    call_meta = current_call_metadata()
+    document = call_meta.get("document_id") if call_meta else None
     queue_start = time.monotonic()
     # Queued time is not this operation's work; time limits that opted in exclude it (#6140).
     with waiting_for_permit():
         for sem in _semaphores_for_scope(scope):
-            await sem.acquire(background=background)
+            await sem.acquire(background=background, tenant=tenant, bank=bank, document=document)
             stack.callback(sem.release)
     record_queue_wait(time.monotonic() - queue_start)
 
@@ -451,7 +460,15 @@ def parse_llm_json(raw: str) -> Any:
         # failing loudly in that case rather than let an empty object masquerade
         # as a successful parse: callers (retry ladders, the #1833 fail-loud path)
         # rely on JSONDecodeError to retry or surface the failure.
-        repaired = repair_json(cleaned, return_objects=True)
+        #
+        # Repair the text as the model wrote it, not ``cleaned``. The escaping pass
+        # tracks string state by counting quotes, so one unescaped quote inside a
+        # value (Gemma 4: ``"... `cmd".",``) flips it, and every newline between
+        # later fields is escaped as if it were string content. The repair then sees
+        # one long string and returns the first fact plus a list of fragments, which
+        # retain drops as malformed (#6729). ``repair_json`` handles raw control
+        # characters on its own, and ``sanitize_value`` scrubs what it keeps.
+        repaired = repair_json(text, return_objects=True)
         if not repaired:
             raise
         return sanitize_value(repaired)
@@ -650,6 +667,16 @@ def create_llm_provider(
 
     elif provider_lower == "cursor":
         return providers.CursorLLM(
+            provider=provider,
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            timeout=timeout,
+        )
+
+    elif provider_lower == "antigravity":
+        return providers.AntigravityLLM(
             provider=provider,
             api_key=api_key,
             base_url=base_url,
@@ -1084,6 +1111,7 @@ class LLMProvider:
             "chatgpt",
             "claude-code",
             "cursor",
+            "antigravity",
             "github-copilot",
             "mock",
             "none",
@@ -1591,6 +1619,7 @@ class LLMProvider:
         max_backoff: float | None = None,
         tool_choice: LLMToolChoice = LLM_TOOL_CHOICE_REQUIRED,
         declared_tools: list[dict[str, Any]] | None = None,
+        strict_schema: bool = True,
     ) -> "LLMToolCallResult":
         """One turn of a tool-using conversation: the call the model makes next.
 
@@ -1604,6 +1633,9 @@ class LLMProvider:
         not just ``tools`` (the ones this turn may call): declaring the same functions on
         every turn of a conversation keeps its prompt prefix, and the provider's cache of
         it, the same while a turn narrows what it may call.
+
+        ``strict_schema`` holds the reply to the schema with the provider's grammar; ``False``
+        sends it the soft way (in the prompt), for models that run away under the grammar.
         """
         from .llm_trace import SchemaToolTurn, reset_schema_tool_turn, set_schema_tool_turn
         from .providers import tools_via_schema
@@ -1663,7 +1695,7 @@ class LLMProvider:
                             initial_backoff=initial_backoff,
                             max_backoff=max_backoff,
                             skip_validation=True,
-                            strict_schema=True,
+                            strict_schema=strict_schema,
                         )
                         break
                     except OutputTooLongError:

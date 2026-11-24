@@ -121,6 +121,10 @@ class BankTemplateConfig(BaseModel):
     mcp_enabled_tools: list[str] | None = Field(
         default=None, description="MCP tool allowlist for this bank (None = all tools)"
     )
+    mcp_server_instructions: str | None = Field(
+        default=None,
+        description="Instructions sent to MCP clients in the initialize response when they connect to this bank",
+    )
     knowledge_banks: list[str] | None = Field(
         default=None, description="Knowledge banks whose passages this bank's reflect reads"
     )
@@ -258,7 +262,7 @@ class BankTemplateConfig(BaseModel):
     default_timezone: str | None = Field(
         default=None,
         description="IANA zone (e.g. 'Europe/Rome') a retain timestamp, or a time the LLM extracts, "
-        "is read in when it carries no UTC offset.",
+        "is read in when it carries no UTC offset, and the zone the LLM reads memory times in.",
     )
     enable_auto_consolidation: bool | None = Field(
         default=None, description="Automatically consolidate observations after retain"

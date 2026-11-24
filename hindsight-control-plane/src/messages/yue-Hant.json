@@ -485,7 +485,7 @@
     "auditEnabledDescription": "記錄呢個記憶庫嘅 retain、recall 同 reflect 操作。淨係就呢個記憶庫覆寫伺服器預設值。",
     "auditServerDefault": "伺服器預設值（{state}）",
     "defaultTimezoneLabel": "預設時區",
-    "defaultTimezoneDescription": "冇 UTC 偏移嘅 retain 時間戳，或者內容入面嘅時間，會用呢個時區解讀。IANA 名稱，例如 Europe/Rome。",
+    "defaultTimezoneDescription": "冇 UTC 偏移嘅 retain 時間戳，或者內容入面嘅時間，會用呢個時區解讀；LLM 讀記憶嘅時間都係用呢個時區。IANA 名稱，例如 Europe/Rome。",
     "docStorageEnabledLabel": "儲存文件原文",
     "docStorageEnabledDescription": "保留原始文字（文件原文同分塊）。停用就只會保留衍生事實。只會覆蓋當前記憶庫嘅伺服器預設值。",
     "docStorageServerDefault": "伺服器預設值（{state}）",
@@ -494,6 +494,9 @@
     "securityPrivacyFailedToSave": "儲存安全性同私隱設定失敗",
     "restrictToolsLabel": "限制工具",
     "restrictToolsDescription": "關閉時，所有工具均可用。開啟時，此記憶庫只能呼叫所選工具。",
+    "mcpServerInstructionsLabel": "MCP 伺服器指示",
+    "mcpServerInstructionsDescription": "當 AI 工具連接到呢個庫嘅 MCP URL 時傳送畀佢哋，等佢哋知道點樣用呢個庫：例如先讀邊份文件，或者用咩標籤儲存新事實。最多 4,000 個字元。",
+    "mcpServerInstructionsPlaceholder": "請先睇文件「house-rules」。儲存新事實時用標籤「inbox」。",
     "modelsTitle": "模型",
     "modelsDescription": "特定提供商的模型設定",
     "geminiFailedToSave": "未能儲存 Gemini 設定",
@@ -662,6 +665,7 @@
     "promptBlock": {
       "instructions": "說明",
       "field": {
+        "default_timezone": "時區",
         "entities_allow_free_form": "自由形式實體",
         "entity_labels": "實體標籤",
         "llm_output_language": "語言規則",
@@ -1491,6 +1495,10 @@
     "actionCreatePage": "建立頁面",
     "actionUpdatePageNode": "更新頁面節點",
     "actionDeletePageNode": "刪除頁面節點",
+    "actionCreateKnowledgeBank": "建立知識庫",
+    "actionDeleteKnowledgeBank": "刪除知識庫",
+    "actionIngestKnowledgeText": "匯入知識文字",
+    "actionDeleteKnowledgeDocument": "刪除知識文件",
     "actionFileRetain": "上載檔案",
     "actionUpdateMemory": "更新記憶",
     "actionUpdateDocument": "更新文件",
@@ -2722,7 +2730,7 @@
         },
         "media_overlap_seconds": {
           "label": "重疊（秒）",
-          "description": "每個段落同下一段共用幾多秒，等切開嗰度唔會漏嘢；一定要短過兩個長度。"
+          "description": "每個段落同下一段共用幾多秒，等切開嗰度唔會漏嘢；最多係兩個長度嘅一半。"
         },
         "max_media_seconds": {
           "label": "最長檔案（秒）",
@@ -2738,6 +2746,8 @@
       "arm_extra_vectors_help": "PDF 頁嘅條帶、文字同文字單元，用同樣方法搵。",
       "arm_keyword": "關鍵詞",
       "arm_keyword_help": "查詢入面較罕見字詞嘅全文配對（所有文件同語言）。",
+      "arm_document": "成份文件",
+      "arm_document_help": "上面搜尋排得最高嘅 3 份文件嘅每段文字，同查詢講法唔同嘅部分都會評分。",
       "armScore": "喺呢個搜尋嘅分數",
       "meaningTitle": "意思分數",
       "meaningHelp": "{count} 個候選逐個用所有向量評分，再同文件最好段落平均。",
@@ -2751,7 +2761,6 @@
       "rankingHelp": "意思同關鍵詞縮放到 0-1 再混合，關鍵詞佔 {weight}%。用到嘅字詞同罕見度：",
       "noKeywords": "呢個查詢冇關鍵詞搜尋。",
       "idfHelp": "呢個詞喺呢個庫有幾罕見（IDF）：越罕見越重要。",
-      "referencePage": "參考文獻列表，排低",
       "depthTitle": "深度截斷（預算 {budget}）",
       "depthHelp": "為 token 預算保留 {total} 個入面頭 {depth} 個。",
       "budgetTitle": "填滿 max_tokens",

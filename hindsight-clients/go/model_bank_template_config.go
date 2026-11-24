@@ -44,6 +44,7 @@ type BankTemplateConfig struct {
 	RetainChunkBatchSize NullableInt32 `json:"retain_chunk_batch_size,omitempty"`
 	RetainMaxAttachmentsPerChunk NullableInt32 `json:"retain_max_attachments_per_chunk,omitempty"`
 	McpEnabledTools []string `json:"mcp_enabled_tools,omitempty"`
+	McpServerInstructions NullableString `json:"mcp_server_instructions,omitempty"`
 	KnowledgeBanks []string `json:"knowledge_banks,omitempty"`
 	ReflectKbSearchMediaTypes []string `json:"reflect_kb_search_media_types,omitempty"`
 	ReflectKbSearchApplyTags NullableBool `json:"reflect_kb_search_apply_tags,omitempty"`
@@ -51,7 +52,7 @@ type BankTemplateConfig struct {
 	ConsolidationSourceFactsMaxTokens NullableInt32 `json:"consolidation_source_facts_max_tokens,omitempty"`
 	ConsolidationSourceFactsMaxTokensPerObservation NullableInt32 `json:"consolidation_source_facts_max_tokens_per_observation,omitempty"`
 	MaxObservationsPerScope NullableInt32 `json:"max_observations_per_scope,omitempty"`
-	ObservationScopeLimits []map[string]interface{} `json:"observation_scope_limits,omitempty"`
+	ObservationScopeLimits []*map[string]interface{} `json:"observation_scope_limits,omitempty"`
 	DefaultObservationScopes NullableDefaultObservationScopes `json:"default_observation_scopes,omitempty"`
 	ConsolidationStrategies []ConsolidationStrategySpec `json:"consolidation_strategies,omitempty"`
 	ReflectSourceFactsMaxTokens NullableInt32 `json:"reflect_source_facts_max_tokens,omitempty"`
@@ -1125,6 +1126,48 @@ func (o *BankTemplateConfig) SetMcpEnabledTools(v []string) {
 	o.McpEnabledTools = v
 }
 
+// GetMcpServerInstructions returns the McpServerInstructions field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *BankTemplateConfig) GetMcpServerInstructions() string {
+	if o == nil || IsNil(o.McpServerInstructions.Get()) {
+		var ret string
+		return ret
+	}
+	return *o.McpServerInstructions.Get()
+}
+
+// GetMcpServerInstructionsOk returns a tuple with the McpServerInstructions field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *BankTemplateConfig) GetMcpServerInstructionsOk() (*string, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.McpServerInstructions.Get(), o.McpServerInstructions.IsSet()
+}
+
+// HasMcpServerInstructions returns a boolean if a field has been set.
+func (o *BankTemplateConfig) HasMcpServerInstructions() bool {
+	if o != nil && o.McpServerInstructions.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetMcpServerInstructions gets a reference to the given NullableString and assigns it to the McpServerInstructions field.
+func (o *BankTemplateConfig) SetMcpServerInstructions(v string) {
+	o.McpServerInstructions.Set(&v)
+}
+// SetMcpServerInstructionsNil sets the value for McpServerInstructions to be an explicit nil
+func (o *BankTemplateConfig) SetMcpServerInstructionsNil() {
+	o.McpServerInstructions.Set(nil)
+}
+
+// UnsetMcpServerInstructions ensures that no value is present for McpServerInstructions, not even an explicit nil
+func (o *BankTemplateConfig) UnsetMcpServerInstructions() {
+	o.McpServerInstructions.Unset()
+}
+
 // GetKnowledgeBanks returns the KnowledgeBanks field value if set, zero value otherwise (both if not set or set to explicit null).
 func (o *BankTemplateConfig) GetKnowledgeBanks() []string {
 	if o == nil {
@@ -1402,9 +1445,9 @@ func (o *BankTemplateConfig) UnsetMaxObservationsPerScope() {
 }
 
 // GetObservationScopeLimits returns the ObservationScopeLimits field value if set, zero value otherwise (both if not set or set to explicit null).
-func (o *BankTemplateConfig) GetObservationScopeLimits() []map[string]interface{} {
+func (o *BankTemplateConfig) GetObservationScopeLimits() []*map[string]interface{} {
 	if o == nil {
-		var ret []map[string]interface{}
+		var ret []*map[string]interface{}
 		return ret
 	}
 	return o.ObservationScopeLimits
@@ -1413,7 +1456,7 @@ func (o *BankTemplateConfig) GetObservationScopeLimits() []map[string]interface{
 // GetObservationScopeLimitsOk returns a tuple with the ObservationScopeLimits field value if set, nil otherwise
 // and a boolean to check if the value has been set.
 // NOTE: If the value is an explicit nil, `nil, true` will be returned
-func (o *BankTemplateConfig) GetObservationScopeLimitsOk() ([]map[string]interface{}, bool) {
+func (o *BankTemplateConfig) GetObservationScopeLimitsOk() ([]*map[string]interface{}, bool) {
 	if o == nil || IsNil(o.ObservationScopeLimits) {
 		return nil, false
 	}
@@ -1429,8 +1472,8 @@ func (o *BankTemplateConfig) HasObservationScopeLimits() bool {
 	return false
 }
 
-// SetObservationScopeLimits gets a reference to the given []map[string]interface{} and assigns it to the ObservationScopeLimits field.
-func (o *BankTemplateConfig) SetObservationScopeLimits(v []map[string]interface{}) {
+// SetObservationScopeLimits gets a reference to the given []*map[string]interface{} and assigns it to the ObservationScopeLimits field.
+func (o *BankTemplateConfig) SetObservationScopeLimits(v []*map[string]interface{}) {
 	o.ObservationScopeLimits = v
 }
 
@@ -2766,6 +2809,9 @@ func (o BankTemplateConfig) ToMap() (map[string]interface{}, error) {
 	}
 	if o.McpEnabledTools != nil {
 		toSerialize["mcp_enabled_tools"] = o.McpEnabledTools
+	}
+	if o.McpServerInstructions.IsSet() {
+		toSerialize["mcp_server_instructions"] = o.McpServerInstructions.Get()
 	}
 	if o.KnowledgeBanks != nil {
 		toSerialize["knowledge_banks"] = o.KnowledgeBanks

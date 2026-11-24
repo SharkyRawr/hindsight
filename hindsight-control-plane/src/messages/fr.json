@@ -485,7 +485,7 @@
     "auditEnabledDescription": "Enregistrer les opérations retain, recall et reflect de cette banque. Remplace la valeur par défaut du serveur pour cette banque uniquement.",
     "auditServerDefault": "Valeur par défaut du serveur ({state})",
     "defaultTimezoneLabel": "Fuseau horaire par défaut",
-    "defaultTimezoneDescription": "Fuseau utilisé pour un horodatage de retain, ou une heure du contenu, sans décalage UTC. Nom IANA comme Europe/Rome.",
+    "defaultTimezoneDescription": "Fuseau utilisé pour un horodatage de retain, ou une heure du contenu, sans décalage UTC, et le fuseau dans lequel le LLM lit les heures des souvenirs. Nom IANA comme Europe/Rome.",
     "docStorageEnabledLabel": "Stocker le texte des documents",
     "docStorageEnabledDescription": "Conserver le texte source brut (documents originaux et fragments). Désactivez pour ne conserver que les faits dérivés. Remplace la valeur par défaut du serveur pour cette banque uniquement.",
     "docStorageServerDefault": "Valeur par défaut du serveur ({state})",
@@ -494,6 +494,9 @@
     "securityPrivacyFailedToSave": "Échec de l'enregistrement des paramètres de sécurité et confidentialité",
     "restrictToolsLabel": "Restreindre les outils",
     "restrictToolsDescription": "Lorsque désactivé, tous les outils sont disponibles. Lorsqu'activé, seuls les outils sélectionnés peuvent être invoqués pour cette banque.",
+    "mcpServerInstructionsLabel": "Instructions du serveur MCP",
+    "mcpServerInstructionsDescription": "Envoyées aux outils d'IA lorsqu'ils se connectent à l'URL MCP de cette banque, pour qu'ils sachent comment l'utiliser : par exemple, quel document lire en premier ou avec quels tags enregistrer les nouveaux faits. Jusqu'à 4 000 caractères.",
+    "mcpServerInstructionsPlaceholder": "Lis d'abord le document 'house-rules'. Enregistre les nouveaux faits avec le tag 'inbox'.",
     "modelsTitle": "Modèles",
     "modelsDescription": "Paramètres de modèles spécifiques au fournisseur",
     "geminiFailedToSave": "Échec de l'enregistrement des paramètres Gemini",
@@ -662,6 +665,7 @@
     "promptBlock": {
       "instructions": "Instructions",
       "field": {
+        "default_timezone": "Fuseau horaire",
         "entities_allow_free_form": "Entités libres",
         "entity_labels": "Étiquettes d'entité",
         "llm_output_language": "Règle de langue",
@@ -1491,6 +1495,10 @@
     "actionCreatePage": "Créer une page",
     "actionUpdatePageNode": "Mettre à jour un nœud de page",
     "actionDeletePageNode": "Supprimer un nœud de page",
+    "actionCreateKnowledgeBank": "Créer une base de connaissances",
+    "actionDeleteKnowledgeBank": "Supprimer une base de connaissances",
+    "actionIngestKnowledgeText": "Ingérer un texte de connaissances",
+    "actionDeleteKnowledgeDocument": "Supprimer un document de connaissances",
     "actionFileRetain": "Téléverser un fichier",
     "actionUpdateMemory": "Mettre à jour un souvenir",
     "actionUpdateDocument": "Mettre à jour un document",
@@ -2722,7 +2730,7 @@
         },
         "media_overlap_seconds": {
           "label": "Chevauchement (secondes)",
-          "description": "Combien de secondes un passage partage avec le suivant, pour ne rien perdre à une coupure ; doit être plus court que les deux durées."
+          "description": "Combien de secondes un passage partage avec le suivant, pour ne rien perdre à une coupure ; au plus la moitié des deux durées."
         },
         "max_media_seconds": {
           "label": "Fichier le plus long (secondes)",
@@ -2738,6 +2746,8 @@
       "arm_extra_vectors_help": "Bandes, texte et unités de texte d'une page PDF, cherchés de même.",
       "arm_keyword": "Mots-clés",
       "arm_keyword_help": "Correspondances plein texte des mots les plus rares de la requête, dans chaque document et chaque langue.",
+      "arm_document": "Documents entiers",
+      "arm_document_help": "Chaque passage de texte des 3 documents les mieux classés par les recherches ci-dessus, pour noter aussi une partie formulée autrement que la requête.",
       "armScore": "Score dans cette recherche",
       "meaningTitle": "Score de sens",
       "meaningHelp": "Chacun des {count} candidats, noté par tous ses vecteurs puis moyenné avec le meilleur passage de son document.",
@@ -2751,7 +2761,6 @@
       "rankingHelp": "Sens et mots-clés ramenés à 0-1 et mélangés, mots-clés {weight} %. Mots utilisés, avec leur rareté :",
       "noKeywords": "Pas de recherche par mots-clés pour cette requête.",
       "idfHelp": "La rareté du mot dans cette banque (IDF) : les rares comptent plus.",
-      "referencePage": "liste de références, rétrogradée",
       "depthTitle": "Coupe de profondeur (budget {budget})",
       "depthHelp": "Garde les {depth} meilleurs sur {total} pour le budget de tokens.",
       "budgetTitle": "Remplissage de max_tokens",

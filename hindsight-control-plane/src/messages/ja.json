@@ -485,7 +485,7 @@
     "auditEnabledDescription": "このバンクの retain、recall、reflect の各操作を記録します。このバンクに限りサーバーの既定値を上書きします。",
     "auditServerDefault": "サーバー既定値（{state}）",
     "defaultTimezoneLabel": "デフォルトのタイムゾーン",
-    "defaultTimezoneDescription": "UTCオフセットのないretainのタイムスタンプや本文中の時刻に使うタイムゾーン。Europe/RomeなどのIANA名。",
+    "defaultTimezoneDescription": "UTCオフセットのないretainのタイムスタンプや本文中の時刻に使うタイムゾーン。LLMが記憶の時刻を読むタイムゾーンでもあります。Europe/RomeなどのIANA名。",
     "docStorageEnabledLabel": "ドキュメント本文を保存",
     "docStorageEnabledDescription": "生の元テキスト（ドキュメント原本とチャンク）を保持します。無効にすると、派生したファクトのみが保持されます。このバンクのみサーバーのデフォルトを上書きします。",
     "docStorageServerDefault": "サーバーのデフォルト（{state}）",
@@ -494,6 +494,9 @@
     "securityPrivacyFailedToSave": "セキュリティとプライバシー設定の保存に失敗しました",
     "restrictToolsLabel": "ツールを制限",
     "restrictToolsDescription": "オフの場合、すべてのツールが利用可能です。オンの場合、選択したツールのみがこのバンクで呼び出せます。",
+    "mcpServerInstructionsLabel": "MCPサーバー指示",
+    "mcpServerInstructionsDescription": "AIツールがこのバンクのMCP URLに接続したときに送信され、バンクの使い方を伝えます。たとえば、最初に読むドキュメントや、新しい事実を保存するときのタグなどです。最大4,000文字。",
+    "mcpServerInstructionsPlaceholder": "まずドキュメント「house-rules」を読んでください。新しい事実はタグ「inbox」を付けて保存してください。",
     "modelsTitle": "モデル",
     "modelsDescription": "プロバイダー固有のモデル設定",
     "geminiFailedToSave": "Gemini設定の保存に失敗しました",
@@ -662,6 +665,7 @@
     "promptBlock": {
       "instructions": "指示",
       "field": {
+        "default_timezone": "タイムゾーン",
         "entities_allow_free_form": "自由形式のエンティティ",
         "entity_labels": "エンティティラベル",
         "llm_output_language": "言語ルール",
@@ -1491,6 +1495,10 @@
     "actionCreatePage": "ページを作成",
     "actionUpdatePageNode": "ページノードを更新",
     "actionDeletePageNode": "ページノードを削除",
+    "actionCreateKnowledgeBank": "ナレッジバンクを作成",
+    "actionDeleteKnowledgeBank": "ナレッジバンクを削除",
+    "actionIngestKnowledgeText": "ナレッジテキストを取り込む",
+    "actionDeleteKnowledgeDocument": "ナレッジドキュメントを削除",
     "actionFileRetain": "ファイルをアップロード",
     "actionUpdateMemory": "メモリを更新",
     "actionUpdateDocument": "ドキュメントを更新",
@@ -2722,7 +2730,7 @@
         },
         "media_overlap_seconds": {
           "label": "重なり(秒)",
-          "description": "区切りで何も失われないよう、各パッセージが次と共有する秒数です。両方の長さより短くする必要があります。"
+          "description": "区切りで何も失われないよう、各パッセージが次と共有する秒数です。両方の長さの半分以下にしてください。"
         },
         "max_media_seconds": {
           "label": "最長のファイル(秒)",
@@ -2738,6 +2746,8 @@
       "arm_extra_vectors_help": "PDFページの帯・テキスト・テキスト単位を同様に検索。",
       "arm_keyword": "キーワード",
       "arm_keyword_help": "クエリの珍しい単語の全文一致（すべてのドキュメント・言語）。",
+      "arm_document": "ドキュメント全体",
+      "arm_document_help": "上の検索で最上位の3つのドキュメントのすべてのテキスト箇所。クエリと言い回しが違う部分もスコア付けされます。",
       "armScore": "この検索でのスコア",
       "meaningTitle": "意味スコア",
       "meaningHelp": "{count} 件の候補をすべてのベクトルで採点し、同じドキュメントの最良パッセージと平均。",
@@ -2751,7 +2761,6 @@
       "rankingHelp": "意味とキーワードを0-1に正規化して混合、キーワード {weight}%。使用した単語と珍しさ:",
       "noKeywords": "このクエリにはキーワード検索なし。",
       "idfHelp": "このバンクでの単語の珍しさ（IDF）: 珍しいほど重視。",
-      "referencePage": "参考文献リスト、順位を下げる",
       "depthTitle": "深さのカット（予算 {budget}）",
       "depthHelp": "トークン予算のために {total} 件中上位 {depth} 件を残す。",
       "budgetTitle": "max_tokens を埋める",

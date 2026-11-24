@@ -485,7 +485,7 @@
     "auditEnabledDescription": "记录该记忆库的 retain、recall 和 reflect 操作。仅对该记忆库覆盖服务器默认值。",
     "auditServerDefault": "服务器默认值（{state}）",
     "defaultTimezoneLabel": "默认时区",
-    "defaultTimezoneDescription": "没有 UTC 偏移的 retain 时间戳或内容中的时间按此时区解读。IANA 名称，如 Europe/Rome。",
+    "defaultTimezoneDescription": "没有 UTC 偏移的 retain 时间戳或内容中的时间按此时区解读，LLM 读取记忆时间时也使用此时区。IANA 名称，如 Europe/Rome。",
     "docStorageEnabledLabel": "存储文档原文",
     "docStorageEnabledDescription": "持久化原始文本（文档原文及分块）。关闭则仅保留派生的事实。仅覆盖当前记忆库的服务器默认值。",
     "docStorageServerDefault": "服务器默认值（{state}）",
@@ -494,6 +494,9 @@
     "securityPrivacyFailedToSave": "保存安全与隐私设置失败",
     "restrictToolsLabel": "限制工具",
     "restrictToolsDescription": "关闭时，所有工具均可用。开启时，此库只能调用所选工具。",
+    "mcpServerInstructionsLabel": "MCP 服务器指令",
+    "mcpServerInstructionsDescription": "当 AI 工具连接到此库的 MCP URL 时发送给它们，让它们知道如何使用此库：例如先读取哪个文档，或用哪些标签保存新事实。最多 4,000 个字符。",
+    "mcpServerInstructionsPlaceholder": "请先阅读文档“house-rules”。保存新事实时使用标签“inbox”。",
     "modelsTitle": "模型",
     "modelsDescription": "特定提供商的模型设置",
     "geminiFailedToSave": "无法保存 Gemini 设置",
@@ -662,6 +665,7 @@
     "promptBlock": {
       "instructions": "说明",
       "field": {
+        "default_timezone": "时区",
         "entities_allow_free_form": "自由形式实体",
         "entity_labels": "实体标签",
         "llm_output_language": "语言规则",
@@ -1491,6 +1495,10 @@
     "actionCreatePage": "创建页面",
     "actionUpdatePageNode": "更新页面节点",
     "actionDeletePageNode": "删除页面节点",
+    "actionCreateKnowledgeBank": "创建知识库",
+    "actionDeleteKnowledgeBank": "删除知识库",
+    "actionIngestKnowledgeText": "导入知识文本",
+    "actionDeleteKnowledgeDocument": "删除知识文档",
     "actionFileRetain": "上传文件",
     "actionUpdateMemory": "更新记忆",
     "actionUpdateDocument": "更新文档",
@@ -2722,7 +2730,7 @@
         },
         "media_overlap_seconds": {
           "label": "重叠（秒）",
-          "description": "每个段落与下一段共享的秒数，避免在切分处丢失内容；必须短于两种时长。"
+          "description": "每个段落与下一段共享的秒数，避免在切分处丢失内容；最多为两种时长的一半。"
         },
         "max_media_seconds": {
           "label": "最长文件（秒）",
@@ -2738,6 +2746,8 @@
       "arm_extra_vectors_help": "PDF 页的条带、文本和文本单元，以同样方式搜索。",
       "arm_keyword": "关键词",
       "arm_keyword_help": "查询中较稀有词的全文匹配（所有文档和语言）。",
+      "arm_document": "整篇文档",
+      "arm_document_help": "上方搜索排名最高的 3 篇文档的每个文本段落，措辞与查询不同的部分也会被评分。",
       "armScore": "本次搜索中的分数",
       "meaningTitle": "语义分数",
       "meaningHelp": "{count} 个候选逐一用全部向量评分，再与所在文档最佳段落取平均。",
@@ -2751,7 +2761,6 @@
       "rankingHelp": "语义与关键词缩放到 0-1 后混合，关键词占 {weight}%。使用的词及其稀有度：",
       "noKeywords": "此查询无关键词搜索。",
       "idfHelp": "该词在此库中的稀有程度（IDF）：越稀有越重要。",
-      "referencePage": "参考文献列表，已降权",
       "depthTitle": "深度截断（预算 {budget}）",
       "depthHelp": "为 token 预算保留 {total} 个中的前 {depth} 个。",
       "budgetTitle": "填充 max_tokens",

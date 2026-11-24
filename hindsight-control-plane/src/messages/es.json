@@ -485,7 +485,7 @@
     "auditEnabledDescription": "Registrar las operaciones de retain, recall y reflect de este banco. Anula el valor predeterminado del servidor solo para este banco.",
     "auditServerDefault": "Valor predeterminado del servidor ({state})",
     "defaultTimezoneLabel": "Zona horaria predeterminada",
-    "defaultTimezoneDescription": "Zona usada para una marca de tiempo de retain, o una hora del contenido, sin desfase UTC. Nombre IANA como Europe/Rome.",
+    "defaultTimezoneDescription": "Zona usada para una marca de tiempo de retain, o una hora del contenido, sin desfase UTC, y la zona en la que el LLM lee las horas de los recuerdos. Nombre IANA como Europe/Rome.",
     "docStorageEnabledLabel": "Almacenar texto del documento",
     "docStorageEnabledDescription": "Conservar el texto original (documentos originales y fragmentos). Desactívelo para conservar únicamente los hechos derivados. Invalida el valor predeterminado del servidor solo para este banco.",
     "docStorageServerDefault": "Valor predeterminado del servidor ({state})",
@@ -494,6 +494,9 @@
     "securityPrivacyFailedToSave": "Error al guardar la configuración de seguridad y privacidad",
     "restrictToolsLabel": "Restringir herramientas",
     "restrictToolsDescription": "Cuando está desactivado, todas las herramientas están disponibles. Cuando está activado, solo las herramientas seleccionadas pueden invocarse para este banco.",
+    "mcpServerInstructionsLabel": "Instrucciones del servidor MCP",
+    "mcpServerInstructionsDescription": "Se envían a las herramientas de IA cuando se conectan a la URL MCP de este banco, para que sepan cómo usarlo: por ejemplo, qué documento leer primero o con qué etiquetas guardar los hechos nuevos. Hasta 4000 caracteres.",
+    "mcpServerInstructionsPlaceholder": "Lee primero el documento 'house-rules'. Guarda los hechos nuevos con la etiqueta 'inbox'.",
     "modelsTitle": "Modelos",
     "modelsDescription": "Configuración de modelos específica del proveedor",
     "geminiFailedToSave": "Error al guardar la configuración de Gemini",
@@ -662,6 +665,7 @@
     "promptBlock": {
       "instructions": "Instrucciones",
       "field": {
+        "default_timezone": "Zona horaria",
         "entities_allow_free_form": "Entidades de forma libre",
         "entity_labels": "Etiquetas de entidad",
         "llm_output_language": "Regla de idioma",
@@ -1491,6 +1495,10 @@
     "actionCreatePage": "Crear página",
     "actionUpdatePageNode": "Actualizar nodo de página",
     "actionDeletePageNode": "Eliminar nodo de página",
+    "actionCreateKnowledgeBank": "Crear banco de conocimiento",
+    "actionDeleteKnowledgeBank": "Eliminar banco de conocimiento",
+    "actionIngestKnowledgeText": "Ingerir texto de conocimiento",
+    "actionDeleteKnowledgeDocument": "Eliminar documento de conocimiento",
     "actionFileRetain": "Subir archivo",
     "actionUpdateMemory": "Actualizar memoria",
     "actionUpdateDocument": "Actualizar documento",
@@ -2722,7 +2730,7 @@
         },
         "media_overlap_seconds": {
           "label": "Solapamiento (segundos)",
-          "description": "Cuántos segundos comparte cada pasaje con el siguiente, para no perder nada en un corte; debe ser menor que ambas duraciones."
+          "description": "Cuántos segundos comparte cada pasaje con el siguiente, para no perder nada en un corte; como máximo la mitad de ambas duraciones."
         },
         "max_media_seconds": {
           "label": "Archivo más largo (segundos)",
@@ -2738,6 +2746,8 @@
       "arm_extra_vectors_help": "Bandas, texto y unidades de texto de una página PDF, buscados igual.",
       "arm_keyword": "Palabras clave",
       "arm_keyword_help": "Coincidencias de texto completo de las palabras más raras de la consulta, en todo documento e idioma.",
+      "arm_document": "Documentos completos",
+      "arm_document_help": "Cada pasaje de texto de los 3 documentos mejor clasificados por las búsquedas de arriba, para puntuar también una parte redactada distinto de la consulta.",
       "armScore": "Puntuación en esta búsqueda",
       "meaningTitle": "Puntuación de significado",
       "meaningHelp": "Cada uno de los {count} candidatos, puntuado con todos sus vectores y promediado con el mejor pasaje de su documento.",
@@ -2751,7 +2761,6 @@
       "rankingHelp": "Significado y palabras clave escalados 0-1 y mezclados, palabras clave {weight}%. Palabras usadas, con su rareza:",
       "noKeywords": "Sin búsqueda por palabras clave para esta consulta.",
       "idfHelp": "Qué tan rara es la palabra en este banco (IDF): las raras cuentan más.",
-      "referencePage": "lista de referencias, rebajada",
       "depthTitle": "Corte de profundidad (presupuesto {budget})",
       "depthHelp": "Conserva los {depth} mejores de {total} para el presupuesto de tokens.",
       "budgetTitle": "Llenando max_tokens",
